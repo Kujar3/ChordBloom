@@ -77,30 +77,62 @@ bool Key::prefersFlats() const
     return p == 0 || p == 5;   // C, F major
 }
 
+namespace
+{
+    // Letter-per-degree spelling of pitch class p in the 7-note scale `scalePcs` whose degree 0 uses letter
+    // index `tonicLetter` (0 = C .. 6 = B). Returns "" when p is not in the scale or would need a double accidental.
+    std::string spellWithLetters (int tonicLetter, const std::array<int, 7>& scalePcs, int p)
+    {
+        static const char letters[] = { 'C', 'D', 'E', 'F', 'G', 'A', 'B' };
+        static const int letterPcs[] = { 0, 2, 4, 5, 7, 9, 11 };
+
+        for (int degree = 0; degree < 7; ++degree)
+        {
+            if (scalePcs[(size_t) degree] != p)
+                continue;
+
+            const int letterIndex = (tonicLetter + degree) % 7;
+            int diff = p - letterPcs[letterIndex];
+            while (diff > 6)  diff -= 12;
+            while (diff < -6) diff += 12;
+
+            if (diff == 0)  return std::string (1, letters[letterIndex]);
+            if (diff == 1)  return std::string (1, letters[letterIndex]) + "#";
+            if (diff == -1) return std::string (1, letters[letterIndex]) + "b";
+            return {};
+        }
+        return {};
+    }
+
+    int letterIndexOf (char letter)
+    {
+        static const char letters[] = { 'C', 'D', 'E', 'F', 'G', 'A', 'B' };
+        for (int i = 0; i < 7; ++i)
+            if (letters[i] == letter)
+                return i;
+        return 0;
+    }
+} // namespace
+
 std::string Key::spell (int pitchClass) const
 {
     const int p = pc (pitchClass);
-    const int degree = degreeOf (p);
-    if (degree < 0)
-        return pitchClassName (p, prefersFlats());
+    const int tonicLetter = letterIndexOf (tonicName()[0]);
 
-    static const char letters[] = { 'C', 'D', 'E', 'F', 'G', 'A', 'B' };
-    static const int letterPcs[] = { 0, 2, 4, 5, 7, 9, 11 };
+    if (contains (p))
+    {
+        auto s = spellWithLetters (tonicLetter, pitchClasses(), p);
+        return s.empty() ? pitchClassName (p, prefersFlats()) : s;
+    }
 
-    const auto t = tonicName();
-    int tonicLetter = 0;
-    for (int i = 0; i < 7; ++i)
-        if (letters[i] == t[0])
-            tonicLetter = i;
+    // Out-of-scale tone. Extension of the contract: when the tone belongs to the parallel key (the usual
+    // source of borrowed chords), spell it as the parallel scale would, using this key's tonic letter, so
+    // that G Major's bVI is "Eb" (not "D#") and A Minor's Picardy third is "C#". Awkward enharmonics
+    // (E#, B#, Cb, Fb) are avoided for out-of-scale tones.
+    auto s = spellWithLetters (tonicLetter, parallel().pitchClasses(), p);
+    if (! s.empty() && s != "E#" && s != "B#" && s != "Cb" && s != "Fb")
+        return s;
 
-    const int letterIndex = (tonicLetter + degree) % 7;
-    int diff = p - letterPcs[letterIndex];
-    while (diff > 6)  diff -= 12;
-    while (diff < -6) diff += 12;
-
-    if (diff == 0)  return std::string (1, letters[letterIndex]);
-    if (diff == 1)  return std::string (1, letters[letterIndex]) + "#";
-    if (diff == -1) return std::string (1, letters[letterIndex]) + "b";
     return pitchClassName (p, prefersFlats());
 }
 
@@ -200,8 +232,206 @@ bool isDiatonic (const Chord& chord, const Key& key)
 }
 
 //==============================================================================
-// TODO (core-theory agent): implement per the contract in Theory.h
-HarmonicFunction harmonicFunction (const Chord&, const Key&) { return HarmonicFunction::Tonic; }
-std::string romanNumeral (const Chord&, const Key&, bool) { return "I"; }
+namespace
+{
+    // Quality of the triad stacked in thirds on `degree` of the key's scale (Major/Minor/Diminished/Augmented).
+    ChordQuality stackedTriadQuality (const Key& key, int degree)
+    {
+        const auto pcs = key.pitchClasses();
+        const int d = ((degree % 7) + 7) % 7;
+        const int root = pcs[(size_t) d];
+        const int third = pc (pcs[(size_t) ((d + 2) % 7)] - root);
+        const int fifth = pc (pcs[(size_t) ((d + 4) % 7)] - root);
+
+        if (fifth == 6) return ChordQuality::Diminished;
+        if (fifth == 8) return ChordQuality::Augmented;
+        return third >= 4 ? ChordQuality::Major : ChordQuality::Minor;
+    }
+
+    bool isDominantShaped (ChordQuality q)
+    {
+        return q == ChordQuality::Major || q == ChordQuality::Dominant7 || q == ChordQuality::Dominant9;
+    }
+
+    bool isDiminishedFamily (ChordQuality q)
+    {
+        return q == ChordQuality::Diminished || q == ChordQuality::Diminished7 || q == ChordQuality::HalfDiminished7;
+    }
+
+    bool isLowerCaseQuality (ChordQuality q)
+    {
+        switch (q)
+        {
+            case ChordQuality::Minor:
+            case ChordQuality::Diminished:
+            case ChordQuality::Minor6:
+            case ChordQuality::MinorAdd9:
+            case ChordQuality::Minor7:
+            case ChordQuality::HalfDiminished7:
+            case ChordQuality::Diminished7:
+            case ChordQuality::MinorMajor7:
+            case ChordQuality::Minor9:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // Numeral suffixes per the Theory.h contract. "\xC2\xB0" = U+00B0 (degree sign), "\xC3\xB8" = U+00F8 (o-slash).
+    const char* numeralSuffix (ChordQuality q)
+    {
+        switch (q)
+        {
+            case ChordQuality::Diminished:      return "\xC2\xB0";
+            case ChordQuality::Diminished7:     return "\xC2\xB0" "7";
+            case ChordQuality::HalfDiminished7: return "\xC3\xB8" "7";
+            case ChordQuality::Augmented:       return "+";
+            case ChordQuality::Major7:          return "maj7";
+            case ChordQuality::Minor7:          return "7";
+            case ChordQuality::Dominant7:       return "7";
+            case ChordQuality::Major6:          return "6";
+            case ChordQuality::Minor6:          return "6";
+            case ChordQuality::Add9:            return "add9";
+            case ChordQuality::MinorAdd9:       return "add9";
+            case ChordQuality::Sus2:            return "sus2";
+            case ChordQuality::Sus4:            return "sus4";
+            case ChordQuality::Dominant7Sus4:   return "7sus4";
+            case ChordQuality::Major9:          return "maj9";
+            case ChordQuality::Minor9:          return "9";
+            case ChordQuality::Dominant9:       return "9";
+            case ChordQuality::MinorMajor7:     return "(maj7)";
+            default:                            return "";
+        }
+    }
+
+    // Signed distance a - b folded into -5..+6.
+    int signedDiff (int a, int b)
+    {
+        int d = pc (a - b);
+        return d > 6 ? d - 12 : d;
+    }
+
+    // Scale degree (0..6) used for a root, plus an accidental (-1 = "b", 0 = none, +1 = "#").
+    struct DegreeRef
+    {
+        int degree = 0;
+        int accidental = 0;
+    };
+
+    DegreeRef locateRoot (int root, ChordQuality quality, const Key& key)
+    {
+        root = pc (root);
+        const int inScale = key.degreeOf (root);
+        if (inScale >= 0)
+            return { inScale, 0 };
+
+        const int below = key.degreeOf (root - 1);
+        const int above = key.degreeOf (root + 1);
+
+        // Diminished-family chords: "#" + the degree below (C major: F#dim -> #iv°).
+        if (isDiminishedFamily (quality))
+        {
+            if (below >= 0) return { below, +1 };
+            if (above >= 0) return { above, -1 };
+            return {};
+        }
+
+        // Roots borrowed from the parallel key are named by their parallel degree, so that major-family keys get
+        // "b" (C major: Eb -> bIII, Ab -> bVI, Bb -> bVII, identical to the "b + degree above" rule) and minor-family
+        // keys get "#" for raised degrees (A minor: C#m -> #iii, F#m -> #vi) instead of misleading "bIV"/"bVII".
+        const Key par = key.parallel();
+        const int parDegree = par.degreeOf (root);
+        if (parDegree >= 0)
+        {
+            const int diff = signedDiff (root, key.pitchClasses()[(size_t) parDegree]);
+            if (diff == -1) return { parDegree, -1 };
+            if (diff == +1) return { parDegree, +1 };
+        }
+
+        // Default: "b" + the degree above (C major: Db -> bII, Gb -> bV).
+        if (above >= 0) return { above, -1 };
+        if (below >= 0) return { below, +1 };
+        return {};
+    }
+
+    std::string plainNumeral (const Chord& chord, const Key& key)
+    {
+        static const char* upper[] = { "I", "II", "III", "IV", "V", "VI", "VII" };
+        static const char* lower[] = { "i", "ii", "iii", "iv", "v", "vi", "vii" };
+
+        const auto ref = locateRoot (chord.root, chord.quality, key);
+        const int d = std::clamp (ref.degree, 0, 6);
+
+        std::string s = ref.accidental < 0 ? "b" : (ref.accidental > 0 ? "#" : "");
+        s += isLowerCaseQuality (chord.quality) ? lower[d] : upper[d];
+        s += numeralSuffix (chord.quality);
+        return s;
+    }
+
+    // Dominant-shaped chord on the 5th degree of a key whose 5th is perfect. Contract: minor-family keys ("E in A minor
+    // is V"). Extension: also Mixolydian, where D/D7 in G Mixolydian is the (major-key) V, not a chromatic chord.
+    bool isNonDiatonicDominant (const Chord& chord, const Key& key)
+    {
+        return isDominantShaped (chord.quality)
+            && key.degreeOf (chord.root) == 4
+            && scaleInfo (key.scale).offsets[4] == 7;
+    }
+
+    // Degree (1..6) of the diatonic, non-diminished target a dominant-shaped chord points to (a fifth below), or -1.
+    int secondaryTargetDegree (const Chord& chord, const Key& key)
+    {
+        if (! isDominantShaped (chord.quality))
+            return -1;
+
+        const int degree = key.degreeOf (pc (chord.root + 5));
+        if (degree <= 0)
+            return -1;
+
+        if (stackedTriadQuality (key, degree) == ChordQuality::Diminished)
+            return -1;
+
+        return degree;
+    }
+} // namespace
+
+HarmonicFunction harmonicFunction (const Chord& chord, const Key& key)
+{
+    if (isDiatonic (chord, key))
+    {
+        switch (key.degreeOf (chord.root))
+        {
+            case 0: case 2: case 5: return HarmonicFunction::Tonic;
+            case 1: case 3:         return HarmonicFunction::Subdominant;
+            default:                return HarmonicFunction::Dominant;
+        }
+    }
+
+    if (isNonDiatonicDominant (chord, key))
+        return HarmonicFunction::Dominant;
+
+    if (isDiatonic (chord, key.parallel()))
+        return HarmonicFunction::Borrowed;
+
+    if (secondaryTargetDegree (chord, key) > 0)
+        return HarmonicFunction::Secondary;
+
+    return HarmonicFunction::Chromatic;
+}
+
+std::string romanNumeral (const Chord& chord, const Key& key, bool detectSecondary)
+{
+    if (detectSecondary && harmonicFunction (chord, key) == HarmonicFunction::Secondary)
+    {
+        const int targetDegree = secondaryTargetDegree (chord, key);
+        const Chord target { key.pitchClasses()[(size_t) targetDegree], stackedTriadQuality (key, targetDegree) };
+
+        std::string s = "V";
+        if (chord.quality == ChordQuality::Dominant7) s += "7";
+        if (chord.quality == ChordQuality::Dominant9) s += "9";
+        return s + "/" + plainNumeral (target, key);
+    }
+
+    return plainNumeral (chord, key);
+}
 
 } // namespace cb

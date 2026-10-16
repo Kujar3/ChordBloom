@@ -97,6 +97,9 @@ add_executable(CoreTests
     tests/VoicingPatternTests.cpp
     ${CB_CORE_SOURCES})
 target_include_directories(CoreTests PRIVATE src tests)
+if(MSVC)
+    target_compile_options(CoreTests PRIVATE /W4 /permissive-)
+endif()
 
 # ---------------------------------------------------------------------------
 # Dev tool: processor self-test + editor snapshot renderer

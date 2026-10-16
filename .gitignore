@@ -5,3 +5,5 @@ out/
 *.user
 .vs/
 build_log.txt
+Essential MIDI Collection Bundle/
+*.obj

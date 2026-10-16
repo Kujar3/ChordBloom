@@ -24,6 +24,10 @@ public:
     void setDisplayChord (std::optional<cb::Chord>);
     void refresh();   // key changed
 
+    // Like setDisplayChord, but with the exact notes being played (e.g. the slot's voice-led voicing). Empty notes ->
+    // the chord's plain voicing around the current octave. Added by the integrator.
+    void setDisplay (std::optional<cb::Chord>, const std::vector<int>& voicedNotes);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

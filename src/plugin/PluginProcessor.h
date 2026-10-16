@@ -72,6 +72,11 @@ public:
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
     using AudioProcessor::processBlock;
 
+    // Host bypass: note-offs for everything Chordbloom holds (no stuck notes downstream), input MIDI passes through,
+    // the preview sound's release tails fade out. Playback re-syncs when the bypass ends. (Added by the integrator.)
+    void processBlockBypassed (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+    using AudioProcessor::processBlockBypassed;
+
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
 
@@ -126,6 +131,7 @@ public:
     void startPreviewNote (int midiNote);        // single note (keyboard clicks)
     void stopPreview();                          // note-offs for whatever preview is sounding
     std::optional<cb::Chord> getPreviewChord() const;   // chord currently being previewed (chord/slot previews), if any
+    std::vector<int> getPreviewNotes() const;           // MIDI notes of the preview currently held (empty when none). Added by the integrator.
 
     //==============================================================================
     // Transport

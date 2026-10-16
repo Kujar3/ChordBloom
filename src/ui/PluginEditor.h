@@ -51,9 +51,26 @@ public:
     ProgressionLane& getProgressionLane() noexcept;
     ChordPaletteView& getPaletteView() noexcept;
 
+    // Recomputes the display / context / sounding chords and pushes them to the children right away
+    // (normally done by the 30 Hz timer; used by the snapshot tool where timers do not run).
+    void updateChordDisplays();
+
+    static constexpr int kDefaultWidth = 1100, kDefaultHeight = 690;
+    static constexpr int kMinWidth = 960, kMinHeight = 600;
+    static constexpr int kMaxWidth = 1600, kMaxHeight = 1000;
+
 private:
     void changeListenerCallback (juce::ChangeBroadcaster*) override;
     void timerCallback() override;
+
+    void refreshChildren();
+    void pushChords (bool force);
+
+    juce::Rectangle<int> paletteArea, laneArea, controlsArea, keyboardArea, exportArea;
+    std::optional<cb::Chord> lastSounding, lastDisplay, lastContext;
+    std::vector<int> lastDisplayNotes;
+    bool chordsPushed = false;
+    bool persistSize = false;   // resized() stores the size in the processor only after the constructor restored it
 
     ChordbloomProcessor& processor;
     cb::ui::LookAndFeel lookAndFeel;
