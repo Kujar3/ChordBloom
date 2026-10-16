@@ -18,6 +18,10 @@ namespace cb
 // Scores should spread across the range: a typical palette has a few chords >= 0.75, several around 0.4-0.6, the rest lower.
 float transitionScore (const Chord& from, const Chord& to, const Key& key);
 
+// 0..1: how good `chord` is as the FIRST chord of a progression in `key` (used to guide an empty progression).
+// Tonic-family chords score highest; mood-typical openers (e.g. VI / bVI in minor, per out/midi_stats.md) score high too.
+float openingScore (const Chord& chord, const Key& key);
+
 // Score for every pad in the palette, same shape as palette[section].chords.
 std::vector<std::vector<float>> suggestionsFor (const Chord& from, const std::vector<PaletteSection>& palette, const Key& key);
 

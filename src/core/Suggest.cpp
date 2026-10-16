@@ -341,4 +341,10 @@ std::vector<std::vector<float>> suggestionsFor (const Chord& from, const std::ve
     }
     return out;
 }
+// STUB (round 2) - to be implemented by the core-suggest agent
+float openingScore (const Chord& chord, const Key& key)
+{
+    return key.degreeOf (chord.root) == 0 ? 1.0f : 0.3f;
+}
+
 } // namespace cb
