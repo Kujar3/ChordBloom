@@ -7,3 +7,4 @@ out/
 build_log.txt
 Essential MIDI Collection Bundle/
 *.obj
+tools/clap-validator/

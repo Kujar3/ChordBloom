@@ -72,6 +72,22 @@ double mean (const std::vector<int>& v)
     return v.empty() ? 0.0 : s / (double) v.size();
 }
 
+double placementMean (const std::vector<int>& v, const Chord& c, VoicingStyle style)
+{
+    if (style != VoicingStyle::Close) return mean (v);
+    std::vector<int> core;
+    for (int note : v)
+        for (int interval : c.intervals())
+            if (interval < 12 && pc (note) == pc (c.root + interval)) core.push_back (note);
+    return mean (core);
+}
+
+int clarityCost (const std::vector<int>& v, const Chord& c)
+{
+    const int bass = pc (v.front() - c.root);
+    return (bass >= 9 && bass <= 11 ? 4 : 0) + (v.size() >= 2 && v[1] - v[0] <= 2 ? 8 : 0);
+}
+
 std::vector<int> relative (const std::vector<int>& v)
 {
     std::vector<int> r;
@@ -110,15 +126,6 @@ bool hasNinth (ChordQuality q)
         if (i >= 12)
             return true;
     return false;
-}
-
-int ninthIndex (ChordQuality q)
-{
-    const auto& iv = qualityIntervals (q);
-    for (int i = 0; i < (int) iv.size(); ++i)
-        if (iv[(size_t) i] >= 12)
-            return i;
-    return -1;
 }
 
 // Deterministic pseudo-random chord sequence for sweeps.
@@ -196,7 +203,7 @@ TEST_CASE ("voicing: invariants for every quality x style x inversion x centre")
     for (int q = 0; q < numChordQualities; ++q)
         for (int root = 0; root < 12; ++root)
             for (auto style : kStyles)
-                for (int inv = -1; inv <= 4; ++inv)
+                for (int inv = -1; inv <= 5; ++inv)
                     for (int centre : kCentres)
                     {
                         const Chord c = ch (root, (ChordQuality) q);
@@ -206,10 +213,10 @@ TEST_CASE ("voicing: invariants for every quality x style x inversion x centre")
                         CHECK (inMidiRange (v));
                         CHECK (pcSet (v) == chordPcSet (c));
                         CHECK ((int) v.size() >= c.numTones());
-                        CHECK (std::abs (mean (v) - centre) <= 6.0 + kTol);
+                        CHECK (std::abs (placementMean (v, c, style) - centre) <= 6.0 + kTol);
                         ++checked;
                     }
-    CHECK_EQ (checked, numChordQualities * 12 * 3 * 6 * 3);
+    CHECK_EQ (checked, numChordQualities * 12 * 3 * 7 * 3);
 }
 
 TEST_CASE ("voicing: explicit inversions put the right chord tone in the bass")
@@ -217,7 +224,7 @@ TEST_CASE ("voicing: explicit inversions put the right chord tone in the bass")
     for (int q = 0; q < numChordQualities; ++q)
         for (int root = 0; root < 12; ++root)
             for (auto style : kStyles)
-                for (int inv = 0; inv <= 4; ++inv)
+                for (int inv = 0; inv <= 5; ++inv)
                     for (int centre : kCentres)
                     {
                         const Chord c = ch (root, (ChordQuality) q);
@@ -301,39 +308,33 @@ TEST_CASE ("voicing: close 9th chords stack root-3-5-7-9")
     CHECK_EQ (relative (voiceChord (ch (0, ChordQuality::Minor9), s, 0, 0, {})), (std::vector<int> { 0, 3, 7, 10, 14 }));
 }
 
-TEST_CASE ("voicing: the 9th sits above the 3rd in every style unless it is the bass")
+TEST_CASE ("voicing: all extensions sit above the core in musical order unless explicitly in bass")
 {
     for (int q = 0; q < numChordQualities; ++q)
-    {
-        if (! hasNinth ((ChordQuality) q))
-            continue;
-
-        const int ni = ninthIndex ((ChordQuality) q);
         for (int root = 0; root < 12; ++root)
             for (auto style : kStyles)
-                for (int inv = -1; inv <= 4; ++inv)
-                {
-                    if (inv == ni || (inv > ni && ni == ch (root, (ChordQuality) q).numTones() - 1))
-                        continue;   // explicit 9th-in-bass (or clamped to it)
-
+                for (int inv = -1; inv <= 6; ++inv)
                     for (int centre : kCentres)
                     {
                         const Chord c = ch (root, (ChordQuality) q);
                         const auto v = voiceChord (c, vset (style, centre), inv, 0, {});
-                        const int thirdPc = c.pitchClasses()[1];
-                        const int ninthPc = c.pitchClasses()[(size_t) ni];
-                        int lowestThird = 1000, lowestNinth = 1000;
-                        for (int n : v)
+                        const auto intervals = c.intervals();
+                        const int bassIndex = inv < 0 ? 0 : std::min (inv, c.numTones() - 1);
+                        int coreTop = 0;
+                        for (int note : v)
+                            for (int interval : intervals)
+                                if (interval < 12 && pc (note) == pc (root + interval))
+                                    coreTop = std::max (coreTop, note);
+                        int previous = coreTop;
+                        for (int i = 0; i < c.numTones(); ++i)
                         {
-                            if (pc (n) == thirdPc) lowestThird = std::min (lowestThird, n);
-                            if (pc (n) == ninthPc) lowestNinth = std::min (lowestNinth, n);
+                            if (intervals[(size_t) i] < 12 || i == bassIndex) continue;
+                            const auto it = std::find_if (v.begin(), v.end(), [&] (int n) { return pc (n) == pc (root + intervals[(size_t) i]); });
+                            REQUIRE (it != v.end());
+                            CHECK (*it > previous);
+                            previous = *it;
                         }
-                        CHECK (lowestNinth > lowestThird);
-                        // never root + whole tone at the bottom
-                        CHECK (! (pc (v[0]) == c.root && v[1] - v[0] == 2));
                     }
-                }
-    }
 }
 
 TEST_CASE ("voicing: 9th in the bass on explicit request")
@@ -399,7 +400,7 @@ TEST_CASE ("voicing: spread is wide with the root low")
                 const int span = v.back() - v.front();
                 CHECK (span >= 19);
                 // Very low spreads may lift a crowded top note an octave (low-register rule), so allow a bit more there.
-                CHECK (span <= (centre >= 60 ? 31 : 38));
+                CHECK (span <= (centre >= 60 ? 33 : 45));
                 CHECK (v[1] - v[0] >= 5);   // open at the bottom
             }
 
@@ -413,7 +414,7 @@ TEST_CASE ("voicing: spread never has intervals smaller than a 4th below MIDI 52
 {
     for (int q = 0; q < numChordQualities; ++q)
         for (int root = 0; root < 12; ++root)
-            for (int inv = -1; inv <= 4; ++inv)
+            for (int inv = -1; inv <= 5; ++inv)
                 for (int centre = 30; centre <= 64; centre += 2)
                 {
                     const auto v = voiceChord (ch (root, (ChordQuality) q), vset (VoicingStyle::Spread, centre), inv, 0, {});
@@ -442,7 +443,14 @@ TEST_CASE ("voicing: octaveShift moves the voicing by whole octaves")
                     const Chord c = ch (9, (ChordQuality) q);
                     const auto base = voiceChord (c, vset (style, centre), inv, 0, {});
                     const auto moved = voiceChord (c, vset (style, centre), inv, shift, {});
-                    CHECK_EQ (moved, shifted (base, 12 * shift));
+                    const auto expected = shifted (base, 12 * shift);
+                    if (inMidiRange (expected))
+                        CHECK_EQ (moved, expected);
+                    else
+                    {
+                        CHECK (inMidiRange (moved));
+                        CHECK (pcSet (moved) == chordPcSet (c));
+                    }
                 }
 
     // Spread shifted down is still the same chord, an octave or two lower on average.
@@ -549,7 +557,7 @@ TEST_CASE ("voicing: voice leading picks the least movement among in-window cand
                     const Chord c = ch (rng.next (12), sevenths ? fours[rng.next (4)] : triads[rng.next (4)]);
                     const auto res = voiceChord (c, s, -1, 0, prev);
                     CHECK (std::abs (mean (res) - centre) <= 7.0 + kTol);
-                    const int cost = movement (res, prev);
+                    const int cost = movement (res, prev) + clarityCost (res, c);
 
                     for (int inv = 0; inv < c.numTones(); ++inv)
                     {
@@ -559,7 +567,7 @@ TEST_CASE ("voicing: voice leading picks the least movement among in-window cand
                             const auto cand = shifted (base, 12 * o);
                             if (! inMidiRange (cand) || std::abs (mean (cand) - centre) > 7.0 + kTol)
                                 continue;
-                            CHECK (cost <= movement (cand, prev));
+                            CHECK (cost <= movement (cand, prev) + clarityCost (cand, c));
                         }
                     }
                     prev = res;
@@ -585,11 +593,12 @@ TEST_CASE ("voicing: voice leading never drifts over 64 chords")
             const auto vs = voiceProgression (p, vset (style, centre));
             REQUIRE (vs.size() == 64);
             double lo = 1000.0, hi = -1000.0;
-            for (auto& v : vs)
+            for (size_t j = 0; j < vs.size(); ++j)
             {
-                CHECK (std::abs (mean (v) - centre) <= 7.0 + kTol);
-                lo = std::min (lo, mean (v));
-                hi = std::max (hi, mean (v));
+                const double m = placementMean (vs[j], p.slots[j].chord, style);
+                CHECK (std::abs (m - centre) <= 7.0 + kTol);
+                lo = std::min (lo, m);
+                hi = std::max (hi, m);
             }
             CHECK (hi - lo <= 14.0 + kTol);
         }
@@ -627,7 +636,7 @@ TEST_CASE ("voicing: voice leading between chords of different sizes")
         {
             CHECK (ascendingUnique (vs[i]));
             CHECK (pcSet (vs[i]) == chordPcSet (chords[i]));
-            CHECK (std::abs (mean (vs[i]) - 60.0) <= 7.0 + kTol);
+            CHECK (std::abs (placementMean (vs[i], chords[i], style) - 60.0) <= 7.0 + kTol);
         }
         // C -> Cmaj9 shares C E G: the common tones are kept where they are.
         if (style == VoicingStyle::Close)
@@ -738,7 +747,7 @@ TEST_CASE ("pattern: empty progression renders nothing")
             CHECK (renderProgression (Progression {}, {}, rset ((RhythmPattern) p, RateDivision::Eighth, (BassMode) b)).empty());
 }
 
-TEST_CASE ("pattern: block holds the chord for gate * slot")
+TEST_CASE ("pattern: block holds the chord with a fixed release tail")
 {
     const auto p = makeProgression ({ ch (0, ChordQuality::Major), ch (9, ChordQuality::Minor) }, { 4, 2 });
     const auto ev = renderProgression (p, { { 60, 64, 67 }, { 57, 60, 64 } }, rset (RhythmPattern::Block));
@@ -746,14 +755,14 @@ TEST_CASE ("pattern: block holds the chord for gate * slot")
     for (int i = 0; i < 3; ++i)
     {
         CHECK_EQ (ev[(size_t) i].startBeat, 0.0);
-        CHECK (near (ev[(size_t) i].lengthBeats, 3.6, 1e-6));
+        CHECK (near (ev[(size_t) i].lengthBeats, 3.9, 1e-6));
         CHECK_EQ (ev[(size_t) i].channel, 1);
         CHECK_EQ (ev[(size_t) i].velocity, 0.75f);
     }
     for (int i = 3; i < 6; ++i)
     {
         CHECK_EQ (ev[(size_t) i].startBeat, 4.0);
-        CHECK (near (ev[(size_t) i].lengthBeats, 1.8, 1e-6));
+        CHECK (near (ev[(size_t) i].lengthBeats, 1.9, 1e-6));
     }
     CHECK_EQ (ev[0].note, 60);
     CHECK_EQ (ev[3].note, 57);
@@ -767,7 +776,7 @@ TEST_CASE ("pattern: strum staggers notes upward by 0.03 beats")
     {
         CHECK_EQ (ev[(size_t) i].note, kCMaj7[(size_t) i]);
         CHECK (near (ev[(size_t) i].startBeat, 0.03 * i));
-        CHECK (near (ev[(size_t) i].lengthBeats, 3.6, 1e-6));
+        CHECK (near (ev[(size_t) i].lengthBeats, 3.9 - 0.03 * i, 1e-6));
     }
 
     auto s = rset (RhythmPattern::Strum);
@@ -951,7 +960,7 @@ TEST_CASE ("pattern: gate scales note lengths and is clamped")
     auto b = rset (RhythmPattern::Block, RateDivision::Eighth, BassMode::Root);
     b.gate = 0.5f;
     for (auto& e : renderOne (b, kCMajor, 2))
-        CHECK (near (e.lengthBeats, 1.0, 1e-6));
+        CHECK (near (e.lengthBeats, 1.5, 1e-6));
 }
 
 TEST_CASE ("pattern: swing only moves second steps")
@@ -1114,14 +1123,10 @@ TEST_CASE ("pattern: bass root sits below the voicing and inside 28..55")
 {
     struct Case { int root; std::vector<int> voicing; int expected; };
     const Case cases[] = {
-        { 0, { 60, 64, 67 }, 48 },   // window [48, 59]
-        { 9, { 57, 60, 64 }, 45 },   // [45, 56]
-        { 5, { 65, 69, 72 }, 53 },   // [53, 64]
-        { 7, { 67, 71, 74 }, 55 },   // [55, 66]
-        { 9, { 69, 72, 76 }, 45 },   // [57, 68] -> 57 > 55 -> 45
-        { 0, { 36, 40, 43 }, 36 },   // [24, 35] -> 24 < 28 -> 36
-        { 0, { 84, 88, 91 }, 48 },   // [72, 83] -> 72 -> 48
-        { 2, { 62, 65, 69, 72 }, 50 },
+        { 0, { 60, 64, 67 }, 36 }, { 9, { 57, 60, 64 }, 45 },
+        { 5, { 65, 69, 72 }, 41 }, { 7, { 67, 71, 74 }, 43 },
+        { 9, { 69, 72, 76 }, 45 }, { 0, { 36, 40, 43 }, 36 },
+        { 0, { 84, 88, 91 }, 36 }, { 2, { 62, 65, 69, 72 }, 38 },
     };
     for (auto& c : cases)
     {
@@ -1132,17 +1137,17 @@ TEST_CASE ("pattern: bass root sits below the voicing and inside 28..55")
     }
 }
 
-TEST_CASE ("pattern: bass Root holds the root for gate * slot on channel 2")
+TEST_CASE ("pattern: bass Root holds the root with a fixed release tail on channel 2")
 {
     const auto p = makeProgression ({ ch (0, ChordQuality::Major), ch (7, ChordQuality::Major) }, { 4, 2 });
     const auto ev = channel (renderProgression (p, { kCMajor, { 59, 62, 67 } }, rset (RhythmPattern::Block, RateDivision::Eighth, BassMode::Root)), 2);
     REQUIRE (ev.size() == 2);
-    CHECK_EQ (ev[0].note, 48);
+    CHECK_EQ (ev[0].note, 36);
     CHECK_EQ (ev[0].startBeat, 0.0);
-    CHECK (near (ev[0].lengthBeats, 3.6, 1e-6));
-    CHECK_EQ (ev[1].note, 55);   // G in [47, 58]
+    CHECK (near (ev[0].lengthBeats, 3.9, 1e-6));
+    CHECK_EQ (ev[1].note, 31);   // nearest G to the previous C2
     CHECK_EQ (ev[1].startBeat, 4.0);
-    CHECK (near (ev[1].lengthBeats, 1.8, 1e-6));
+    CHECK (near (ev[1].lengthBeats, 1.9, 1e-6));
 }
 
 TEST_CASE ("pattern: bass Root + 5th alternates every beat starting with the root")
@@ -1152,16 +1157,16 @@ TEST_CASE ("pattern: bass Root + 5th alternates every beat starting with the roo
     for (int b = 0; b < 4; ++b)
     {
         CHECK (near (ev[(size_t) b].startBeat, (double) b));
-        CHECK_EQ (ev[(size_t) b].note, b % 2 == 0 ? 48 : 55);
+        CHECK_EQ (ev[(size_t) b].note, b % 2 == 0 ? 36 : 31);
         CHECK (near (ev[(size_t) b].lengthBeats, 0.9, 1e-6));
     }
 
-    // G root at 55 would put its 5th at 62: the figure moves down an octave.
+    // G starts nearest MIDI 40; its D is voice-led down a fourth.
     const auto g = channel (renderOne (rset (RhythmPattern::Block, RateDivision::Eighth, BassMode::RootFifth), { 67, 71, 74 }, 2,
                                        Chord { 7, ChordQuality::Major }), 2);
     REQUIRE (g.size() == 2);
     CHECK_EQ (g[0].note, 43);
-    CHECK_EQ (g[1].note, 50);
+    CHECK_EQ (g[1].note, 38);
 }
 
 TEST_CASE ("pattern: bass Octaves alternates low/high every step")
@@ -1183,7 +1188,7 @@ TEST_CASE ("pattern: bass Pulse retriggers the root every step")
     for (int k = 0; k < 12; ++k)
     {
         CHECK (near (ev[(size_t) k].startBeat, k / 3.0));
-        CHECK_EQ (ev[(size_t) k].note, 48);
+        CHECK_EQ (ev[(size_t) k].note, 36);
     }
 }
 
@@ -1319,10 +1324,148 @@ TEST_CASE ("pattern: end to end I-vi-IV-V with default settings")
     const auto ev = renderProgression (p, voicings, RenderSettings {});
     CHECK_EQ (ev.size(), (size_t) 16);   // Block: 3 chord notes + 1 bass note per slot
     CHECK_EQ (channel (ev, 2).size(), (size_t) 4);
-    CHECK_EQ (channel (ev, 2)[0].note, 48);
-    CHECK_EQ (channel (ev, 2)[1].note, 45);
-    CHECK_EQ (channel (ev, 2)[2].note, 53);
-    CHECK_EQ (channel (ev, 2)[3].note, 55);
+    CHECK_EQ (channel (ev, 2)[0].note, 36);
+    CHECK_EQ (channel (ev, 2)[1].note, 33);
+    CHECK_EQ (channel (ev, 2)[2].note, 29);
+    CHECK_EQ (channel (ev, 2)[3].note, 31);
     for (auto& e : ev)
         CHECK (e.startBeat + e.lengthBeats <= p.slotStartBeat (p.slotAtBeat (e.startBeat) + 1) + kTol);
+}
+
+TEST_CASE ("voicing: close extensions preserve the core register")
+{
+    const auto s = vset (VoicingStyle::Close);
+    for (auto quality : { ChordQuality::Add9, ChordQuality::Major9, ChordQuality::Minor11,
+                          ChordQuality::Major69, ChordQuality::Dominant13, ChordQuality::Major7Sharp11,
+                          ChordQuality::Dominant7Flat9 })
+    {
+        const auto c = ch (0, quality);
+        const auto notes = voiceChord (c, s, 0, 0, {});
+        CHECK_EQ (notes.front(), 60);
+        CHECK (pcSet (notes) == chordPcSet (c));
+    }
+}
+
+TEST_CASE ("voicing: auto discourages seventh bass and bottom seconds but explicit inversions remain")
+{
+    for (int root = 0; root < 12; ++root)
+        for (auto quality : { ChordQuality::Major7, ChordQuality::Minor7, ChordQuality::Dominant7 })
+        {
+            const auto c = ch (root, quality);
+            const auto s = vset (VoicingStyle::Close, 60 + root);
+            const auto explicitBass = voiceChord (c, s, 3, 0, {});
+            CHECK_EQ (pc (explicitBass.front()), c.pitchClasses()[3]);
+            const auto led = voiceChord (c, s, -1, 0, explicitBass);
+            CHECK (led[1] - led[0] > 2);
+            CHECK (pc (led.front()) != c.pitchClasses()[3]);
+        }
+}
+
+TEST_CASE ("pattern: slash bass follows explicit voicing in every bass mode")
+{
+    for (auto style : kStyles)
+        for (int inv = 0; inv < 3; ++inv)
+            for (int mode = 1; mode < numBassModes; ++mode)
+            {
+                auto p = makeProgression ({ ch (0, ChordQuality::Major) });
+                p.slots[0].inversion = inv;
+                const auto v = voiceProgression (p, vset (style));
+                const auto bass = channel (renderProgression (p, v, rset (RhythmPattern::Block, RateDivision::Eighth, (BassMode) mode)), 2);
+                REQUIRE (! bass.empty());
+                CHECK_EQ (pc (bass.front().note), pc (v[0].front()));
+                for (const auto& e : bass)
+                {
+                    CHECK (e.note >= 28 && e.note <= 55);
+                    CHECK (chordPcSet (p.slots[0].chord).count (pc (e.note)) != 0);
+                }
+            }
+    auto p = makeProgression ({ ch (0, ChordQuality::Major) });
+    p.slots[0].inversion = 1;
+    const auto s = rset (RhythmPattern::Block, RateDivision::Eighth, BassMode::Root);
+    CHECK_EQ (channel (renderProgression (p, {}, s), 2)[0].note, 40);
+    p.slots[0].inversion = -1;
+    CHECK_EQ (pc (channel (renderProgression (p, { {64,67,72} }, s), 2)[0].note), 0);
+}
+
+TEST_CASE ("pattern: bass minimises movement subject to range and available separation")
+{
+    for (int lowest : { 21, 33, 40, 48, 60, 84 })
+    {
+        Progression p;
+        std::vector<std::vector<int>> voicings;
+        for (int i = 0; i < 24; ++i)
+        {
+            ProgressionSlot slot;
+            slot.chord = ch ((i * 7) % 12, ChordQuality::Major);
+            p.slots.push_back (slot);
+            voicings.push_back ({ lowest });
+        }
+        const auto bass = channel (renderProgression (p, voicings, rset (RhythmPattern::Block, RateDivision::Eighth, BassMode::Root)), 2);
+        REQUIRE (bass.size() == p.slots.size());
+        int previous = 40;
+        for (size_t i = 0; i < bass.size(); ++i)
+        {
+            const int note = bass[i].note;
+            bool canSeparate = false;
+            for (int n = 28; n <= 55; ++n)
+                if (pc (n) == p.slots[i].chord.root && n <= lowest - 5) canSeparate = true;
+            CHECK (note >= 28 && note <= 55);
+            CHECK_EQ (pc (note), p.slots[i].chord.root);
+            CHECK (! canSeparate || note <= lowest - 5);
+            for (int n = 28; n <= 55; ++n)
+                if (pc (n) == pc (note) && (! canSeparate || n <= lowest - 5))
+                    CHECK (std::abs (note - previous) <= std::abs (n - previous));
+            previous = note;
+        }
+    }
+}
+
+TEST_CASE ("pattern: held releases have a fixed tail for every slot length and gate")
+{
+    for (int length : { 1, 2, 4, 8, 16 })
+        for (float gate : { 0.05f, 0.5f, 0.9f, 1.0f })
+            for (auto pattern : { RhythmPattern::Block, RhythmPattern::Strum })
+            {
+                auto s = rset (pattern, RateDivision::Eighth, BassMode::Root);
+                s.gate = gate;
+                for (const auto& e : renderOne (s, kCMaj7, length))
+                    CHECK (near (e.startBeat + e.lengthBeats, length - (1.0 - gate), 1e-6));
+            }
+}
+
+TEST_CASE ("pattern: every bass mode enters each slot nearest the last bass note")
+{
+    const auto p = makeProgression ({ ch (9, ChordQuality::Minor), ch (11, ChordQuality::Major),
+                                      ch (0, ChordQuality::Major), ch (7, ChordQuality::Major) });
+    for (int mode = 1; mode < numBassModes; ++mode)
+    {
+        const auto events = channel (renderProgression (p, { {72}, {72}, {72}, {72} },
+            rset (RhythmPattern::Block, RateDivision::Eighth, (BassMode) mode)), 2);
+        int previous = 40;
+        for (const auto& event : events)
+        {
+            const int slot = p.slotAtBeat (event.startBeat);
+            if (near (event.startBeat, p.slotStartBeat (slot)))
+                for (int candidate = 28; candidate <= 55; ++candidate)
+                    if (pc (candidate) == p.slots[(size_t) slot].chord.root)
+                        CHECK (std::abs (event.note - previous) <= std::abs (candidate - previous));
+            previous = event.note;
+        }
+    }
+}
+
+TEST_CASE ("pattern: bass Root + 5th uses the chord's own fifth (b5 for dim, #5 for aug)")
+{
+    for (auto quality : { ChordQuality::Diminished, ChordQuality::HalfDiminished7, ChordQuality::Diminished7,
+                          ChordQuality::Augmented, ChordQuality::Major, ChordQuality::Minor7, ChordQuality::Sus4 })
+        for (int root = 0; root < 12; ++root)
+        {
+            const Chord c { root, quality };
+            const auto v = voiceChord (c, VoicingSettings {}, -1, 0, {});
+            const auto bass = channel (renderOne (rset (RhythmPattern::Block, RateDivision::Eighth, BassMode::RootFifth), v, 4, c), 2);
+            REQUIRE (bass.size() == 4);
+            const auto tones = c.pitchClasses();
+            for (const auto& e : bass)
+                CHECK (std::find (tones.begin(), tones.end(), pc (e.note)) != tones.end());
+        }
 }

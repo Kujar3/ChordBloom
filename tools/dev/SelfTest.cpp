@@ -112,6 +112,8 @@ struct FakePlayHead final : juce::AudioPlayHead
     bool hasInfo = true;
     double bpm = 120.0;
     double ppq = 0.0;
+    bool reportLoop = false;            // report isLooping + loop points (some hosts do, FL's pattern mode may not)
+    double loopStart = 0.0, loopEnd = 0.0;
 
     juce::Optional<PositionInfo> getPosition() const override
     {
@@ -123,6 +125,11 @@ struct FakePlayHead final : juce::AudioPlayHead
         info.setBpm (bpm);
         info.setPpqPosition (ppq);
         info.setTimeSignature (TimeSignature { 4, 4 });
+        if (reportLoop)
+        {
+            info.setIsLooping (true);
+            info.setLoopPoints (LoopPoints { loopStart, loopEnd });
+        }
         return info;
     }
 };
@@ -168,13 +175,50 @@ struct Rig
         else
             p.processBlock (buffer, midi);
 
+        auto out = record (midi);
+
+        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+        {
+            const float* x = buffer.getReadPointer (ch);
+            for (int i = 0; i < blockSize; ++i)
+            {
+                if (! std::isfinite (x[i]))
+                    audioFinite = false;
+                else
+                    peak = juce::jmax (peak, std::abs (x[i]));
+            }
+        }
+
+        samplePos += blockSize;
+        if (head.playing)
+        {
+            head.ppq += blockSize * head.bpm / 60.0 / sr;
+            if (hostLoopLen > 0.0 && head.ppq >= hostLoopStart + hostLoopLen)
+                head.ppq -= hostLoopLen;   // host loop that does not split the block: the overshoot carries over
+        }
+        return out;
+    }
+
+    // A 0-sample processBlock call (VST3 parameter flush), optionally with a zeroed play head.
+    std::vector<Ev> processZero (const juce::MidiBuffer& input = {})
+    {
+        juce::AudioBuffer<float> empty (2, 0);
+        juce::MidiBuffer midi (input);
+        p.processBlock (empty, midi);
+        return record (midi);
+    }
+
+    std::vector<Ev> record (const juce::MidiBuffer& midi)
+    {
         std::vector<Ev> out;
+        lastOthers.clear();
         for (const auto meta : midi)
         {
             const auto msg = meta.getMessage();
             if (! (msg.isNoteOn() || msg.isNoteOff()))
             {
                 ++numOtherEvents;
+                lastOthers.push_back (msg);
                 continue;
             }
 
@@ -201,22 +245,7 @@ struct Rig
             }
         }
 
-        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
-        {
-            const float* x = buffer.getReadPointer (ch);
-            for (int i = 0; i < blockSize; ++i)
-            {
-                if (! std::isfinite (x[i]))
-                    audioFinite = false;
-                else
-                    peak = juce::jmax (peak, std::abs (x[i]));
-            }
-        }
-
         all.insert (all.end(), out.begin(), out.end());
-        samplePos += blockSize;
-        if (head.playing)
-            head.ppq += blockSize * head.bpm / 60.0 / sr;
         return out;
     }
 
@@ -265,9 +294,11 @@ struct Rig
     std::vector<Ev> all;
     std::map<int, int> open;
     int doubleOns = 0, strayOffs = 0, numOtherEvents = 0;
+    std::vector<juce::MidiMessage> lastOthers;   // non-note messages of the last block
     bool audioFinite = true;
     float peak = 0.0f;
     bool bypassed = false;   // drive processBlockBypassed instead of processBlock
+    double hostLoopStart = 0.0, hostLoopLen = 0.0;   // > 0: the fake host loops (ppq wraps back while playing)
 };
 
 const Ev* findEvent (const std::vector<Ev>& evs, bool on, int channel, int note, juce::int64 sample, int tolerance = 1)
@@ -348,6 +379,7 @@ void testBasicsAndDefaults()
         { id::pattern, 0 }, { id::rate, 1 }, { id::bassMode, 1 }, { id::velocity, 0.75f }, { id::gate, 0.9f },
         { id::swing, 0 }, { id::humanize, 0 }, { id::previewOn, 1 }, { id::previewTone, 0 }, { id::previewVolume, -9 },
         { id::midiOut, 1 }, { id::syncToHost, 1 }, { id::scaleLock, 0 }, { id::chordTrigger, 0 }, { id::triggerSevenths, 0 },
+        { id::midiOutPart, 0 },
     };
 
     for (auto& d : defaults)
@@ -356,7 +388,14 @@ void testBasicsAndDefaults()
         check (std::abs (v - d.value) < 1.0e-4f, str ("default ", d.id, " == ", d.value), str ("got ", v));
     }
 
-    check (p.getParameters().size() == 20, "parameter count == 20", str ("got ", p.getParameters().size()));
+    check (p.getParameters().size() == 21, "parameter count == 21", str ("got ", p.getParameters().size()));
+    {
+        auto* sync = p.getAPVTS().getParameter (id::syncToHost);
+        check (sync != nullptr && sync->getName (64) == "Play With Host", "syncToHost is shown as \"Play With Host\"",
+               sync != nullptr ? sync->getName (64).toStdString() : std::string ("missing"));
+        auto* part = dynamic_cast<juce::AudioParameterChoice*> (p.getAPVTS().getParameter (id::midiOutPart));
+        check (part != nullptr && part->choices.size() == 3 && part->choices[0] == "Chords + Bass", "midiOutPart choices");
+    }
 
     const auto key = p.getKey();
     check (key.tonic == 0 && key.scale == cb::ScaleType::Major, "getKey default C Major");
@@ -665,7 +704,7 @@ void testStateRoundTrip()
     }
     check (slotsOk, "state: invalid slots clamped and truncated to kMaxSlots");
     const auto ed = z.getSavedEditorSize();
-    check (ed.x >= 960 && ed.x <= 1600 && ed.y >= 600 && ed.y <= 1000, "state: editor size clamped to the resizable range",
+    check (ed.x >= 960 && ed.x <= 1600 && ed.y >= 560 && ed.y <= 1000, "state: editor size clamped to the resizable range",
            str (ed.x, "x", ed.y));
 
     juce::MemoryBlock afterBad;
@@ -899,15 +938,34 @@ void testLocalPlayback()
                                 spb, 0.0, 0, "local 100 bpm, slot 0");
         check (onNotesAt (rig.all, 1, (juce::int64) std::floor (4.0 * spb)).size() >= 3, "local 100 bpm: slot 1 at 4 beats");
 
-        // Host starts -> local yields to host sync, then host stops -> local restarts from the top
+        // Host starts -> local yields to host sync; host stops -> Chordbloom's own Play is switched off as well (B5,
+        // behaviour changed in round 2: it used to restart its own loop, which kept playing after FL stopped).
         rig.head.playing = true;
         rig.head.ppq = 8.0;
         rig.run (2);
         check (p.getPlayingSlot() == 2, "local->host: host transport takes over", str (p.getPlayingSlot()));
         rig.head.playing = false;
-        const auto restartAt = rig.samplePos;
-        auto evs = rig.run (2);
-        check (! onNotesAt (evs, 1, restartAt, 0).empty() && p.getPlayingSlot() == 0, "host->local: local restarts from slot 0");
+        auto evs = rig.run (4);
+        check (! p.isLocalPlaybackOn() && p.getPlayingSlot() == -1 && countOns (evs) == 0 && rig.openCount() == 0,
+               "host stop: Chordbloom's own loop stops too (Play switched off, nothing keeps playing)",
+               str ("local ", p.isLocalPlaybackOn(), " slot ", p.getPlayingSlot(), " ons ", countOns (evs)));
+
+        // Play pressed while the host plays (follows the host), then the host stops -> silence as well
+        rig.head.playing = true;
+        rig.head.ppq = 0.0;
+        rig.run (2);
+        p.setLocalPlayback (true);
+        rig.run (2);
+        rig.head.playing = false;
+        evs = rig.run (3);
+        check (! p.isLocalPlaybackOn() && p.getPlayingSlot() == -1 && countOns (evs) == 0 && rig.openCount() == 0,
+               "Play pressed while the host plays: host stop silences it");
+
+        // Local playback while the host is stopped still works
+        p.setLocalPlayback (true);
+        evs = rig.run (3);
+        check (p.isLocalPlaybackOn() && countOns (evs, 0, std::numeric_limits<juce::int64>::max(), 1) >= 3,
+               "local playback still starts while the host is stopped");
         p.setLocalPlayback (false);
         rig.run (1);
         check (rig.openCount() == 0, "local: no hanging notes after mode changes");
@@ -1123,10 +1181,16 @@ void testChordTrigger()
     mean /= juce::jmax ((size_t) 1, d5.size());
     check (std::abs (mean - 60.0) <= 9.0, "chordTrigger: C5 octave plays around the voicing centre", str ("mean ", mean));
     check (p.getTriggeredDegree() == 1, "chordTrigger: getTriggeredDegree while held", str (p.getTriggeredDegree()));
+    {
+        const auto shown = p.getTriggeredNotes();   // B26: the keyboard guide shows exactly what is played
+        check (std::set<int> (shown.begin(), shown.end()) == d5, "chordTrigger: getTriggeredNotes == the notes sent",
+               notesToString (shown));
+    }
 
     evs = rig.processBlock (noteOff (62));
     check (rig.openCount() == 0, "chordTrigger: release sends note-offs for the whole chord");
     check (p.getTriggeredDegree() == -1, "chordTrigger: degree -1 after release");
+    check (p.getTriggeredNotes().empty(), "chordTrigger: no triggered notes after release");
 
     evs = rig.processBlock (noteOn (50));   // D4
     std::set<int> d4;
@@ -1137,6 +1201,11 @@ void testChordTrigger()
     for (int n : d5)
         d5down.insert (n - 12);
     check (d4 == d5down, "chordTrigger: one octave lower input -> chord one octave lower");
+    {
+        const auto shown = p.getTriggeredNotes();
+        check (std::set<int> (shown.begin(), shown.end()) == d4, "chordTrigger: getTriggeredNotes follows the input octave",
+               notesToString (shown));
+    }
     rig.processBlock (noteOff (50));
 
     evs = rig.processBlock (noteOn (61));   // black key
@@ -1560,14 +1629,46 @@ void testMidiExport()
         return -1.0;
     };
 
+    auto trackName = [] (const juce::MidiFile& mf, int track)
+    {
+        if (track >= mf.getNumTracks())
+            return juce::String();
+        for (auto* h : *mf.getTrack (track))
+            if (h->message.isTrackNameEvent())
+                return h->message.getTextFromTextMetaEvent();
+        return juce::String();
+    };
+
+    auto onlyChannel = [] (const juce::MidiFile& mf, int track, int channel)
+    {
+        if (track >= mf.getNumTracks())
+            return false;
+        for (auto* h : *mf.getTrack (track))
+            if (h->message.isNoteOnOrOff() && h->message.getChannel() != channel)
+                return false;
+        return true;
+    };
+
+    // Both parts: one named track per part (round 2: used to be one track with two channels)
     juce::MidiFile parsed;
     const bool ok = parse (cb::midiexport::buildMidiFile (events, 90.0, true, true), parsed);
-    check (ok && parsed.getNumTracks() == 2 && parsed.getTimeFormat() == 960, "export: type-1, 2 tracks, 960 ppq");
+    check (ok && parsed.getNumTracks() == 3 && parsed.getTimeFormat() == 960, "export: type-1, tempo + chords + bass tracks, 960 ppq",
+           str (parsed.getNumTracks(), " tracks"));
+    check (trackName (parsed, 1) == "Chordbloom Chords" && trackName (parsed, 2) == "Chordbloom Bass"
+               && onlyChannel (parsed, 1, 1) && onlyChannel (parsed, 2, 2),
+           "export: Both = two named tracks (chords ch1, bass ch2)",
+           (trackName (parsed, 1) + " / " + trackName (parsed, 2)).toStdString());
     check (std::abs (tempoOf (parsed) - 90.0) < 0.01, "export: tempo track (90 bpm)", str (tempoOf (parsed)));
     check (countNoteOns (parsed) == 3 && countNoteOns (parsed, 1) == 2 && countNoteOns (parsed, 2) == 1, "export: both parts, channels kept");
+    {
+        juce::MidiFile noBass;
+        std::vector<cb::NoteEvent> chordsOnlyEvents (events.begin(), events.begin() + 2);
+        parse (cb::midiexport::buildMidiFile (chordsOnlyEvents, 120.0, true, true), noBass);
+        check (noBass.getNumTracks() == 2 && trackName (noBass, 1) == "Chordbloom Chords", "export: Both without bass notes has no empty bass track");
+    }
 
     bool tickOk = false;
-    if (parsed.getNumTracks() == 2)
+    if (parsed.getNumTracks() == 3)
         for (auto* h : *parsed.getTrack (1))
             if (h->message.isNoteOn() && h->message.getNoteNumber() == 64)
                 tickOk = std::abs (h->message.getTimeStamp() - 1440.0) < 0.5 && h->noteOffObject != nullptr
@@ -1591,8 +1692,9 @@ void testMidiExport()
     const auto file = p.writeMidiToTempFile (ChordbloomProcessor::ExportPart::Chords);
     const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("Chordbloom");
     check (file.existsAsFile(), "export: temp file written", file.getFullPathName().toStdString());
-    check (file.getFileName() == "Chordbloom - C Major - Chords.mid" && file.getParentDirectory() == dir,
-           "export: temp file name/location", file.getFullPathName().toStdString());
+    check (file.getFileName() == "C Am F G - C major - Chords.mid" && file.getParentDirectory() == dir
+               && file.getFileName() == p.getExportFileName (ChordbloomProcessor::ExportPart::Chords),
+           "export: temp file named after the progression, in <temp>/Chordbloom", file.getFullPathName().toStdString());
 
     auto readFile = [] (const juce::File& f, juce::MidiFile& out)
     {
@@ -1613,13 +1715,23 @@ void testMidiExport()
 
     const auto bassFile = p.writeMidiToTempFile (ChordbloomProcessor::ExportPart::Bass);
     juce::MidiFile bassParsed;
-    check (bassFile.getFileName() == "Chordbloom - C Major - Bass.mid" && readFile (bassFile, bassParsed)
+    check (bassFile.getFileName() == "C Am F G - C major - Bass.mid" && readFile (bassFile, bassParsed)
                && countNoteOns (bassParsed) == nBass && countNoteOns (bassParsed, 1) == 0,
            "export: bass file", str (countNoteOns (bassParsed), " vs ", nBass));
 
     const auto bothFile = p.writeMidiToTempFile (ChordbloomProcessor::ExportPart::Both);
     juce::MidiFile bothParsed;
-    check (readFile (bothFile, bothParsed) && countNoteOns (bothParsed) == (int) rendered.size(), "export: both file");
+    check (readFile (bothFile, bothParsed) && countNoteOns (bothParsed) == (int) rendered.size() && bothParsed.getNumTracks() == 3
+               && bothFile.getFileName() == "C Am F G - C major - Chords + Bass.mid",
+           "export: both file (two named tracks)", bothFile.getFileName().toStdString());
+    {
+        bool loopLong = bothParsed.getNumTracks() == 3;
+        for (int t = 1; t < bothParsed.getNumTracks(); ++t)
+            for (auto* h : *bothParsed.getTrack (t))
+                if (h->message.isEndOfTrackMetaEvent())
+                    loopLong = loopLong && std::abs (h->message.getTimeStamp() - 16.0 * 960.0) < 0.5;
+        check (loopLong, "export: both tracks are exactly one loop long");
+    }
 
     const auto custom = dir.getChildFile ("selftest-save.mid");
     check (p.saveMidiFile (custom, ChordbloomProcessor::ExportPart::Both) && custom.existsAsFile(), "export: saveMidiFile");
@@ -1630,6 +1742,762 @@ void testMidiExport()
 
     ChordbloomProcessor empty;
     check (! empty.saveMidiFile (custom, ChordbloomProcessor::ExportPart::Both), "export: saveMidiFile false for empty progression");
+}
+
+//==============================================================================
+// Round 2 (processor review fixes)
+//==============================================================================
+
+// B1: VST3 hosts call processBlock with 0 samples (parameter flush). Note-offs drained in such a call must reach the
+// built-in synth (Warm Pad used to drone forever), and a zeroed play head in it must not read as a transport stop.
+void testZeroSampleBlocks()
+{
+    {
+        ChordbloomProcessor p;
+        setParam (p, cb::ParamIDs::previewTone, 1.0f);   // Warm Pad (infinite sustain before round 2)
+        pumpMessages (20);
+        Rig rig (p);
+        p.startPreviewChord (C_);
+        rig.run (50);
+        p.stopPreview();
+        const auto evs = rig.processZero();
+        int offs = 0;
+        for (auto& e : evs)
+            offs += e.on ? 0 : 1;
+        check (offs >= 3 && rig.openCount() == 0, "0-sample block: preview note-offs go out as MIDI", str (offs, " offs"));
+        rig.run (600);   // 6.4 s
+        check (rig.blockPeak() < 1.0e-4f, "0-sample block: the synth gets the note-offs too (no Warm Pad drone)",
+               str ("peak ", rig.blockPeak()));
+
+        // live input inside a 0-sample call: passes through and sounds
+        rig.processZero (noteOn (67));
+        rig.run (5);
+        check (rig.openNotes (1).count (67) == 1 && rig.blockPeak() > 1.0e-4f, "0-sample block: live note-on handled");
+        rig.processZero (noteOff (67));
+        rig.run (600);
+        check (rig.openCount() == 0 && rig.blockPeak() < 1.0e-4f, "0-sample block: live note-off reaches synth and MIDI out");
+    }
+
+    {
+        ChordbloomProcessor p;
+        p.setProgression (makeProgression ({ C_, Am_, F_, G_ }));
+        const auto voicings = p.getProgressionVoicings();
+        Rig rig (p);
+        rig.head.playing = true;
+        rig.run (60);   // ~1.3 beats into slot 0
+        const auto before = rig.openNotes (1);
+
+        // VST3 flush call with a zeroed play head (not playing, ppq 0)
+        const double ppq = rig.head.ppq;
+        rig.head.playing = false;
+        rig.head.ppq = 0.0;
+        const auto flush = rig.processZero();
+        rig.head.playing = true;
+        rig.head.ppq = ppq;
+        check (flush.empty() && rig.openNotes (1) == before && ! before.empty(),
+               "0-sample block with a zeroed play head: playback is not stopped", str (flush.size(), " events"));
+
+        const auto next = rig.run (10);
+        check (countOns (next) == 0 && rig.openNotes (1) == before && rig.doubleOns == 0,
+               "0-sample block: playback continues seamlessly afterwards (no re-strike)", str (countOns (next), " note-ons"));
+        check (p.getPlayingSlot() == 0, "0-sample block: still in slot 0");
+
+        rig.head.playing = false;
+        rig.run (2);
+        check (rig.openCount() == 0, "0-sample block: real stop still closes everything");
+    }
+}
+
+// B4: FL Studio's pattern mode loops ppq over the pattern length (1 bar for an empty pattern). The progression must
+// keep running across those loops instead of replaying its first chord(s).
+void testHostPatternLoop()
+{
+    for (int reportLoop = 0; reportLoop < 2; ++reportLoop)
+    {
+        for (int bars : { 1, 2 })
+        {
+            ChordbloomProcessor p;
+            p.setProgression (makeProgression ({ C_, Am_, F_, G_ }));   // 16 beats
+            const auto voicings = p.getProgressionVoicings();
+            Rig rig (p, 48000.0, 441);   // the pattern end falls inside a block
+            rig.hostLoopLen = 4.0 * bars;
+            rig.head.reportLoop = reportLoop == 1;
+            rig.head.loopStart = 0.0;
+            rig.head.loopEnd = rig.hostLoopLen;
+            rig.head.playing = true;
+
+            const double spb = rig.samplesPerBeat();
+            const auto evs = rig.run ((int) std::ceil (33.0 * spb / rig.blockSize));
+
+            const std::string label = str ("pattern loop ", bars, " bar", bars > 1 ? "s" : "", reportLoop ? " (loop points)" : " (no loop points)");
+            bool sequenceOk = voicings.size() == 4;
+            std::string why;
+            for (int i = 0; i < 8 && sequenceOk; ++i)
+            {
+                const auto at = (juce::int64) std::floor (i * 4.0 * spb);
+                const auto got = onNotesAt (evs, 1, at, 2);
+                const auto& v = voicings[(size_t) (i % 4)];
+                if (got != std::set<int> (v.begin(), v.end()))
+                {
+                    sequenceOk = false;
+                    why = str ("chord ", i, " got ", notesToString ({ got.begin(), got.end() }), " want ", notesToString (v));
+                }
+            }
+            check (sequenceOk, label + ": C Am F G keep coming across the host loops", why);
+            check (rig.doubleOns == 0, label + ": no double note-ons");
+            check (std::abs (p.getHostLoopBeats() - 4.0 * bars) < 1e-6, label + ": getHostLoopBeats reports the pattern length",
+                   str (p.getHostLoopBeats()));
+
+            if (bars == 1 && reportLoop == 0)
+            {
+                // A genuine relocation (mid-bar click) still follows the host's position
+                rig.hostLoopLen = 0.0;
+                rig.head.ppq = 9.37;
+                rig.processBlock();
+                const auto open = rig.openNotes (1);
+                check (p.getPlayingSlot() == 2 && open == std::set<int> (voicings[2].begin(), voicings[2].end()),
+                       "pattern loop: a mid-bar relocation still jumps to the host position", str ("slot ", p.getPlayingSlot()));
+            }
+
+            rig.head.playing = false;
+            rig.run (2);
+            check (rig.openCount() == 0, label + ": stop leaves nothing on");
+        }
+    }
+}
+
+// B6: a host loop wrapping inside a block (hosts that do not split the block at the loop end) must not flam the
+// downbeat chord; loops that are relocations must not blip the chord after the loop end.
+void testHostLoopWrapNoFlam()
+{
+    for (int reportLoop = 0; reportLoop < 2; ++reportLoop)
+    {
+        ChordbloomProcessor p;
+        p.setProgression (makeProgression ({ C_, Am_, F_, G_ }));
+        const auto voicings = p.getProgressionVoicings();
+        const auto expected = p.renderProgressionEvents();
+        Rig rig (p, 48000.0, 441);
+        rig.hostLoopLen = 16.0;
+        rig.head.reportLoop = reportLoop == 1;
+        rig.head.loopEnd = 16.0;
+        rig.head.playing = true;
+        const double spb = rig.samplesPerBeat();
+        rig.run ((int) std::ceil (49.0 * spb / rig.blockSize));
+
+        const std::string label = reportLoop ? "loop wrap (loop points)" : "loop wrap (no loop points)";
+        const int window = (int) (0.05 * rig.sr);
+        bool once = true;
+        std::string why;
+        for (int k = 1; k <= 2; ++k)
+        {
+            const auto wrap = (juce::int64) std::floor (16.0 * k * spb);
+            for (int n : voicings[0])
+            {
+                int ons = 0, offsAfter = 0;
+                for (auto& e : rig.all)
+                {
+                    if (e.channel != 1 || e.note != n || e.sample < wrap - window || e.sample > wrap + window)
+                        continue;
+                    if (e.on)
+                        ++ons;
+                    else if (e.sample > wrap)
+                        ++offsAfter;
+                }
+                if (ons != 1 || offsAfter != 0)
+                {
+                    once = false;
+                    why = str ("loop ", k, " note ", n, ": ", ons, " ons, ", offsAfter, " offs after the downbeat");
+                }
+            }
+        }
+        check (once, label + ": downbeat chord struck exactly once per loop (no flam)", why);
+        checkLoopAgainstRender (rig.all, expected, spb, 16.0, 0, label + " loop 2");
+        check (rig.doubleOns == 0, label + ": no double note-ons");
+        rig.head.playing = false;
+        rig.run (2);
+        check (rig.openCount() == 0, label + ": nothing left on");
+    }
+
+    // 24-beat host loop over a 16-beat progression (a relocation every loop) with loop points: no blip of slot 2
+    {
+        ChordbloomProcessor p;
+        p.setProgression (makeProgression ({ C_, Am_, F_, G_ }));
+        const auto voicings = p.getProgressionVoicings();
+        Rig rig (p, 48000.0, 441);
+        rig.hostLoopLen = 24.0;
+        rig.head.reportLoop = true;
+        rig.head.loopEnd = 24.0;
+        rig.head.playing = true;
+        const double spb = rig.samplesPerBeat();
+        rig.run ((int) std::ceil (25.0 * spb / rig.blockSize));
+
+        const auto wrap = (juce::int64) std::floor (24.0 * spb);
+        const int window = (int) (0.05 * rig.sr);
+        std::set<int> struck;
+        for (auto& e : rig.all)
+            if (e.on && e.channel == 1 && e.sample >= wrap - window && e.sample <= wrap + window)
+                struck.insert (e.note);
+        check (struck == std::set<int> (voicings[0].begin(), voicings[0].end()),
+               "24-beat host loop: only the slot-0 chord is struck at the wrap (no blip of the next slot)",
+               notesToString ({ struck.begin(), struck.end() }));
+        check (p.getHostLoopBeats() == 0.0 && rig.doubleOns == 0, "24-beat host loop: treated as relocation, balanced");
+        rig.head.playing = false;
+        rig.run (2);
+        check (rig.openCount() == 0, "24-beat host loop: nothing left on");
+    }
+}
+
+// B7: velocity / gate / swing / humanize tweaks while the loop plays re-time notes but never strike mid-step.
+void testTimingTweaksDoNotRestrike()
+{
+    ChordbloomProcessor p;
+    namespace id = cb::ParamIDs;
+    p.setProgression (makeProgression ({ C_, Am_, F_, G_ }));
+    setParam (p, id::pattern, (float) cb::RhythmPattern::Pulse);
+    setParam (p, id::rate, (float) cb::RateDivision::Eighth);
+    setParam (p, id::bassMode, (float) cb::BassMode::Off);
+    setParam (p, id::gate, 0.2f);
+    pumpMessages (100);
+
+    Rig rig (p);
+    p.setLocalPlayback (true);
+    const double spb = rig.samplesPerBeat();
+    auto runTo = [&] (double beat)
+    {
+        std::vector<Ev> evs;
+        while ((double) (rig.samplePos + rig.blockSize) <= beat * spb)
+        {
+            auto e = rig.processBlock();
+            evs.insert (evs.end(), e.begin(), e.end());
+        }
+        return evs;
+    };
+    auto sampleOf = [&] (double beat) { return (juce::int64) std::floor (beat * spb); };
+
+    runTo (1.24);
+    setParam (p, id::gate, 1.0f);
+    pumpMessages (80);
+    auto evs = runTo (1.49);
+    check (countOns (evs) == 0, "gate 0.2 -> 1.0 mid-step: no ghost hit before the next step", str (countOns (evs), " note-ons"));
+    evs = runTo (1.62);
+    check (countOns (evs, sampleOf (1.5) - 2, sampleOf (1.5) + 2) >= 3, "gate change: the next step plays normally");
+
+    // Swing 0 -> 1 while the off-beat chord at 2.5 sounds: it is neither cut nor struck again at its swung position
+    setParam (p, id::gate, 0.9f);
+    pumpMessages (80);
+    runTo (2.52);
+    const auto heldBefore = rig.openNotes (1);
+    setParam (p, id::swing, 1.0f);
+    pumpMessages (80);
+    evs = runTo (2.98);
+    int offsEarly = 0;
+    for (auto& e : evs)
+        if (! e.on && e.sample < sampleOf (2.66))
+            ++offsEarly;
+    check (! heldBefore.empty() && countOns (evs) == 0 && offsEarly == 0,
+           "swing change mid-step: sounding off-beat chord not cut, not re-struck",
+           str (countOns (evs), " note-ons, ", offsEarly, " early note-offs"));
+    evs = runTo (3.1);
+    check (countOns (evs, sampleOf (3.0) - 2, sampleOf (3.0) + 2) >= 3, "swing change: the downbeat at 3.0 plays normally");
+
+    // Humanize mid-step
+    runTo (3.2);
+    setParam (p, id::humanize, 1.0f);
+    pumpMessages (80);
+    evs = runTo (3.45);
+    check (countOns (evs) == 0, "humanize change mid-step: no extra strike", str (countOns (evs), " note-ons"));
+
+    // A structural change (pattern) still chases the new notes immediately
+    runTo (5.0);
+    setParam (p, id::pattern, (float) cb::RhythmPattern::Block);
+    pumpMessages (80);
+    rig.processBlock();
+    const auto vAm = p.getProgressionVoicings()[1];
+    check (rig.openNotes (1) == std::set<int> (vAm.begin(), vAm.end()), "pattern change mid-slot: the held chord is chased");
+
+    p.setLocalPlayback (false);
+    rig.run (2);
+    check (rig.openCount() == 0 && rig.doubleOns == 0, "timing tweaks: balanced, nothing left on");
+}
+
+// I21 + B8: the built-in synth honours CC64; switching MIDI Out off releases a forwarded pedal / bend downstream.
+void testSustainPedal()
+{
+    auto cc = [] (int controller, int value, int channel = 1)
+    {
+        juce::MidiBuffer b;
+        b.addEvent (juce::MidiMessage::controllerEvent (channel, controller, value), 0);
+        return b;
+    };
+
+    {
+        ChordbloomProcessor p;
+        Rig rig (p);
+        rig.processBlock (noteOn (72));
+        rig.run (20);
+        rig.processBlock (noteOff (72));
+        rig.run (60);   // ~0.64 s
+        check (rig.blockPeak() < 5.0e-4f, "synth: without the pedal a released note fades", str ("peak ", rig.blockPeak()));
+
+        rig.processBlock (cc (64, 127));
+        rig.processBlock (noteOn (72));
+        rig.run (20);
+        rig.processBlock (noteOff (72));
+        rig.run (60);
+        check (rig.blockPeak() > 1.0e-3f, "synth: sustain pedal keeps the released note ringing", str ("peak ", rig.blockPeak()));
+        check (rig.openCount() == 0, "sustain: the note-off itself is still sent as MIDI out");
+        rig.processBlock (cc (64, 0));
+        rig.run (100);
+        check (rig.blockPeak() < 1.0e-3f, "synth: pedal up releases the sustained note", str ("peak ", rig.blockPeak()));
+    }
+
+    {
+        ChordbloomProcessor p;
+        Rig rig (p);
+        rig.processBlock (cc (64, 127));
+        juce::MidiBuffer bend;
+        bend.addEvent (juce::MidiMessage::pitchWheel (1, 12000), 0);
+        rig.processBlock (bend);
+        rig.processBlock (noteOn (60));
+        rig.processBlock (noteOff (60));
+        setParam (p, cb::ParamIDs::midiOut, 0.0f);
+        rig.processBlock();
+        bool pedalUp = false, bendCentred = false, otherChannels = false;
+        for (auto& m : rig.lastOthers)
+        {
+            if (m.isSustainPedalOff() && m.getChannel() == 1)
+                pedalUp = true;
+            else if (m.isPitchWheel() && m.getChannel() == 1 && m.getPitchWheelValue() == 8192)
+                bendCentred = true;
+            else
+                otherChannels = true;
+        }
+        check (pedalUp && bendCentred, "MIDI Out off: a forwarded sustain pedal is released and the bend centred",
+               str (rig.lastOthers.size(), " messages"));
+        check (! otherChannels, "MIDI Out off: only the channels that need it get a reset");
+
+        rig.processBlock (cc (64, 127));
+        check (rig.lastOthers.empty(), "MIDI Out off: live controllers are not forwarded");
+        setParam (p, cb::ParamIDs::midiOut, 1.0f);
+        rig.processBlock (cc (64, 0));
+        check (rig.lastOthers.size() == 1, "MIDI Out on again: controllers forwarded");
+    }
+}
+
+// B15: an input note-off without a matching note-on must not cut a preview / playback note of the same pitch.
+void testUnmatchedNoteOff()
+{
+    ChordbloomProcessor p;
+    Rig rig (p);
+    p.startPreviewNote (60);
+    rig.processBlock();
+    rig.processBlock (noteOff (60));
+    check (rig.openNotes (1).count (60) == 1 && p.getSoundingNotes().test (60),
+           "unmatched live note-off does not cut the preview note of the same pitch");
+    p.stopPreview();
+    rig.processBlock();
+    check (rig.openCount() == 0, "unmatched note-off: the preview's own note-off closes it");
+
+    const auto evs = rig.processBlock (noteOff (62, 5));
+    check (findEvent (evs, false, 1, 62, rig.samplePos - rig.blockSize + 5, 0) != nullptr,
+           "unmatched note-off passes through when nothing holds the note");
+
+    // Same with playback on channel 1
+    p.setProgression (makeProgression ({ C_ }));
+    p.setLocalPlayback (true);
+    rig.run (4);
+    const auto open = rig.openNotes (1);
+    const int n = open.empty() ? 60 : *open.begin();
+    rig.processBlock (noteOff (n));
+    check (! open.empty() && rig.openNotes (1) == open, "unmatched note-off does not cut a playback note");
+    p.setLocalPlayback (false);
+    rig.run (2);
+    check (rig.openCount() == 0, "unmatched note-off: balanced afterwards");
+}
+
+// B17: the first bypassed block's cleanup note-offs come before the block's input (a new note-on is not cancelled).
+void testBypassOrdering()
+{
+    ChordbloomProcessor p;
+    Rig rig (p);
+    p.startPreviewNote (60);
+    rig.processBlock();
+    check (rig.openNotes (1).count (60) == 1, "bypass order: preview note on before");
+
+    rig.bypassed = true;
+    const auto evs = rig.processBlock (noteOn (60, 0, 1));
+    check (evs.size() == 2 && ! evs[0].on && evs[1].on && rig.openNotes (1).count (60) == 1,
+           "bypass: cleanup note-off precedes a new input note-on of the same pitch", str (evs.size(), " events"));
+    rig.processBlock (noteOff (60, 0, 1));
+    rig.bypassed = false;
+    p.stopPreview();
+    rig.run (2);
+    check (rig.openCount() == 0, "bypass order: balanced afterwards");
+}
+
+// I13: midiOutPart filters playback MIDI out (previews and live input count as chords); the synth plays everything.
+void testMidiOutPart()
+{
+    namespace id = cb::ParamIDs;
+    ChordbloomProcessor p;
+    p.setProgression (makeProgression ({ C_, Am_, F_, G_ }));
+    Rig rig (p);
+    rig.head.playing = true;
+    const double spb = rig.samplesPerBeat();
+
+    setParam (p, id::midiOutPart, 1.0f);   // Chords only
+    auto evs = rig.run ((int) std::ceil (6.0 * spb / rig.blockSize));   // mid slot 1
+    bool bassSounds = false;
+    for (int n = 28; n <= 55; ++n)
+        bassSounds = bassSounds || p.getSoundingNotes().test ((size_t) n);
+    check (countOns (evs, 0, std::numeric_limits<juce::int64>::max(), 2) == 0 && countOns (evs, 0, std::numeric_limits<juce::int64>::max(), 1) >= 6,
+           "midiOutPart Chords only: no bass notes on MIDI out");
+    check (bassSounds, "midiOutPart: the built-in sound still plays the bass");
+
+    setParam (p, id::midiOutPart, 2.0f);   // Bass only
+    evs = rig.run (2);
+    check (rig.openNotes (1).empty(), "midiOutPart -> Bass only: the sent chord notes are closed at once");
+    p.startPreviewChord (F_);
+    evs = rig.processBlock (noteOn (90, 3, 1));
+    auto more = rig.run ((int) std::ceil (8.0 * spb / rig.blockSize));
+    evs.insert (evs.end(), more.begin(), more.end());
+    check (countOns (evs, 0, std::numeric_limits<juce::int64>::max(), 1) == 0 && countOns (evs, 0, std::numeric_limits<juce::int64>::max(), 2) >= 1,
+           "midiOutPart Bass only: only playback bass goes out (no chords, previews or live input)");
+    check (p.getSoundingNotes().test (90), "midiOutPart Bass only: live input still sounds internally");
+    rig.processBlock (noteOff (90, 0, 1));
+    p.stopPreview();
+
+    setParam (p, id::midiOutPart, 1.0f);   // switch while a bass note sounds
+    rig.run (2);
+    check (rig.openNotes (2).empty(), "midiOutPart -> Chords only: the sent bass note is closed at once");
+
+    setParam (p, id::midiOutPart, 0.0f);
+    rig.run ((int) std::ceil (4.0 * spb / rig.blockSize));
+    check (! rig.openNotes (1).empty() && ! rig.openNotes (2).empty(), "midiOutPart Chords + Bass: both parts again");
+    p.startPreviewChord (C_);
+    rig.run (2);
+    p.stopPreview();
+    rig.head.playing = false;
+    rig.run (2);
+    check (rig.openCount() == 0 && rig.doubleOns == 0, "midiOutPart: nothing left on, never a double note-on",
+           str (rig.openCount(), " open, ", rig.doubleOns, " double"));
+}
+
+// B14 + I25: export names come from the progression, keep '#', contain nothing Windows forbids, <= 60 characters.
+void testExportNames()
+{
+    namespace id = cb::ParamIDs;
+    using Part = ChordbloomProcessor::ExportPart;
+    auto legal = [] (const juce::String& n)
+    {
+        return n.length() <= 60 && ! n.containsAnyOf ("<>:\"/\\|?*") && n.endsWith (".mid") && ! n.dropLastCharacters (4).endsWith (" ")
+            && ! n.dropLastCharacters (4).endsWith (".");
+    };
+
+    ChordbloomProcessor p;
+    setParam (p, id::keyRoot, 6.0f);
+    setParam (p, id::scale, 1.0f);   // F# Natural Minor
+    pumpMessages (30);
+    p.setProgression (makeProgression ({ { 6, cb::ChordQuality::Minor }, { 2, cb::ChordQuality::Major },
+                                         { 9, cb::ChordQuality::Major }, { 4, cb::ChordQuality::Major } }));
+    const auto name = p.getExportFileName (Part::Chords);
+    check (name == "F#m D A E - F# minor - Chords.mid", "export name: from the progression, '#' kept", name.toStdString());
+    const auto file = p.writeMidiToTempFile (Part::Chords);
+    check (file.getFileName() == name && file.existsAsFile(), "export name: temp file uses it", file.getFullPathName().toStdString());
+    check (p.getExportFileName (Part::Bass) == "F#m D A E - F# minor - Bass.mid"
+               && p.getExportFileName (Part::Both) == "F#m D A E - F# minor - Chords + Bass.mid",
+           "export name: part labels");
+
+    ChordbloomProcessor fMajor, fSharpMajor;
+    setParam (fMajor, id::keyRoot, 5.0f);
+    setParam (fSharpMajor, id::keyRoot, 6.0f);
+    pumpMessages (30);
+    fMajor.setProgression (makeProgression ({ F_, C_ }));
+    fSharpMajor.setProgression (makeProgression ({ { 6, cb::ChordQuality::Major }, { 1, cb::ChordQuality::Major } }));
+    const auto nf = fMajor.getExportFileName (Part::Chords), nfs = fSharpMajor.getExportFileName (Part::Chords);
+    check (nf != nfs && nfs.contains ("F#") && nfs.contains ("F# major"), "export name: F# major differs from F major",
+           (nf + " / " + nfs).toStdString());
+
+    ChordbloomProcessor longOne;
+    cb::Progression big;
+    for (int i = 0; i < cb::kMaxSlots; ++i)
+        big.slots.push_back ({ { (i * 7) % 12, (cb::ChordQuality) (i % cb::numChordQualities) }, 2, -1, 0 });
+    longOne.setProgression (big);
+    bool allLegal = true;
+    std::string bad;
+    for (auto part : { Part::Chords, Part::Bass, Part::Both })
+    {
+        const auto n = longOne.getExportFileName (part);
+        if (! legal (n))
+        {
+            allLegal = false;
+            bad += n.toStdString() + " | ";
+        }
+    }
+    const auto longName = longOne.getExportFileName (Part::Both);
+    check (allLegal && longName.contains (" ...") && longName.endsWith (" - C major - Chords + Bass.mid"),
+           "export name: 16 chords of every quality -> shortened, legal, <= 60 chars", bad + longName.toStdString());
+    check (longOne.writeMidiToTempFile (Part::Both).existsAsFile(), "export name: long progression writes a file");
+
+    cb::Progression sixNine;
+    sixNine.slots.push_back ({ { 0, cb::ChordQuality::Major69 }, 4, -1, 0 });
+    longOne.setProgression (sixNine);
+    check (legal (longOne.getExportFileName (Part::Chords)), "export name: 6/9 chord has no '/'",
+           longOne.getExportFileName (Part::Chords).toStdString());
+
+    ChordbloomProcessor empty;
+    check (empty.getExportFileName (Part::Chords) == "Chordbloom - C major - Chords.mid", "export name: empty progression",
+           empty.getExportFileName (Part::Chords).toStdString());
+}
+
+// I3: a single chord / a single slot as a MIDI file (for drags straight into the DAW).
+void testSingleChordExport()
+{
+    auto readFile = [] (const juce::File& f, juce::MidiFile& out)
+    {
+        juce::FileInputStream in (f);
+        return in.openedOk() && out.readFrom (in);
+    };
+    auto notesOf = [] (const juce::MidiFile& mf, int& ons, int& firstTick, int& channelMask, double& eot)
+    {
+        std::set<int> notes;
+        ons = 0;
+        firstTick = -1;
+        channelMask = 0;
+        eot = -1.0;
+        for (int t = 1; t < mf.getNumTracks(); ++t)
+            for (auto* h : *mf.getTrack (t))
+            {
+                if (h->message.isNoteOn())
+                {
+                    ++ons;
+                    notes.insert (h->message.getNoteNumber());
+                    channelMask |= 1 << h->message.getChannel();
+                    if (firstTick < 0 || h->message.getTimeStamp() < firstTick)
+                        firstTick = (int) h->message.getTimeStamp();
+                }
+                if (h->message.isEndOfTrackMetaEvent())
+                    eot = h->message.getTimeStamp();
+            }
+        return notes;
+    };
+
+    const cb::Chord Am7 { 9, cb::ChordQuality::Minor7 };
+    ChordbloomProcessor p;
+    p.startPreviewChord (Am7);   // the drag starts with a press: the file uses what was heard
+    const auto heard = p.getPreviewNotes();
+    p.stopPreview();
+    const auto f = p.writeChordMidiToTempFile (Am7);
+    juce::MidiFile mf;
+    int ons = 0, first = 0, channels = 0;
+    double eot = 0.0;
+    const bool parsed = f.existsAsFile() && readFile (f, mf);
+    const auto notes = parsed ? notesOf (mf, ons, first, channels, eot) : std::set<int>();
+    check (parsed && f.getFileName() == "Am7 - C major.mid", "single chord export: file written and parses back", f.getFullPathName().toStdString());
+    check (notes == std::set<int> (heard.begin(), heard.end()) && ons == (int) heard.size() && first == 0 && channels == (1 << 1),
+           "single chord export: the previewed Am7 voicing, chord channel only, at tick 0",
+           notesToString ({ notes.begin(), notes.end() }) + " vs " + notesToString (heard));
+    check (std::abs (eot - 4.0 * 960.0) < 0.5, "single chord export: 4 beats long", str ("eot ", eot));
+
+    setParam (p, cb::ParamIDs::pattern, (float) cb::RhythmPattern::Pulse);
+    pumpMessages (50);
+    const auto pulse = p.writeChordMidiToTempFile (G_);
+    juce::MidiFile pm;
+    const bool pulseOk = readFile (pulse, pm);
+    notesOf (pm, ons, first, channels, eot);
+    check (pulseOk && ons == 8 * 3, "single chord export: current pattern applies (Pulse 1/8 -> 8 strikes)", str (ons, " note-ons"));
+    setParam (p, cb::ParamIDs::pattern, 0.0f);
+    pumpMessages (50);
+
+    p.setProgression (makeProgression ({ C_, Am_, F_, G_ }));
+    const auto voicings = p.getProgressionVoicings();
+    const auto s = p.writeSlotMidiToTempFile (1);
+    juce::MidiFile sm;
+    const bool slotOk = s.existsAsFile() && readFile (s, sm);
+    const auto slotNotes = slotOk ? notesOf (sm, ons, first, channels, eot) : std::set<int>();
+    check (slotOk && slotNotes == std::set<int> (voicings[1].begin(), voicings[1].end()) && first == 0 && channels == (1 << 1)
+               && std::abs (eot - 4.0 * 960.0) < 0.5,
+           "slot export: that slot's voicing, shifted to beat 0, one slot long", notesToString ({ slotNotes.begin(), slotNotes.end() }));
+    check (p.writeSlotMidiToTempFile (7) == juce::File() && p.writeSlotMidiToTempFile (-1) == juce::File(), "slot export: invalid slot -> File()");
+}
+
+// I10: transpose (undoable) and the "move chords to key" suggestion.
+void testTranspose()
+{
+    namespace id = cb::ParamIDs;
+    ChordbloomProcessor p;
+    check (p.bestTranspositionForKey() == 0, "transpose: empty progression -> 0");
+    const auto original = makeProgression ({ C_, G_, Am_, F_ });
+    p.setProgression (original);
+    check (p.bestTranspositionForKey() == 0, "best transposition: already diatonic -> 0");
+
+    setParam (p, id::keyRoot, 6.0f);
+    setParam (p, id::scale, 1.0f);   // F# minor
+    pumpMessages (50);
+    const int best = p.bestTranspositionForKey();
+    check (best == -3, "best transposition: C G Am F into F# minor -> -3 (A E F#m D)", str ("got ", best));
+
+    ChangeCounter counter;
+    p.addChangeListener (&counter);
+    p.transposeProgression (best);
+    pumpMessages (30);
+    const auto& s = p.getProgression().slots;
+    bool allDiatonic = s.size() == 4;
+    for (auto& slot : s)
+        allDiatonic = allDiatonic && cb::isDiatonic (slot.chord, p.getKey());
+    check (s.size() == 4 && s[0].chord.root == 9 && s[1].chord.root == 4 && s[2].chord.root == 6 && s[3].chord.root == 2
+               && s[2].chord.quality == cb::ChordQuality::Minor && allDiatonic,
+           "transpose: every root moved, qualities kept, all diatonic now");
+    check (counter.count > 0, "transpose: sends a change message");
+    check (p.bestTranspositionForKey() == 0, "best transposition after moving: 0");
+    check (p.canUndo() && p.undo() && p.getProgression() == original, "transpose: undo restores the original");
+    check (p.redo() && p.getProgression().slots[0].chord.root == 9, "transpose: redo");
+
+    const auto before = p.getProgression();
+    p.undo();
+    p.redo();
+    const bool couldUndo = p.canUndo();
+    p.transposeProgression (12);
+    p.transposeProgression (0);
+    check (p.getProgression() == before && couldUndo == p.canUndo(), "transpose by 0 / 12: no change");
+    p.transposeProgression (-1);
+    check (p.getProgression().slots[0].chord.root == 8, "transpose -1 semitone");
+    p.removeChangeListener (&counter);
+
+    const int range = p.bestTranspositionForKey();
+    check (range >= -5 && range <= 6, "best transposition stays within -5..+6", str (range));
+}
+
+// I26: a new instance starts with the last key / scale / tone picked in the editor; a loaded state always wins.
+void testUserDefaults()
+{
+    namespace id = cb::ParamIDs;
+    const auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("Chordbloom-selftest.settings");
+    file.deleteFile();
+    ChordbloomProcessor::setUserDefaultsFile (file);
+
+    {
+        ChordbloomProcessor fresh;
+        check (fresh.getKey().tonic == 0 && fresh.getKey().scale == cb::ScaleType::Major, "user defaults: none yet -> C Major");
+    }
+    {
+        ChordbloomProcessor p;
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditorAndMakeActive());
+        setParam (p, id::keyRoot, 6.0f);
+        setParam (p, id::scale, 1.0f);
+        setParam (p, id::previewTone, 1.0f);
+        pumpMessages (500);
+        check (! file.existsAsFile(), "user defaults: parameter changes alone (host / validator) are not recorded");
+        p.rememberUserDefaults();   // what the header's key / scale / tone menus call after the user's pick
+        pumpMessages (500);
+        check (file.existsAsFile(), "user defaults: written after picking a key in the editor");
+
+        // Host automation / a validator moving the key while the editor is open must not become the default.
+        setParam (p, id::keyRoot, 3.0f);
+        setParam (p, id::scale, 6.0f);
+        pumpMessages (500);
+    }
+    {
+        ChordbloomProcessor fresh;
+        check (fresh.getKey().tonic == 6 && fresh.getKey().scale == cb::ScaleType::NaturalMinor && getParam (fresh, id::previewTone) == 1.0f,
+               "user defaults: a new instance starts in F# minor with Warm Pad",
+               str (fresh.getKey().tonic, " ", (int) fresh.getKey().scale, " tone ", getParam (fresh, id::previewTone)));
+        check (fresh.getPalette().size() == (size_t) cb::numPaletteSections && ! fresh.getPalette()[0].chords.empty()
+                   && fresh.getPalette()[0].chords[0].chord.root == 6,
+               "user defaults: the palette is built for that key");
+    }
+
+    juce::MemoryBlock cMajorState;
+    {
+        ChordbloomProcessor src;   // starts in F# minor; set to C major without an editor (not recorded)
+        setParam (src, id::keyRoot, 0.0f);
+        setParam (src, id::scale, 0.0f);
+        setParam (src, id::previewTone, 0.0f);
+        pumpMessages (400);
+        src.getStateInformation (cMajorState);
+    }
+    {
+        ChordbloomProcessor q;
+        std::unique_ptr<juce::AudioProcessorEditor> editor (q.createEditorAndMakeActive());
+        q.setStateInformation (cMajorState.getData(), (int) cMajorState.getSize());
+        pumpMessages (500);
+        check (q.getKey().tonic == 0 && q.getKey().scale == cb::ScaleType::Major, "user defaults: a loaded project state wins");
+    }
+    {
+        ChordbloomProcessor fresh;
+        check (fresh.getKey().tonic == 6 && fresh.getKey().scale == cb::ScaleType::NaturalMinor,
+               "user defaults: neither a state load nor changes without the editor overwrite them");
+    }
+
+    ChordbloomProcessor::setUserDefaultsFile ({});   // back to disabled (dev tool default)
+    file.deleteFile();
+    ChordbloomProcessor plain;
+    check (plain.getKey().tonic == 0, "user defaults: disabled -> factory defaults");
+}
+
+// B27: Soft Keys must not alias on high notes at full velocity (the 9th harmonic of MIDI 104 folds to ~14.2 kHz).
+void testSoftKeysAliasing()
+{
+    constexpr double sr = 44100.0;
+    constexpr int n = 882;   // first 20 ms, where the modulation index is highest
+    PreviewSynth synth;
+    synth.prepare (sr, 1024);
+    synth.setTone (PreviewSynth::Tone::SoftKeys);
+    synth.setGainDecibels (-9.0f);
+    juce::AudioBuffer<float> buf (2, n);
+    buf.clear();
+    juce::MidiBuffer m;
+    m.addEvent (juce::MidiMessage::noteOn (1, 104, (juce::uint8) 127), 0);
+    synth.render (buf, m, n);
+
+    auto magnitude = [&] (double freq)
+    {
+        double re = 0.0, im = 0.0;
+        for (int i = 0; i < n; ++i)
+        {
+            const double w = 0.5 - 0.5 * std::cos (juce::MathConstants<double>::twoPi * i / (n - 1));   // Hann
+            const double x = (double) buf.getSample (0, i) * w;
+            re += x * std::cos (juce::MathConstants<double>::twoPi * freq * i / sr);
+            im -= x * std::sin (juce::MathConstants<double>::twoPi * freq * i / sr);
+        }
+        return std::sqrt (re * re + im * im);
+    };
+
+    const double f0 = juce::MidiMessage::getMidiNoteInHertz (104);
+    const double fundamental = magnitude (f0);
+    const double alias9 = magnitude (std::abs (9.0 * f0 - sr));
+    const double alias7 = magnitude (std::abs (7.0 * f0 - sr));
+    check (fundamental > 0.0 && alias9 / fundamental < 0.03 && alias7 / fundamental < 0.05,
+           "Soft Keys MIDI 104 vel 127: folded sidebands at least ~30 dB down",
+           str ("9f ", alias9 / fundamental, " 7f ", alias7 / fundamental));
+}
+
+// B1 safety net: a Warm Pad note whose note-off is lost fades out after ~30 s instead of droning forever, but holds
+// its level for long chords.
+void testWarmPadFiniteSustain()
+{
+    constexpr double sr = 48000.0;
+    constexpr int block = 4800;
+    PreviewSynth synth;
+    synth.prepare (sr, block);
+    synth.setTone (PreviewSynth::Tone::WarmPad);
+    synth.setGainDecibels (-9.0f);
+    juce::AudioBuffer<float> buf (2, block);
+    juce::MidiBuffer on;
+    on.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+
+    float atOne = 0.0f, atFifteen = 0.0f, atEnd = 0.0f;
+    for (int b = 0; b < 340; ++b)   // 34 s
+    {
+        buf.clear();
+        synth.render (buf, b == 0 ? on : juce::MidiBuffer(), block);
+        const float peak = buf.getMagnitude (0, 0, block);
+        if (b == 10) atOne = peak;
+        if (b == 150) atFifteen = peak;
+        if (b == 339) atEnd = peak;
+    }
+    check (atFifteen > 0.7f * atOne, "Warm Pad: holds its level for long chords (15 s)", str (atOne, " -> ", atFifteen));
+    check (atEnd < 1.0e-3f, "Warm Pad: a note without note-off fades out after ~30 s", str ("peak ", atEnd));
 }
 
 //==============================================================================
@@ -1692,15 +2560,29 @@ void testFuzz()
             p.updateSlot (0, s);
         }
         else if (r < 59) pumpMessages (0);
+        else if (r < 60) setParam (p, id::midiOutPart, (float) rng.nextInt (3));
+        else if (r < 61) setParam (p, id::gate, 0.05f + 0.95f * rng.nextFloat());
+        else if (r < 62) setParam (p, id::swing, rng.nextFloat());
+        else if (r < 63) in.addEvent (juce::MidiMessage::controllerEvent (1, 64, rng.nextBool() ? 127 : 0), rng.nextInt (256));
+        else if (r < 64) rig.hostLoopLen = (double) (rng.nextInt (4) * 4);
+        else if (r < 65) rig.head.reportLoop = rng.nextBool();
+        else if (r < 66) setParam (p, id::previewTone, (float) rng.nextInt (3));
 
-        rig.processBlock (in);
+        rig.head.loopStart = rig.hostLoopStart;
+        rig.head.loopEnd = rig.hostLoopStart + juce::jmax (1.0, rig.hostLoopLen);
+        if (r >= 66 && r < 68)
+            rig.processZero (in);   // VST3-style 0-sample flush calls in between
+        else
+            rig.processBlock (in);
     }
 
     pumpMessages (0);
     juce::MidiBuffer releaseAll;
     for (int n : heldInput)
         releaseAll.addEvent (juce::MidiMessage::noteOff (1, n), 0);
+    releaseAll.addEvent (juce::MidiMessage::controllerEvent (1, 64, 0), 0);
     setParam (p, id::midiOut, 1.0f);
+    setParam (p, id::midiOutPart, 0.0f);
     p.stopPreview();
     p.setLocalPlayback (false);
     rig.head.playing = false;
@@ -1737,6 +2619,20 @@ int runSelfTest()
     testBypass();
     testPreviewSynth();
     testMidiExport();
+    testZeroSampleBlocks();
+    testHostPatternLoop();
+    testHostLoopWrapNoFlam();
+    testTimingTweaksDoNotRestrike();
+    testSustainPedal();
+    testUnmatchedNoteOff();
+    testBypassOrdering();
+    testMidiOutPart();
+    testExportNames();
+    testSingleChordExport();
+    testTranspose();
+    testUserDefaults();
+    testSoftKeysAliasing();
+    testWarmPadFiniteSustain();
     testFuzz();
 
     std::cout << "\nselftest: " << numPassed << " passed, " << numFailed << " failed\n";

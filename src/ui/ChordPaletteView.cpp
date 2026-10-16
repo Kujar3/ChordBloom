@@ -1,6 +1,8 @@
 #include "ui/ChordPaletteView.h"
 
 #include "ui/DragPayload.h"
+#include "ui/PluginEditor.h"
+#include "ui/ProgressionLane.h"
 #include "ui/Theme.h"
 
 #include <algorithm>
@@ -61,6 +63,37 @@ void drawHalo (juce::Graphics& g, juce::Rectangle<float> r, float radius, juce::
     }
 }
 
+// The top-suggestion marker (also used by the legend).
+void drawTopDot (juce::Graphics& g, juce::Point<float> c)
+{
+    g.setColour (Col::accent.withAlpha (0.25f));
+    g.fillEllipse (juce::Rectangle<float> (9.0f, 9.0f).withCentre (c));
+    g.setColour (Col::accent);
+    g.fillEllipse (juce::Rectangle<float> (5.0f, 5.0f).withCentre (c));
+}
+
+// Invisible, click-through child that exposes one painted item (pad) to accessibility clients.
+class AccessibleItem : public juce::Component
+{
+public:
+    AccessibleItem()
+    {
+        setInterceptsMouseClicks (false, false);
+        setWantsKeyboardFocus (false);
+        setMouseClickGrabsKeyboardFocus (false);
+        setAccessible (true);
+    }
+
+    std::function<void()> onPress;
+
+    std::unique_ptr<juce::AccessibilityHandler> createAccessibilityHandler() override
+    {
+        juce::AccessibilityActions actions;
+        actions.addAction (juce::AccessibilityActionType::press, [this] { if (onPress != nullptr) onPress(); });
+        return std::make_unique<juce::AccessibilityHandler> (*this, juce::AccessibilityRole::button, std::move (actions));
+    }
+};
+
 struct Pad
 {
     cb::PaletteChord info;
@@ -71,7 +104,7 @@ struct Pad
     juce::Font romanFont { juce::FontOptions() };
     bool showRoman = true;
 
-    float score = 0.0f;   // suggestion strength for the current context chord
+    float score = 0.0f;   // suggestion strength for the current context chord (or opening strength)
     bool top = false;     // one of the top suggestions
 
     float hover = 0.0f;   // animated 0..1
@@ -92,17 +125,23 @@ struct Row
 // pad can show its own hint).
 struct ChordPaletteView::Impl : public juce::Component,
                                 public juce::TooltipClient,
-                                private juce::Timer
+                                private juce::Timer,
+                                private juce::AsyncUpdater
 {
     explicit Impl (ChordbloomProcessor& p) : processor (p)
     {
         setOpaque (false);
+        setWantsKeyboardFocus (false);
+        setMouseClickGrabsKeyboardFocus (false);   // a click must never pull keyboard focus away from the host
+        setTitle ("Chord palette");
+        setDescription ("Chords that fit the key. Click a chord to hear it, double-click to add it to the progression.");
         rebuild();
     }
 
     ~Impl() override
     {
         stopTimer();
+        cancelPendingUpdate();
 
         if (previewing)
             processor.stopPreview();
@@ -181,10 +220,16 @@ struct ChordPaletteView::Impl : public juce::Component,
         rows = std::move (newRows);
 
         if (padFor (pressedId) == nullptr)
+        {
             pressedId = -1;
+            pressedOnPlus = false;
+        }
 
         if (padFor (hoverId) == nullptr)
             hoverId = -1;
+
+        if (padFor (firstClickPad) == nullptr)
+            firstClickPad = -1;
 
         recomputeScores();
         layout();
@@ -198,14 +243,81 @@ struct ChordPaletteView::Impl : public juce::Component,
         if (! pad.info.hint.empty())
             tip << "\n" << toJuce (pad.info.hint);
 
-        tip << "\nClick to hear " << middleDot() << " double-click to add " << middleDot() << " drag into the progression";
         return tip;
+    }
+
+    //==============================================================================
+    // Where a double-click / "+" adds: after the lane's selected slot, else at the end.
+    ProgressionLane* findLane() const
+    {
+        if (auto* editor = findParentComponentOfClass<ChordbloomEditor>())
+            return &editor->getProgressionLane();
+
+        return nullptr;
+    }
+
+    int selectedSlot() const
+    {
+        const int n = (int) processor.getProgression().slots.size();
+
+        if (auto* lane = findLane())
+        {
+            const int sel = lane->getSelectedSlot();
+            return sel >= 0 && sel < n ? sel : -1;
+        }
+
+        return -1;
+    }
+
+    juce::String addPlaceText() const
+    {
+        const int sel = selectedSlot();
+
+        if (sel < 0)
+            return "to the end";
+
+        const auto& slots = processor.getProgression().slots;
+        return "after " + toJuce (slots[(size_t) sel].chord.name (key));
+    }
+
+    void addChordFromPad (int id)
+    {
+        auto* pad = padFor (id);
+
+        if (pad == nullptr)
+            return;
+
+        const auto chord = pad->info.chord;
+        auto* lane = findLane();
+        const int n = (int) processor.getProgression().slots.size();
+        const int sel = selectedSlot();
+        const int at = sel >= 0 && sel < n - 1 ? sel + 1 : -1;   // after the last slot == append
+        const bool added = processor.addChord (chord, at);
+
+        if (added && lane != nullptr)
+        {
+            // The selection follows the new chord, so the glow (context) continues from it. The lane caches the
+            // progression and the processor's change message is async: sync it first, then select with notification.
+            const int newIndex = at >= 0 ? at : (int) processor.getProgression().slots.size() - 1;
+            lane->refresh();
+            lane->setSelectedSlot (newIndex, true);
+        }
+
+        // addChord() (or the selection change) may have refreshed us synchronously: look the pad up again.
+        if (auto* p = padFor (id))
+        {
+            p->flash = 1.0f;
+            p->flashError = ! added && processor.getProgression().slots.size() >= (size_t) cb::kMaxSlots;
+            startAnimation();
+        }
     }
 
     //==============================================================================
     void setContext (std::optional<cb::Chord> chord)
     {
-        if (chord == context)
+        const bool emptyNow = processor.getProgression().empty();
+
+        if (chord == context && emptyNow == scoredEmpty)
             return;
 
         context = chord;
@@ -225,41 +337,69 @@ struct ChordPaletteView::Impl : public juce::Component,
 
     void recomputeScores()
     {
+        // No context and nothing in the lane yet: guide the first chord instead of showing a flat grid.
+        scoredEmpty = processor.getProgression().empty();
+        const bool opening = ! context.has_value() && scoredEmpty;
+
         struct Candidate
         {
             float score;
             cb::Chord chord;
         };
 
-        std::vector<Candidate> candidates;
+        // Best-scoring chord per root, so the top dots mark three different destinations (not F, Fmaj7, Fmaj9).
+        std::vector<Candidate> bestPerRoot;
 
         for (auto& row : rows)
         {
             for (auto& pad : row.pads)
             {
                 pad.top = false;
-                pad.score = context.has_value() ? juce::jlimit (0.0f, 1.0f, cb::transitionScore (*context, pad.info.chord, key)) : 0.0f;
 
-                if (pad.score >= kMinSuggestScore)
-                {
-                    const bool known = std::any_of (candidates.begin(), candidates.end(),
-                                                    [&] (const Candidate& c) { return c.chord == pad.info.chord; });
-                    if (! known)
-                        candidates.push_back ({ pad.score, pad.info.chord });
-                }
+                float score = 0.0f;
+
+                if (context.has_value())
+                    score = cb::transitionScore (*context, pad.info.chord, key);
+                else if (opening)
+                    score = cb::openingScore (pad.info.chord, key);
+
+                pad.score = std::isfinite (score) ? juce::jlimit (0.0f, 1.0f, score) : 0.0f;
+
+                if (pad.score < kMinSuggestScore)
+                    continue;
+
+                // The dots mark where to go next: a colour change on the same root (E7 -> E, Am7 -> Am) keeps its
+                // glow but never takes one of the three dots.
+                if (context.has_value() && pad.info.chord.root == context->root)
+                    continue;
+
+                auto it = std::find_if (bestPerRoot.begin(), bestPerRoot.end(),
+                                        [&] (const Candidate& c) { return c.chord.root == pad.info.chord.root; });
+
+                if (it == bestPerRoot.end())
+                    bestPerRoot.push_back ({ pad.score, pad.info.chord });
+                else if (pad.score > it->score)
+                    *it = { pad.score, pad.info.chord };
             }
         }
 
-        std::stable_sort (candidates.begin(), candidates.end(),
+        std::stable_sort (bestPerRoot.begin(), bestPerRoot.end(),
                           [] (const Candidate& a, const Candidate& b) { return a.score > b.score; });
 
-        if (candidates.size() > (size_t) kTopSuggestions)
-            candidates.resize ((size_t) kTopSuggestions);
+        if (bestPerRoot.size() > (size_t) kTopSuggestions)
+            bestPerRoot.resize ((size_t) kTopSuggestions);
+
+        anyGlow = false;
 
         for (auto& row : rows)
+        {
             for (auto& pad : row.pads)
-                pad.top = std::any_of (candidates.begin(), candidates.end(),
+            {
+                pad.top = std::any_of (bestPerRoot.begin(), bestPerRoot.end(),
                                        [&] (const Candidate& c) { return c.chord == pad.info.chord; });
+                anyGlow = anyGlow || pad.score >= kMinSuggestScore;
+            }
+        }
     }
 
     //==============================================================================
@@ -269,6 +409,7 @@ struct ChordPaletteView::Impl : public juce::Component,
     {
         auto area = getLocalBounds().toFloat().reduced (12.0f, 10.0f);
         const int numRows = (int) rows.size();
+        legendArea = {};
 
         if (numRows == 0 || area.isEmpty())
             return;
@@ -302,9 +443,64 @@ struct ChordPaletteView::Impl : public juce::Component,
                 const float textW = pad.bounds.getWidth() - 14.0f;
                 pad.nameFont = fittedFont (nameH, 600, pad.name, textW, 10.0f);
                 pad.romanFont = fittedFont (romanH, 400, pad.roman, textW, 8.5f);
-                pad.showRoman = pad.bounds.getHeight() >= 32.0f;
+                // Decided on the unrounded row height, so every row agrees (rounding makes rows 1 px apart).
+                pad.showRoman = rowH >= 30.0f;
             }
         }
+
+        // Legend: the free cells at the end of the lowest row that has at least two empty columns (the Secondary
+        // row never has more than 6 pads, so this is normally the bottom-right corner).
+        for (int r = numRows - 1; r >= 0; --r)
+        {
+            const auto& row = rows[(size_t) r];
+            const int used = (int) row.pads.size();
+
+            if (kColumns - used >= 2)
+            {
+                const float x = used > 0 ? std::round (cellsX + (float) used * pitch) : cellsX + cellsW * 0.5f;
+                legendArea = { x, row.bounds.getY(), row.cells.getRight() - x, row.bounds.getHeight() };
+                break;
+            }
+        }
+
+        triggerAsyncUpdate();   // accessible pad proxies follow the layout (never touched from paint)
+    }
+
+    //==============================================================================
+    // Accessibility: one invisible, click-through proxy per pad.
+    void handleAsyncUpdate() override
+    {
+        size_t count = 0;
+
+        for (const auto& row : rows)
+            count += row.pads.size();
+
+        while (proxies.size() > count)
+            proxies.pop_back();
+
+        while (proxies.size() < count)
+        {
+            proxies.push_back (std::make_unique<AccessibleItem>());
+            addAndMakeVisible (*proxies.back());
+        }
+
+        size_t k = 0;
+
+        forEachPad ([&] (int id, Pad& pad)
+        {
+            auto& proxy = *proxies[k++];
+            proxy.setBounds (pad.bounds.getSmallestIntegerContainer());
+            proxy.setTitle (pad.name + " (" + pad.roman + ")");
+            proxy.setDescription (juce::String (cb::functionName (pad.info.function)) + ". " + toJuce (pad.info.hint));
+            proxy.setHelpText ("Adds " + pad.name + " to the progression");
+
+            juce::Component::SafePointer<Impl> safe (this);
+            proxy.onPress = [safe, id]
+            {
+                if (safe != nullptr)
+                    safe->addChordFromPad (id);
+            };
+        });
     }
 
     //==============================================================================
@@ -331,6 +527,8 @@ struct ChordPaletteView::Impl : public juce::Component,
                             row.cells.withTrimmedLeft (6.0f), juce::Justification::centredLeft, true);
             }
         }
+
+        paintLegend (g);
 
         // Halos and rings go first so they sit behind every pad and only show in the gaps.
         forEachPad ([&] (int id, Pad& pad)
@@ -359,6 +557,84 @@ struct ChordPaletteView::Impl : public juce::Component,
         g.drawRoundedRectangle (r, cb::ui::kCornerRadius, 1.0f);
     }
 
+    // Small key that explains the glow ring and the dot (bottom-right corner of the grid).
+    void paintLegend (juce::Graphics& g) const
+    {
+        if (! anyGlow || legendArea.getWidth() < 120.0f || legendArea.getHeight() < 16.0f)
+            return;
+
+        const bool opening = ! context.has_value();
+        const juce::String glowText = opening ? "glow = good first chord" : "glow = good next chord";
+        juce::String dotText = "dot = top 3 picks";
+
+        if (context.has_value())
+            dotText << " after " << toJuce (context->name (key));
+
+        const auto f = cb::ui::font (11.0f, 400);
+        const float swatchW = 18.0f, gap = 7.0f;
+        const auto area = legendArea.reduced (2.0f, 0.0f);
+        const bool twoLines = area.getHeight() >= 34.0f;
+
+        auto drawGlowSwatch = [&] (juce::Point<float> c)
+        {
+            const auto r = juce::Rectangle<float> (swatchW - 4.0f, 10.0f).withCentre (c);
+            g.setColour (Col::panelRaised);
+            g.fillRoundedRectangle (r, 3.0f);
+            g.setColour (Col::accent.withAlpha (0.18f));
+            g.drawRoundedRectangle (r.expanded (2.5f), 5.0f, 1.25f);
+            g.setColour (Col::accent.withAlpha (0.85f));
+            g.drawRoundedRectangle (r.expanded (1.0f), 4.0f, 1.4f);
+        };
+
+        g.setFont (f);
+
+        if (twoLines)
+        {
+            if (widthOf (f, dotText) + swatchW + gap > area.getWidth())
+                dotText = "dot = top 3 picks";
+
+            const float lineH = 16.0f;
+            const float textW = std::max (widthOf (f, glowText), widthOf (f, dotText));
+            const float blockW = swatchW + gap + textW;
+
+            if (blockW > area.getWidth())
+                return;
+
+            const float x = area.getRight() - blockW - 4.0f;
+            const float y = std::round (area.getCentreY() - lineH);
+
+            drawGlowSwatch ({ x + swatchW * 0.5f, y + lineH * 0.5f });
+            drawTopDot (g, { x + swatchW * 0.5f, y + lineH * 1.5f + 1.0f });
+
+            g.setColour (Col::textDim.withAlpha (0.85f));
+            g.drawText (glowText, juce::Rectangle<float> (x + swatchW + gap, y, textW + 2.0f, lineH),
+                        juce::Justification::centredLeft, false);
+            g.setColour (Col::textFaint.brighter (0.15f));
+            g.drawText (dotText, juce::Rectangle<float> (x + swatchW + gap, y + lineH + 1.0f, textW + 2.0f, lineH),
+                        juce::Justification::centredLeft, false);
+            return;
+        }
+
+        const juce::String shortDot ("dot = top picks");
+        const float w1 = widthOf (f, glowText), w2 = widthOf (f, shortDot);
+        const float blockW = swatchW + gap + w1 + 14.0f + 10.0f + gap + w2;
+
+        if (blockW > area.getWidth())
+            return;
+
+        float x = area.getRight() - blockW - 4.0f;
+        const float cy = area.getCentreY();
+        drawGlowSwatch ({ x + swatchW * 0.5f, cy });
+        x += swatchW + gap;
+        g.setColour (Col::textDim.withAlpha (0.85f));
+        g.drawText (glowText, juce::Rectangle<float> (x, cy - 8.0f, w1 + 2.0f, 16.0f), juce::Justification::centredLeft, false);
+        x += w1 + 14.0f;
+        drawTopDot (g, { x + 5.0f, cy });
+        x += 10.0f + gap;
+        g.setColour (Col::textFaint.brighter (0.15f));
+        g.drawText (shortDot, juce::Rectangle<float> (x, cy - 8.0f, w2 + 2.0f, 16.0f), juce::Justification::centredLeft, false);
+    }
+
     bool isLit (int id, const Pad& pad) const
     {
         return id == pressedId || (sounding.has_value() && *sounding == pad.info.chord);
@@ -371,7 +647,7 @@ struct ChordPaletteView::Impl : public juce::Component,
         if (lit)
             drawHalo (g, r, kPadRadius, pad.colour, 0.30f, 4);
 
-        if (context.has_value() && pad.score >= kMinSuggestScore)
+        if (pad.score >= kMinSuggestScore)
         {
             // Graded so the eye finds the strong moves first: weak = faint hairline, strong = bright ring + halo.
             const float t = juce::jlimit (0.0f, 1.0f, juce::jmap (pad.score, kMinSuggestScore, 0.95f, 0.0f, 1.0f));
@@ -465,13 +741,7 @@ struct ChordPaletteView::Impl : public juce::Component,
 
         // Top-suggestion dot (hidden while the "+" is showing)
         if (pad.top && plusAlpha < 0.5f)
-        {
-            const auto c = juce::Point<float> (r.getRight() - 9.0f, r.getY() + kAccentBar + 7.0f);
-            g.setColour (Col::accent.withAlpha (0.25f));
-            g.fillEllipse (juce::Rectangle<float> (9.0f, 9.0f).withCentre (c));
-            g.setColour (Col::accent);
-            g.fillEllipse (juce::Rectangle<float> (5.0f, 5.0f).withCentre (c));
-        }
+            drawTopDot (g, { r.getRight() - 9.0f, r.getY() + kAccentBar + 7.0f });
 
         // "+" add affordance
         if (plusAlpha > 0.01f && r.getWidth() >= 40.0f)
@@ -570,20 +840,22 @@ struct ChordPaletteView::Impl : public juce::Component,
     void mouseDown (const juce::MouseEvent& e) override
     {
         dragStarted = false;
+        pressedOnPlus = false;
         const int id = padAt (e.position);
         auto* pad = padFor (id);
 
         if (pad == nullptr || e.mods.isPopupMenu())
             return;
 
+        // Double-clicks only count when both clicks land on the same pad.
+        if (e.getNumberOfClicks() == 1)
+            firstClickPad = id;
+
         pressedId = id;
         downPos = e.position;
-        const auto chord = pad->info.chord;
+        pressedOnPlus = plusHit (id, e.position);   // "+" adds on release (if no drag started), see mouseUp
 
-        if (plusHit (id, e.position))
-            append (id);
-
-        processor.startPreviewChord (chord);
+        processor.startPreviewChord (pad->info.chord);
         previewing = true;
         repaintPad (id);
     }
@@ -599,6 +871,7 @@ struct ChordPaletteView::Impl : public juce::Component,
             return;
 
         dragStarted = true;
+        pressedOnPlus = false;   // a drag that starts on the "+" is just a drag: it must not also add the chord
 
         if (previewing)
         {
@@ -620,7 +893,8 @@ struct ChordPaletteView::Impl : public juce::Component,
         {
             juce::Point<int> offset;
             auto image = makeDragImage (*pad, offset);
-            container->startDragging (cb::ui::drag::makeChordPayload (pad->info.chord), this, image, false, &offset, &e.source);
+            // allowDraggingToExternalWindows: after ~0.7 s outside the plugin the editor turns it into a MIDI file drag.
+            container->startDragging (cb::ui::drag::makeChordPayload (pad->info.chord), this, image, true, &offset, &e.source);
         }
     }
 
@@ -632,42 +906,38 @@ struct ChordPaletteView::Impl : public juce::Component,
             previewing = false;
         }
 
+        const int id = pressedId;
+        const bool addViaPlus = pressedOnPlus && ! dragStarted && id >= 0 && ! e.mods.isPopupMenu() && plusHit (id, e.position);
+
         if (pressedId >= 0)
         {
             repaintPad (pressedId);
             pressedId = -1;
         }
 
+        pressedOnPlus = false;
         dragStarted = false;
+
+        if (addViaPlus)
+            addChordFromPad (id);
+
         updateHover (e.position, getLocalBounds().toFloat().contains (e.position));
     }
 
     void mouseDoubleClick (const juce::MouseEvent& e) override
     {
-        const int id = padAt (e.position);
-
-        if (id < 0 || e.mods.isPopupMenu() || plusHit (id, e.position))   // the "+" already added on mouse down
+        // JUCE also calls this for the 3rd and 4th click of a fast run (sliding window): tapping a pad repeatedly to
+        // audition it must add at most one chord.
+        if (e.getNumberOfClicks() != 2 || e.mods.isPopupMenu())
             return;
 
-        append (id);
-    }
+        const auto pos = e.mouseDownPosition;
+        const int id = padAt (pos);
 
-    void append (int id)
-    {
-        auto* pad = padFor (id);
-
-        if (pad == nullptr)
+        if (id < 0 || id != firstClickPad || plusHit (id, pos))   // the "+" adds on its own clicks
             return;
 
-        const bool added = processor.addChord (pad->info.chord);
-
-        // addChord() may have refreshed us synchronously: look the pad up again.
-        if (auto* p = padFor (id))
-        {
-            p->flash = 1.0f;
-            p->flashError = ! added && processor.getProgression().slots.size() >= (size_t) cb::kMaxSlots;
-            startAnimation();
-        }
+        addChordFromPad (id);
     }
 
     juce::ScaledImage makeDragImage (const Pad& pad, juce::Point<int>& offset)
@@ -699,7 +969,17 @@ struct ChordPaletteView::Impl : public juce::Component,
     juce::String getTooltip() override
     {
         if (auto* pad = padFor (hoverId))
-            return hoverPlus ? "Add " + pad->name + " to the end of the progression" : pad->tooltip;
+        {
+            const auto place = addPlaceText();
+
+            if (hoverPlus)
+                return "Add " + pad->name + " " + place;
+
+            juce::String tip (pad->tooltip);
+            tip << "\nClick to hear " << middleDot() << " double-click to add " << place
+                << "\nDrag into the progression, or straight out into FL Studio";
+            return tip;
+        }
 
         return {};
     }
@@ -751,12 +1031,18 @@ struct ChordPaletteView::Impl : public juce::Component,
     ChordbloomProcessor& processor;
     cb::Key key;
     std::vector<Row> rows;
+    juce::Rectangle<float> legendArea;
+    std::vector<std::unique_ptr<AccessibleItem>> proxies;
 
     std::optional<cb::Chord> context, sounding;
+    bool scoredEmpty = true;   // whether the scores were computed for an empty progression
+    bool anyGlow = false;
 
     int hoverId = -1;
     bool hoverPlus = false;
     int pressedId = -1;
+    bool pressedOnPlus = false;
+    int firstClickPad = -1;
     bool previewing = false;
     bool dragStarted = false;
     juce::Point<float> downPos;
@@ -766,6 +1052,9 @@ struct ChordPaletteView::Impl : public juce::Component,
 ChordPaletteView::ChordPaletteView (ChordbloomProcessor& p) : impl (std::make_unique<Impl> (p))
 {
     setOpaque (false);
+    setWantsKeyboardFocus (false);
+    setMouseClickGrabsKeyboardFocus (false);
+    setTitle ("Chord palette");
     addAndMakeVisible (*impl);
 }
 
@@ -778,7 +1067,17 @@ void ChordPaletteView::resized() { impl->setBounds (getLocalBounds()); }
 void ChordPaletteView::refresh()
 {
     if (impl->matchesProcessor())
+    {
+        // The progression may have become empty (or stopped being empty) without a context change: the glow
+        // switches between "good first chords" and "good next chords".
+        if (impl->processor.getProgression().empty() != impl->scoredEmpty)
+        {
+            impl->recomputeScores();
+            impl->repaint();
+        }
+
         return;
+    }
 
     impl->rebuild();
     impl->repaint();

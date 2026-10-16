@@ -14,7 +14,7 @@ class KeyboardGuide;
 class ExportPanel;
 
 /**
-    Layout at the default 1100 x 690 (resizable 960x600 .. 1600x1000, size persisted in the processor):
+    Layout at the default 1100 x 690 (resizable 960x560 .. 1600x1000, size persisted in the processor):
 
       +--------------------------------------------------------------------------------+
       | HeaderBar (56): logo, key + scale, sound tone/volume/on, MIDI out, undo/redo    |
@@ -55,13 +55,30 @@ public:
     // (normally done by the 30 Hz timer; used by the snapshot tool where timers do not run).
     void updateChordDisplays();
 
+    // Help popover of the header's "?" button (snapshot / test hook; added by ui-shell, round 2).
+    void setHelpVisible (bool shouldBeVisible);
+    bool isHelpVisible() const;
+
+    // Pad / lane-block drags that leave the plugin window become MIDI file drags (a chord payload -> a one-chord clip,
+    // a slot payload -> that slot's clip), so a single chord can be dropped straight into FL's playlist / piano roll.
+    bool shouldDropFilesWhenDraggedExternally (const juce::DragAndDropTarget::SourceDetails&, juce::StringArray& files,
+                                               bool& canMoveFiles) override;
+
+    // Initial / restored editor size: `requested` clamped to the resizable range and to the given screen area (the
+    // display's user area, minus room for the host's plug-in window frame), so the editor always fits on screen.
+    // An empty area only applies the resizable range. (Added by ui-shell, round 2; public for tests.)
+    static juce::Point<int> clampSizeToScreen (juce::Point<int> requested, juce::Rectangle<int> screenUserArea);
+
     static constexpr int kDefaultWidth = 1100, kDefaultHeight = 690;
-    static constexpr int kMinWidth = 960, kMinHeight = 600;
+    static constexpr int kMinWidth = 960, kMinHeight = 560;   // 560 (was 600): fits a 1080p screen at 150% scaling
     static constexpr int kMaxWidth = 1600, kMaxHeight = 1000;
+
+    void parentHierarchyChanged() override;
 
 private:
     void changeListenerCallback (juce::ChangeBroadcaster*) override;
     void timerCallback() override;
+    void fitToCurrentDisplay();
 
     void refreshChildren();
     void pushChords (bool force);
@@ -71,6 +88,9 @@ private:
     std::vector<int> lastDisplayNotes;
     bool chordsPushed = false;
     bool persistSize = false;   // resized() stores the size in the processor only after the constructor restored it
+    int focusSweepCountdown = 0;
+    bool fittedToDisplay = false;   // fitToCurrentDisplay() ran once the editor was on screen
+    bool externalDropPending = false;   // a pad / block went out as a MIDI file: show the "plays along" hint on release
 
     ChordbloomProcessor& processor;
     cb::ui::LookAndFeel lookAndFeel;

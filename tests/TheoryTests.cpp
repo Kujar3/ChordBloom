@@ -9,6 +9,14 @@
 
 // Tests for Theory / Palette / Suggest (owner: core-theory agent)
 
+// Chord-tone spelling (Theory.cpp). Declared here as well because core-theory may not add declarations to Theory.h;
+// once the integrator adds them there these become harmless redeclarations.
+namespace cb
+{
+std::string spellChordTone (const Chord&, int interval, const Key&);
+std::vector<std::string> chordToneNames (const Chord&, const Key&);
+}
+
 namespace
 {
 using cb::Chord;
@@ -72,6 +80,23 @@ bool sectionHas (const cb::PaletteSection& s, const Chord& c)
         if (pad.chord == c)
             return true;
     return false;
+}
+
+// "V/x", "V7/x", "V9/x", "V13/x", "V7b9/x" (but not "V6/9" or "I6/9").
+bool looksSecondary (const std::string& numeral)
+{
+    for (const char* prefix : { "V/", "V7/", "V9/", "V13/", "V7b9/" })
+        if (numeral.rfind (prefix, 0) == 0)
+            return true;
+    return false;
+}
+
+std::vector<std::string> padNames (const cb::PaletteSection& s, const Key& k)
+{
+    std::vector<std::string> out;
+    for (auto& pad : s.chords)
+        out.push_back (pad.chord.name (k));
+    return out;
 }
 
 // Best-scoring pad (over the whole palette) from `from`.
@@ -524,8 +549,8 @@ TEST_CASE ("function: roman numeral and function agree on secondary labels")
                 const Chord c { r, (ChordQuality) q };
                 const auto numeral = cb::romanNumeral (c, k);
                 REQUIRE (! numeral.empty());
-                const bool looksSecondary = numeral.find ('/') != std::string::npos;
-                CHECK_EQ (looksSecondary, cb::harmonicFunction (c, k) == F::Secondary);
+                // Round 2: "6/9" also contains a slash, so look for the secondary label shape "V<suffix>/x".
+                CHECK_EQ (looksSecondary (numeral), cb::harmonicFunction (c, k) == F::Secondary);
             }
 }
 
@@ -617,40 +642,81 @@ TEST_CASE ("palette: colour pads are diatonic, new, and in degree order")
     }
 }
 
-TEST_CASE ("palette: borrowed pads come from the parallel key only")
+// Round 2 (B13, intentional change): minor-family scales other than Natural Minor also borrow from the natural minor.
+TEST_CASE ("palette: borrowed pads come from the parallel key or, in altered minor scales, the natural minor")
 {
     for (auto& k : allKeys())
     {
+        const bool alteredMinor = cb::scaleInfo (k.scale).isMinorFamily && k.scale != ScaleType::NaturalMinor;
+        const Key natural { k.tonic, ScaleType::NaturalMinor };
         const auto p = cb::buildPalette (k);
         for (auto& pad : p[3].chords)
         {
             CHECK (! cb::isDiatonic (pad.chord, k));
-            CHECK (cb::isDiatonic (pad.chord, k.parallel()));
+            CHECK (cb::isDiatonic (pad.chord, k.parallel()) || (alteredMinor && cb::isDiatonic (pad.chord, natural)));
             CHECK (pad.function == F::Borrowed || pad.function == F::Dominant);
         }
     }
 }
 
-TEST_CASE ("palette: secondary pads are V7 of diatonic targets in degree order")
+// Round 2 (I19, intentional change): minor-family keys also offer V7b9/x right after V7/x.
+TEST_CASE ("palette: secondary pads are V7 (or V7b9 in minor keys) of diatonic targets in degree order")
+{
+    for (auto& k : allKeys())
+    {
+        const bool minorKey = cb::scaleInfo (k.scale).isMinorFamily;
+        const auto p = cb::buildPalette (k);
+        int lastTarget = 0;
+        Chord last {};
+        for (auto& pad : p[4].chords)
+        {
+            CHECK_EQ (pad.function, F::Secondary);
+            const int target = k.degreeOf (pad.chord.root + 5);
+            const auto tq = cb::diatonicChord (k, target, false).quality;
+            CHECK (tq != Q::Diminished);
+            CHECK (tq != Q::Augmented);
+            for (int s = 0; s < 4; ++s)
+                CHECK (! sectionHas (p[(size_t) s], pad.chord));
+
+            if (pad.chord.quality == Q::Dominant7Flat9)
+            {
+                CHECK (minorKey);
+                CHECK (last == ch (pad.chord.root, Q::Dominant7));     // directly after its plain V7
+                CHECK (tq == Q::Minor || k.contains (pad.chord.root + 1));
+                CHECK (pad.roman.rfind ("V7b9/", 0) == 0);
+                CHECK_EQ (target, lastTarget);
+            }
+            else
+            {
+                CHECK (pad.chord.quality == Q::Dominant7);
+                CHECK (pad.roman.rfind ("V7/", 0) == 0);
+                CHECK (target > lastTarget);
+            }
+            lastTarget = target;
+            last = pad.chord;
+        }
+        CHECK (p[4].chords.size() <= 6);
+    }
+}
+
+TEST_CASE ("palette: every possible V7/x is offered before any V7b9 variant")
 {
     for (auto& k : allKeys())
     {
         const auto p = cb::buildPalette (k);
-        int lastTarget = 0;
-        for (auto& pad : p[4].chords)
+        for (int target = 1; target < 7; ++target)
         {
-            CHECK (pad.chord.quality == Q::Dominant7);
-            CHECK_EQ (pad.function, F::Secondary);
-            const int target = k.degreeOf (pad.chord.root + 5);
-            CHECK (target > lastTarget);
-            lastTarget = target;
-            const auto tq = cb::diatonicChord (k, target, false).quality;
-            CHECK (tq != Q::Diminished);
-            CHECK (pad.roman.rfind ("V7/", 0) == 0);
+            const auto t = cb::diatonicChord (k, target, false);
+            if (t.quality == Q::Diminished || t.quality == Q::Augmented)
+                continue;
+            const Chord v7 { cb::pc (t.root + 7), Q::Dominant7 };
+            if (cb::harmonicFunction (v7, k) != F::Secondary)
+                continue;
+            bool earlier = false;
             for (int s = 0; s < 4; ++s)
-                CHECK (! sectionHas (p[(size_t) s], pad.chord));
+                earlier = earlier || sectionHas (p[(size_t) s], v7);
+            CHECK (earlier || sectionHas (p[4], v7));
         }
-        CHECK (p[4].chords.size() <= 6);
     }
 }
 
@@ -703,14 +769,17 @@ TEST_CASE ("palette: C major contents")
     for (auto& pad : p[1].chords) names.push_back (pad.chord.name (c));
     CHECK_EQ (names, (std::vector<std::string> { "Cmaj7", "Dm7", "Em7", "Fmaj7", "G7", "Am7", "Bm7b5" }));
 
-    for (auto c9 : { ch (C, Q::Add9), ch (C, Q::Sus2), ch (C, Q::Sus4), ch (D, Q::Minor9), ch (F_, Q::Major9),
-                     ch (G, Q::Dominant7Sus4), ch (A, Q::Minor9) })
-        CHECK (sectionHas (p[2], c9));
-    CHECK_EQ (p[2].chords.size(), (size_t) 8);
+    // Round 2 (I16 / I19, intentional change): data-driven colours plus 6/9, the Lydian IVmaj7#11 and V13.
+    CHECK_EQ (padNames (p[2], c), (std::vector<std::string> { "Cadd9", "C6/9", "Cmaj9", "Dm9", "Fadd9", "F6", "Fmaj7#11", "G13" }));
+    names.clear();
+    for (auto& pad : p[2].chords) names.push_back (pad.roman);
+    CHECK_EQ (names, (std::vector<std::string> { "Iadd9", "I6/9", "Imaj9", "ii9", "IVadd9", "IV6", "IVmaj7#11", "V13" }));
 
-    CHECK (p[3].chords[0].chord == ch (F_, Q::Minor));   // iv first: the most-used borrowed chord
-    for (auto b : { ch (Bb, Q::Major), ch (Ab, Q::Major), ch (Eb, Q::Major), ch (G, Q::Minor), ch (F_, Q::Minor7), ch (Ab, Q::Major7) })
-        CHECK (sectionHas (p[3], b));
+    // Round 2 (I23, intentional change): bVI, bVII, iv, bIII, then iv7, bVImaj7, v, i7.
+    CHECK_EQ (padNames (p[3], c), (std::vector<std::string> { "Ab", "Bb", "Fm", "Eb", "Fm7", "Abmaj7", "Gm", "Cm7" }));
+    names.clear();
+    for (auto& pad : p[3].chords) names.push_back (pad.roman);
+    CHECK_EQ (names, (std::vector<std::string> { "bVI", "bVII", "iv", "bIII", "iv7", "bVImaj7", "v", "i7" }));
 
     names.clear();
     for (auto& pad : p[4].chords) names.push_back (pad.chord.name (c) + " " + pad.roman);
@@ -726,17 +795,74 @@ TEST_CASE ("palette: A minor contents")
     const auto a = key (A, ScaleType::NaturalMinor);
     const auto p = cb::buildPalette (a);
 
-    for (auto c : { ch (A, Q::MinorAdd9), ch (A, Q::Sus2), ch (A, Q::Sus4), ch (D, Q::Minor9), ch (F_, Q::Major9) })
-        CHECK (sectionHas (p[2], c));
+    // Round 2 (I16 / I19, intentional change): VII(add9), VI(add9), VII6, III6, iv9 lead the data; plus i11 and VImaj7#11.
+    CHECK_EQ (padNames (p[2], a), (std::vector<std::string> { "Am11", "C6", "Dm9", "Fadd9", "Fmaj7#11", "Gadd9", "G6", "Gsus4" }));
+    std::vector<std::string> names;
+    for (auto& pad : p[2].chords) names.push_back (pad.roman);
+    CHECK_EQ (names, (std::vector<std::string> { "i11", "III6", "iv9", "VIadd9", "VImaj7#11", "VIIadd9", "VII6", "VIIsus4" }));
 
     CHECK (p[3].chords[0].chord == ch (E, Q::Major));    // the major V comes first in minor
     for (auto c : { ch (D, Q::Major), ch (A, Q::Major), ch (E, Q::Dominant7), ch (B, Q::Minor) })
         CHECK (sectionHas (p[3], c));
     CHECK (! sectionHas (p[3], ch (C, Q::Major)));
 
-    std::vector<std::string> names;
+    // Round 2 (I19, intentional change): V7b9 of the minor targets iv and v (whose b9 C is in the key).
+    names.clear();
     for (auto& pad : p[4].chords) names.push_back (pad.chord.name (a) + " " + pad.roman);
-    CHECK_EQ (names, (std::vector<std::string> { "A7 V7/iv", "B7 V7/v", "C7 V7/VI", "D7 V7/VII" }));   // G7 is VII7
+    CHECK_EQ (names, (std::vector<std::string> { "A7 V7/iv", "A7b9 V7b9/iv", "B7 V7/v", "B7b9 V7b9/v", "C7 V7/VI", "D7 V7/VII" }));
+    CHECK (p[4].chords[1].hint.rfind ("A darker, dramatic pull into Dm (iv)", 0) == 0);
+}
+
+TEST_CASE ("palette: major keys keep plain secondary dominants only")
+{
+    for (int t = 0; t < 12; ++t)
+        for (auto s : { ScaleType::Major, ScaleType::Lydian, ScaleType::Mixolydian })
+        {
+            const auto pal = cb::buildPalette (key (t, s));   // keep the palette alive for the loop
+            for (auto& pad : pal[4].chords)
+                CHECK (pad.chord.quality == Q::Dominant7);
+        }
+}
+
+TEST_CASE ("palette: new extended colours show up where they are diatonic")
+{
+    const auto c = key (C, ScaleType::Major);
+    auto has = [] (const Key& k, int section, const Chord& chord) { return sectionHas (cb::buildPalette (k)[(size_t) section], chord); };
+
+    CHECK (has (key (C, ScaleType::Lydian), 2, ch (C, Q::Major7Sharp11)));       // Lydian's signature tonic
+    CHECK (has (key (C, ScaleType::Mixolydian), 2, ch (C, Q::Dominant13)));      // Mixolydian I13
+    CHECK (has (key (A, ScaleType::HarmonicMinor), 2, ch (E, Q::Dominant7Flat9)));   // harmonic minor V7b9
+    CHECK (has (key (A, ScaleType::Dorian), 2, ch (A, Q::Minor11)));
+    CHECK (has (key (A, ScaleType::NaturalMinor), 2, ch (F_, Q::Major7Sharp11)));  // the Lydian VI of natural minor
+
+    // Every key of the two main families gets at least one of the round-2 extended colours.
+    for (int t = 0; t < 12; ++t)
+        for (auto s : { ScaleType::Major, ScaleType::NaturalMinor, ScaleType::HarmonicMinor, ScaleType::Dorian,
+                        ScaleType::Lydian, ScaleType::Mixolydian })
+        {
+            int extended = 0;
+            const auto pal = cb::buildPalette (key (t, s));
+            for (auto& pad : pal[2].chords)
+                extended += (int) pad.chord.quality >= (int) Q::Minor11 ? 1 : 0;
+            CHECK (extended >= 1);
+        }
+
+    // Hints for the new chords are friendly sentences naming the chord type.
+    const auto p = cb::buildPalette (c);
+    for (auto& pad : p[2].chords)
+    {
+        if (pad.chord.quality == Q::Major7Sharp11) CHECK_EQ (pad.hint, std::string ("Dreamy, floating Lydian maj7#11 - sets up G nicely."));
+        if (pad.chord.quality == Q::Dominant13)    CHECK_EQ (pad.hint, std::string ("Rich, soulful 13th - a smooth, jazzy pull back to C."));
+        if (pad.chord.quality == Q::Major69)       CHECK_EQ (pad.hint, std::string ("Smooth, open 6/9 - a richer way to land home."));
+    }
+    const auto ph = cb::buildPalette (key (A, ScaleType::HarmonicMinor));
+    for (auto& pad : ph[2].chords)
+        if (pad.chord.quality == Q::Dominant7Flat9)
+            CHECK_EQ (pad.hint, std::string ("Dark, dramatic 7b9 - the most intense pull back to Am."));
+    const auto pn = cb::buildPalette (key (A, ScaleType::NaturalMinor));
+    for (auto& pad : pn[2].chords)
+        if (pad.chord.quality == Q::Minor11)
+            CHECK_EQ (pad.hint, std::string ("Lush, neo-soul m11 - a richer way to land home."));
 }
 
 TEST_CASE ("palette: borrowed names are spelled sensibly in sharp keys")
@@ -767,6 +893,300 @@ TEST_CASE ("palette: harmonic minor and modes")
     const auto gm = cb::buildPalette (key (G, ScaleType::Mixolydian));
     CHECK (! sectionHas (gm[3], ch (F_, Q::Major)));      // bVII is diatonic in Mixolydian
     CHECK (sectionHas (gm[3], ch (C, Q::Minor)));
+}
+
+//==============================================================================
+// Round 2: new qualities (Minor11, Major69, Dominant13, Major7Sharp11, Dominant7Flat9)
+//==============================================================================
+TEST_CASE ("round2: new quality suffixes and intervals")
+{
+    CHECK_EQ (std::string (cb::qualitySuffix (Q::Minor11)), std::string ("m11"));
+    CHECK_EQ (std::string (cb::qualitySuffix (Q::Major69)), std::string ("6/9"));
+    CHECK_EQ (std::string (cb::qualitySuffix (Q::Dominant13)), std::string ("13"));
+    CHECK_EQ (std::string (cb::qualitySuffix (Q::Major7Sharp11)), std::string ("maj7#11"));
+    CHECK_EQ (std::string (cb::qualitySuffix (Q::Dominant7Flat9)), std::string ("7b9"));
+    CHECK_EQ (cb::qualityIntervals (Q::Minor11), (std::vector<int> { 0, 3, 7, 10, 14, 17 }));
+    CHECK_EQ (cb::qualityIntervals (Q::Dominant13), (std::vector<int> { 0, 4, 7, 10, 14, 21 }));
+
+    const auto c = key (C, ScaleType::Major);
+    CHECK_EQ (ch (D, Q::Minor11).name (c), std::string ("Dm11"));
+    CHECK_EQ (ch (C, Q::Major69).name (c), std::string ("C6/9"));
+    CHECK_EQ (ch (G, Q::Dominant13).name (c), std::string ("G13"));
+    CHECK_EQ (ch (F_, Q::Major7Sharp11).name (c), std::string ("Fmaj7#11"));
+    CHECK_EQ (ch (E, Q::Dominant7Flat9).name (key (A, ScaleType::HarmonicMinor)), std::string ("E7b9"));
+}
+
+TEST_CASE ("round2: numerals of the new qualities follow the case rules")
+{
+    const auto c = key (C, ScaleType::Major);
+    CHECK_EQ (rn (D, Q::Minor11, c), std::string ("ii11"));
+    CHECK_EQ (rn (A, Q::Minor11, c), std::string ("vi11"));
+    CHECK_EQ (rn (C, Q::Major69, c), std::string ("I6/9"));
+    CHECK_EQ (rn (F_, Q::Major69, c), std::string ("IV6/9"));
+    CHECK_EQ (rn (G, Q::Dominant13, c), std::string ("V13"));
+    CHECK_EQ (rn (F_, Q::Major7Sharp11, c), std::string ("IVmaj7#11"));
+    CHECK_EQ (rn (G, Q::Dominant7Flat9, c), std::string ("V7b9"));
+    CHECK_EQ (rn (Ab, Q::Major69, c), std::string ("bVI6/9"));
+
+    const auto a = key (A, ScaleType::NaturalMinor);
+    CHECK_EQ (rn (A, Q::Minor11, a), std::string ("i11"));
+    CHECK_EQ (rn (D, Q::Minor11, a), std::string ("iv11"));
+    CHECK_EQ (rn (F_, Q::Major7Sharp11, a), std::string ("VImaj7#11"));
+    CHECK_EQ (rn (E, Q::Dominant7Flat9, a), std::string ("V7b9"));
+    CHECK_EQ (rn (E, Q::Dominant13, a), std::string ("V13"));
+    CHECK_EQ (rn (E, Q::Dominant7Flat9, key (A, ScaleType::HarmonicMinor)), std::string ("V7b9"));
+}
+
+TEST_CASE ("round2: 13 and 7b9 chords behave like dominant 7ths")
+{
+    const auto c = key (C, ScaleType::Major);
+    CHECK_EQ (rn (D, Q::Dominant13, c), std::string ("V13/V"));
+    CHECK_EQ (rn (A, Q::Dominant7Flat9, c), std::string ("V7b9/ii"));
+    CHECK_EQ (rn (E, Q::Dominant7Flat9, c), std::string ("V7b9/vi"));
+    CHECK_EQ (rn (C, Q::Dominant13, c), std::string ("V13/IV"));
+    CHECK_EQ (cb::harmonicFunction (ch (D, Q::Dominant13), c), F::Secondary);
+    CHECK_EQ (cb::harmonicFunction (ch (A, Q::Dominant7Flat9), c), F::Secondary);
+    CHECK_EQ (cb::harmonicFunction (ch (G, Q::Dominant13), c), F::Dominant);       // diatonic
+    CHECK_EQ (cb::harmonicFunction (ch (G, Q::Dominant7Flat9), c), F::Dominant);   // the minor-key V7b9 in major
+    CHECK_EQ (cb::harmonicFunction (ch (Fs, Q::Dominant7Flat9), c), F::Chromatic); // target vii° is diminished
+    CHECK_EQ (cb::romanNumeral (ch (D, Q::Dominant7Flat9), c, false), std::string ("II7b9"));
+
+    const auto a = key (A, ScaleType::NaturalMinor);
+    CHECK_EQ (cb::harmonicFunction (ch (E, Q::Dominant7Flat9), a), F::Dominant);
+    CHECK_EQ (cb::harmonicFunction (ch (E, Q::Dominant13), a), F::Dominant);
+    CHECK_EQ (rn (A, Q::Dominant7Flat9, a), std::string ("V7b9/iv"));
+    CHECK_EQ (rn (B, Q::Dominant7Flat9, a), std::string ("V7b9/v"));
+    CHECK_EQ (rn (D, Q::Dominant13, a), std::string ("V13/VII"));
+
+    for (int t = 0; t < 12; ++t)
+        for (auto s : { ScaleType::NaturalMinor, ScaleType::Dorian, ScaleType::Phrygian, ScaleType::HarmonicMinor })
+        {
+            CHECK_EQ (cb::harmonicFunction (ch (t + 7, Q::Dominant13), key (t, s)), F::Dominant);
+            CHECK_EQ (cb::harmonicFunction (ch (t + 7, Q::Dominant7Flat9), key (t, s)), F::Dominant);
+        }
+}
+
+TEST_CASE ("round2: every quality is handled by numerals, names and functions in every key")
+{
+    for (auto& k : allKeys())
+        for (int r = 0; r < 12; ++r)
+            for (int q = 0; q < cb::numChordQualities; ++q)
+            {
+                const Chord c { r, (ChordQuality) q };
+                const auto numeral = cb::romanNumeral (c, k);
+                const auto plain = cb::romanNumeral (c, k, false);
+                REQUIRE (! numeral.empty());
+                REQUIRE (! plain.empty());
+                CHECK (! looksSecondary (plain));
+                CHECK (c.name (k).size() >= 1);
+                const auto names = cb::chordToneNames (c, k);
+                CHECK_EQ (names.size(), (size_t) c.numTones());
+                const auto f = cb::harmonicFunction (c, k);
+                CHECK ((int) f >= 0 && (int) f <= (int) F::Chromatic);
+            }
+}
+
+//==============================================================================
+// Round 2: B13 - harmonic / melodic minor (and the other altered minor scales) borrow from natural minor
+//==============================================================================
+TEST_CASE ("b13: harmonic minor labels C, G and Em as borrowed natural-minor chords")
+{
+    const auto a = key (A, ScaleType::HarmonicMinor);
+    CHECK_EQ (rn (C, Q::Major, a), std::string ("III"));
+    CHECK_EQ (rn (G, Q::Major, a), std::string ("VII"));       // natural-minor numeral (beside G#dim = vii°)
+    CHECK_EQ (rn (E, Q::Minor, a), std::string ("v"));
+    CHECK_EQ (rn (G, Q::Dominant7, a), std::string ("VII7"));
+    CHECK_EQ (rn (A, Q::Minor7, a), std::string ("i7"));
+    CHECK_EQ (rn (C, Q::Major7, a), std::string ("IIImaj7"));
+    for (auto c : { ch (C, Q::Major), ch (G, Q::Major), ch (E, Q::Minor), ch (G, Q::Dominant7), ch (A, Q::Minor7),
+                    ch (C, Q::Major7), ch (E, Q::Minor7) })
+        CHECK_EQ (cb::harmonicFunction (c, a), F::Borrowed);
+
+    // The progression Am C G F reads the same in natural and harmonic minor.
+    const auto an = key (A, ScaleType::NaturalMinor);
+    for (auto c : { ch (A, Q::Minor), ch (C, Q::Major), ch (G, Q::Major), ch (F_, Q::Major) })
+        CHECK_EQ (cb::romanNumeral (c, a), cb::romanNumeral (c, an));
+
+    // Real secondary dominants still read as such.
+    CHECK_EQ (rn (C, Q::Dominant7, a), std::string ("V7/VI"));
+    CHECK_EQ (rn (A, Q::Dominant7, a), std::string ("V7/iv"));
+    CHECK_EQ (rn (B, Q::Dominant7, a), std::string ("V7/V"));
+}
+
+TEST_CASE ("b13: augmented III+ is never a secondary-dominant target")
+{
+    for (int t = 0; t < 12; ++t)
+        for (auto s : { ScaleType::HarmonicMinor, ScaleType::MelodicMinor })
+        {
+            const auto k = key (t, s);
+            const int augRoot = k.pitchClasses()[2];
+            for (auto q : { Q::Major, Q::Dominant7, Q::Dominant9, Q::Dominant13, Q::Dominant7Flat9 })
+            {
+                const Chord v { augRoot + 7, q };
+                CHECK (cb::harmonicFunction (v, k) != F::Secondary);
+                CHECK (! looksSecondary (cb::romanNumeral (v, k)));
+            }
+        }
+}
+
+TEST_CASE ("b13: melodic minor, dorian and phrygian borrow from natural minor")
+{
+    const auto m = key (A, ScaleType::MelodicMinor);
+    CHECK_EQ (rn (F_, Q::Major, m), std::string ("VI"));
+    CHECK_EQ (rn (G, Q::Major, m), std::string ("VII"));
+    CHECK_EQ (rn (D, Q::Minor, m), std::string ("iv"));
+    CHECK_EQ (rn (C, Q::Major, m), std::string ("III"));
+    for (auto c : { ch (F_, Q::Major), ch (G, Q::Major), ch (D, Q::Minor), ch (C, Q::Major), ch (E, Q::Minor) })
+        CHECK_EQ (cb::harmonicFunction (c, m), F::Borrowed);
+
+    const auto d = key (D, ScaleType::Dorian);
+    CHECK_EQ (cb::harmonicFunction (ch (Bb, Q::Major), d), F::Borrowed);   // was Chromatic
+    CHECK_EQ (rn (Bb, Q::Major, d), std::string ("bVI"));                   // modes keep mode-relative accidentals
+    CHECK_EQ (cb::harmonicFunction (ch (G, Q::Minor), d), F::Borrowed);
+
+    const auto e = key (E, ScaleType::Phrygian);
+    CHECK_EQ (cb::harmonicFunction (ch (B, Q::Minor), e), F::Borrowed);
+    CHECK_EQ (cb::harmonicFunction (ch (D, Q::Major), e), F::Borrowed);      // the natural-minor VII
+    CHECK_EQ (rn (D, Q::Major, e), std::string ("VII"));
+
+    // Natural Minor itself and the major family are unchanged: natural-minor-only chords are not borrowed in A minor.
+    CHECK_EQ (cb::harmonicFunction (ch (Bb, Q::Major), key (A, ScaleType::NaturalMinor)), F::Chromatic);
+}
+
+TEST_CASE ("b13: harmonic and melodic minor palettes offer the natural-minor III, VII and v")
+{
+    const auto a = key (A, ScaleType::HarmonicMinor);
+    const auto p = cb::buildPalette (a);
+    CHECK_EQ (padNames (p[3], a), (std::vector<std::string> { "G", "C", "Am7", "Em", "Em7", "Cmaj7", "D", "A" }));
+    CHECK (p[3].chords[0].hint.rfind ("Borrowed from A natural minor:", 0) == 0);
+    CHECK (p[3].chords[6].hint.rfind ("Borrowed from A major:", 0) == 0);
+    for (auto& pad : p[3].chords)
+        CHECK_EQ (pad.function, F::Borrowed);
+
+    const auto m = key (A, ScaleType::MelodicMinor);
+    const auto pm = cb::buildPalette (m);
+    for (auto c : { ch (G, Q::Major), ch (F_, Q::Major), ch (C, Q::Major), ch (E, Q::Minor), ch (D, Q::Minor) })
+        CHECK (sectionHas (pm[3], c));
+
+    // Every harmonic / melodic minor key: VII and III of the natural minor are one click away.
+    for (int t = 0; t < 12; ++t)
+        for (auto s : { ScaleType::HarmonicMinor, ScaleType::MelodicMinor })
+        {
+            const auto k = key (t, s);
+            const auto pal = cb::buildPalette (k);
+            CHECK (sectionHas (pal[3], ch (cb::pc (t + 10), Q::Major)));
+            CHECK (sectionHas (pal[3], ch (cb::pc (t + 3), Q::Major)));
+            CHECK (sectionHas (pal[3], ch (cb::pc (t + 7), Q::Minor)));
+        }
+
+    // Dorian gets the natural-minor bVI next to its major V.
+    const auto dp = cb::buildPalette (key (D, ScaleType::Dorian));
+    CHECK (sectionHas (dp[3], ch (Bb, Q::Major)));
+    CHECK (dp[3].chords[0].chord == ch (A, Q::Major));
+}
+
+//==============================================================================
+// Round 2: B12 - chord-relative spelling
+//==============================================================================
+TEST_CASE ("b12: secondary dominants spell their raised tones with sharps")
+{
+    const auto c = key (C, ScaleType::Major);
+    using V = std::vector<std::string>;
+    CHECK_EQ (cb::chordToneNames (ch (D, Q::Dominant7), c), (V { "D", "F#", "A", "C" }));
+    CHECK_EQ (cb::chordToneNames (ch (E, Q::Dominant7), c), (V { "E", "G#", "B", "D" }));
+    CHECK_EQ (cb::chordToneNames (ch (B, Q::Dominant7), c), (V { "B", "D#", "F#", "A" }));
+    CHECK_EQ (cb::chordToneNames (ch (A, Q::Dominant7), c), (V { "A", "C#", "E", "G" }));
+    CHECK_EQ (cb::chordToneNames (ch (C, Q::Dominant7), c), (V { "C", "E", "G", "Bb" }));
+    CHECK_EQ (cb::chordToneNames (ch (C, Q::Dominant7), key (A, ScaleType::NaturalMinor)), (V { "C", "E", "G", "Bb" }));
+    CHECK_EQ (cb::chordToneNames (ch (B, Q::Dominant7), key (G, ScaleType::Major)), (V { "B", "D#", "F#", "A" }));
+    CHECK_EQ (cb::chordToneNames (ch (A, Q::Dominant7Flat9), key (A, ScaleType::NaturalMinor)), (V { "A", "C#", "E", "G", "Bb" }));
+
+    // Slash-bass names (ProgressionLane): D7/F#, E7/G#.
+    CHECK_EQ (cb::spellChordTone (ch (D, Q::Dominant7), 4, c), std::string ("F#"));
+    CHECK_EQ (cb::spellChordTone (ch (E, Q::Dominant7), 4, c), std::string ("G#"));
+}
+
+TEST_CASE ("b12: chord-relative spelling of borrowed, altered and extended chords")
+{
+    const auto c = key (C, ScaleType::Major);
+    using V = std::vector<std::string>;
+    CHECK_EQ (cb::chordToneNames (ch (Ab, Q::Major), c), (V { "Ab", "C", "Eb" }));
+    CHECK_EQ (cb::chordToneNames (ch (F_, Q::Minor), c), (V { "F", "Ab", "C" }));
+    CHECK_EQ (cb::chordToneNames (ch (B, Q::Diminished7), c), (V { "B", "D", "F", "Ab" }));
+    CHECK_EQ (cb::chordToneNames (ch (C, Q::Augmented), c), (V { "C", "E", "G#" }));
+    CHECK_EQ (cb::chordToneNames (ch (C, Q::Major7Sharp11), c), (V { "C", "E", "G", "B", "F#" }));   // #11, not Gb
+    CHECK_EQ (cb::chordToneNames (ch (F_, Q::Major7Sharp11), c), (V { "F", "A", "C", "E", "B" }));
+    CHECK_EQ (cb::chordToneNames (ch (D, Q::Minor11), c), (V { "D", "F", "A", "C", "E", "G" }));
+    CHECK_EQ (cb::chordToneNames (ch (G, Q::Dominant13), c), (V { "G", "B", "D", "F", "A", "E" }));
+    CHECK_EQ (cb::chordToneNames (ch (C, Q::Major69), c), (V { "C", "E", "G", "A", "D" }));
+    CHECK_EQ (cb::chordToneNames (ch (G, Q::Dominant7Flat9), c), (V { "G", "B", "D", "F", "Ab" }));
+    CHECK_EQ (cb::chordToneNames (ch (Fs, Q::HalfDiminished7), c), (V { "F#", "A", "C", "E" }));
+    CHECK_EQ (cb::chordToneNames (ch (Ab, Q::Minor), key (Eb, ScaleType::Major)), (V { "Ab", "Cb", "Eb" }));
+    CHECK_EQ (cb::chordToneNames (ch (Gs, Q::Diminished7), key (A, ScaleType::HarmonicMinor)), (V { "G#", "B", "D", "F" }));
+}
+
+TEST_CASE ("b12: chord roots outside key and parallel key follow their numeral")
+{
+    const auto c = key (C, ScaleType::Major);
+    CHECK_EQ (ch (Fs, Q::Diminished).name (c), std::string ("F#dim"));          // #iv°
+    CHECK_EQ (ch (Fs, Q::HalfDiminished7).name (c), std::string ("F#m7b5"));     // was "Gbm7b5"
+    CHECK_EQ (ch (Cs, Q::Diminished7).name (c), std::string ("C#dim7"));         // #i°7
+    CHECK_EQ (ch (Db, Q::Major).name (c), std::string ("Db"));                   // bII
+    CHECK_EQ (ch (Gb, Q::Major).name (c), std::string ("Gb"));                   // bV
+    CHECK_EQ (ch (Bb, Q::Major).name (key (A, ScaleType::NaturalMinor)), std::string ("Bb"));   // Neapolitan bII, was "A#"
+    CHECK_EQ (ch (Ab, Q::Major).name (key (G, ScaleType::Major)), std::string ("Ab"));          // bII, was "G#"
+    CHECK_EQ (ch (G, Q::Major).name (key (A, ScaleType::HarmonicMinor)), std::string ("G"));
+    CHECK_EQ (ch (Bb, Q::Major).name (key (D, ScaleType::Dorian)), std::string ("Bb"));
+    // Unchanged: roots in the key or its parallel key keep Key::spell.
+    CHECK_EQ (ch (Eb, Q::Major).name (key (G, ScaleType::Major)), std::string ("Eb"));
+    CHECK_EQ (ch (Cs, Q::Minor).name (key (A, ScaleType::NaturalMinor)), std::string ("C#m"));
+
+    for (auto& k : allKeys())
+        for (int r = 0; r < 12; ++r)
+            for (int q = 0; q < cb::numChordQualities; ++q)
+            {
+                const Chord ch2 { r, (ChordQuality) q };
+                const auto tones = cb::chordToneNames (ch2, k);
+                REQUIRE (! tones.empty());
+                CHECK_EQ (ch2.name (k).rfind (tones[0], 0), (size_t) 0);   // the name starts with the spelled root
+                for (auto& t : tones)
+                {
+                    CHECK (t.size() == 1 || t.size() == 2);                 // never a double accidental
+                    CHECK (t.find ("##") == std::string::npos && t.find ("bb") == std::string::npos);
+                }
+            }
+}
+
+TEST_CASE ("b12: palette chords spell as stacked letters with single accidentals")
+{
+    for (auto& k : allKeys())
+    {
+        // Keys whose own scale needs a double accidental (G# Harmonic Minor ...) fall back to plain names.
+        bool regular = true;
+        for (int p : k.pitchClasses())
+            regular = regular && k.spell (p).size() <= 2;
+        std::set<char> scaleLetters;
+        for (int p : k.pitchClasses())
+            scaleLetters.insert (k.spell (p)[0]);
+        regular = regular && scaleLetters.size() == 7;
+
+        const auto pal = cb::buildPalette (k);
+        for (auto& s : pal)
+            for (auto& pad : s.chords)
+            {
+                const auto tones = cb::chordToneNames (pad.chord, k);
+                const auto pcs = pad.chord.pitchClasses();
+
+                // Triad tones (root, 3rd/sus, 5th) take distinct letters: no "C Eb D#" style spellings.
+                std::set<char> triadLetters { tones[0][0], tones[1][0], tones[2][0] };
+                CHECK_EQ (triadLetters.size(), (size_t) 3);
+
+                // Diatonic chords of regular keys spell exactly like the key does.
+                if (regular && s.id != cb::PaletteSectionId::Borrowed && s.id != cb::PaletteSectionId::Secondary)
+                    for (size_t i = 0; i < pcs.size(); ++i)
+                        CHECK_EQ (tones[i], k.spell (pcs[i]));
+            }
+    }
 }
 
 //==============================================================================
@@ -831,11 +1251,14 @@ TEST_CASE ("suggest: secondary dominants resolve to their target")
     CHECK (bestNext (ch (E, Q::Dominant7), c) == ch (A, Q::Minor));
 
     for (auto& k : allKeys())
-        for (auto& pad : cb::buildPalette (k)[4].chords)
+    {
+        const auto pal = cb::buildPalette (k);   // round 2: was a range-for over a destroyed temporary
+        for (auto& pad : pal[4].chords)
         {
             const auto target = cb::diatonicChord (k, k.degreeOf (pad.chord.root + 5), false);
             CHECK (cb::transitionScore (pad.chord, target, k) >= 0.9f);
         }
+    }
 }
 
 TEST_CASE ("suggest: borrowed moves")

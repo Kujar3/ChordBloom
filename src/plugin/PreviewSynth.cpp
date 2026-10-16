@@ -12,12 +12,15 @@ struct PreviewSynth::Impl
         int note = 0, channel = 0;
         std::uint64_t age = 0;
         bool active = false, released = false;
+        bool sustained = false;   // note-off arrived while the sustain pedal (CC64) was down: keeps ringing until pedal up
         double phase = 0.0, partialPhase = 0.0, thirdPhase = 0.0, increment = 0.0;
         float velocity = 0.0f, envelope = 0.0f, attackStep = 0.0f;
         float decay = 1.0f, release = 1.0f, modulation = 0.0f, modulationDecay = 1.0f;
         float panLeft = 0.7071f, panRight = 0.7071f, filterState = 0.0f, filterG = 0.0f;
         float lastLeft = 0.0f, lastRight = 0.0f;
         int attackRemaining = 0, fadeRemaining = 0, fadeLength = 1;
+        int holdRemaining = 0;    // samples of full sustain before `decay` applies (Warm Pad)
+        float maxIndex = 0.0f;    // Soft Keys: phase-modulation index cap that keeps the sidebands below ~0.45 * sampleRate
     };
     // Fixed tail storage preserves the stolen oscillator during its 3 ms fade.
     struct Slot
@@ -27,6 +30,7 @@ struct PreviewSynth::Impl
         int residualRemaining = 0;
     };
     std::array<Slot, 24> slots {};
+    std::array<bool, 17> sustainDown {};   // per MIDI channel 1..16 (index 0 unused)
     juce::AudioBuffer<float> scratch;
     juce::Reverb reverb;
     juce::SmoothedValue<float> gain { 1.0f };
@@ -109,9 +113,13 @@ struct PreviewSynth::Impl
         const auto isPad = voice.tone == Tone::WarmPad;
         voice.attackRemaining = juce::jmax (1, static_cast<int> (std::ceil (sampleRate * (isPad ? 0.25 : 0.003))));
         voice.attackStep = 1.0f / static_cast<float> (voice.attackRemaining);
-        voice.decay = isPad ? 1.0f : coefficient (voice.tone == Tone::SoftKeys ? 2.4 : 0.8);
+        // Warm Pad: full sustain for 20 s, then a 10 s fade (to -60 dB), so even a lost note-off can never drone forever.
+        voice.holdRemaining = isPad ? static_cast<int> (sampleRate * 20.0) : 0;
+        voice.decay = coefficient (isPad ? 10.0 : (voice.tone == Tone::SoftKeys ? 2.4 : 0.8));
         voice.release = coefficient (isPad ? 1.2 : (voice.tone == Tone::SoftKeys ? 0.35 : 0.18));
         voice.modulation = 0.25f + 2.2f * velocity * velocity;
+        // Carson-style bound: the strongest sidebands sit at (2 * index + 3) * f, keep them below 0.45 * sampleRate.
+        voice.maxIndex = static_cast<float> (juce::jmax (0.0, (0.45 / juce::jmax (1.0e-9, voice.increment) - 3.0) * 0.5));
         voice.modulationDecay = coefficient (0.7);
         const auto cutoff = juce::jmin (sampleRate * 0.18, 1300.0 + 1600.0 * velocity);
         const auto g = std::tan (juce::MathConstants<double>::pi * cutoff / sampleRate);
@@ -122,17 +130,40 @@ struct PreviewSynth::Impl
             voice.thirdPhase = 0.67;
         }
     }
-    void stopNotes (bool allowTailOff, int channel = 0, int note = -1)
+    // respectSustain: a plain note-off while the channel's sustain pedal is down only marks the voice as sustained.
+    void stopNotes (bool allowTailOff, int channel = 0, int note = -1, bool respectSustain = false)
     {
         for (auto& slot : slots)
             for (auto* voice : { &slot.voice, &slot.tail })
                 if (voice->active && (channel == 0 || voice->channel == channel)
                     && (note < 0 || voice->note == note))
                 {
+                    if (respectSustain && voice->channel >= 1 && voice->channel <= 16
+                        && sustainDown[static_cast<size_t> (voice->channel)])
+                    {
+                        voice->sustained = true;
+                        continue;
+                    }
+                    voice->sustained = false;
                     if (allowTailOff)
                         voice->released = true;
                     else
                         quickRelease (*voice);
+                }
+    }
+    void setSustain (int channel, bool down)
+    {
+        if (channel < 1 || channel > 16)
+            return;
+        sustainDown[static_cast<size_t> (channel)] = down;
+        if (down)
+            return;
+        for (auto& slot : slots)
+            for (auto* voice : { &slot.voice, &slot.tail })
+                if (voice->active && voice->sustained && voice->channel == channel)
+                {
+                    voice->sustained = false;
+                    voice->released = true;
                 }
     }
     void tick (Voice& voice, float& left, float& right)
@@ -146,6 +177,8 @@ struct PreviewSynth::Impl
             voice.envelope = juce::jmin (1.0f, voice.envelope + voice.attackStep);
             --voice.attackRemaining;
         }
+        else if (voice.holdRemaining > 0)
+            --voice.holdRemaining;
         else
             voice.envelope *= voice.decay;
         double signal = 0.0;
@@ -175,9 +208,8 @@ struct PreviewSynth::Impl
         }
         else
         {
-            const auto brightness = juce::jlimit (0.0, 1.0, (0.45 - step * 3.0) / 0.2);
-            signal = std::sin (twoPi * voice.phase + brightness * voice.modulation
-                             * std::sin (twoPi * voice.partialPhase));
+            const auto index = static_cast<double> (juce::jmin (voice.modulation, voice.maxIndex));
+            signal = std::sin (twoPi * voice.phase + index * std::sin (twoPi * voice.partialPhase));
             if (step * 4.0 < 0.45)
                 signal += 0.07 * voice.velocity * voice.modulation * std::sin (twoPi * voice.thirdPhase);
             signal *= 0.88;
@@ -269,6 +301,7 @@ void PreviewSynth::prepare (double sampleRate, int maxBlockSize)
 void PreviewSynth::reset()
 {
     impl->slots = {};
+    impl->sustainDown.fill (false);
     impl->nextAge = 0;
     impl->reverb.reset();
     impl->gain.setCurrentAndTargetValue (impl->targetGain);
@@ -295,8 +328,8 @@ void PreviewSynth::render (juce::AudioBuffer<float>& buffer, const juce::MidiBuf
     int position = 0;
     for (const auto metadata : midi)
     {
-        if (metadata.samplePosition >= count)
-            break;
+        // Events at or beyond the end of the block (including every event of a 0-sample block) are still applied, at
+        // the block end: the synth's note state must always match what was sent as MIDI out.
         const auto eventPosition = juce::jlimit (position, count, metadata.samplePosition);
         impl->renderRange (buffer, position, eventPosition);
         position = eventPosition;
@@ -311,7 +344,11 @@ void PreviewSynth::render (juce::AudioBuffer<float>& buffer, const juce::MidiBuf
         if (status == 0x90 && value != 0)
             impl->noteOn (note, channel, static_cast<float> (value) / 127.0f);
         else if (status == 0x80 || status == 0x90)
-            impl->stopNotes (true, channel, note);
+            impl->stopNotes (true, channel, note, true);
+        else if (status == 0xb0 && note == 64)
+            impl->setSustain (channel, value >= 64);
+        else if (status == 0xb0 && note == 121)
+            impl->setSustain (channel, false);                 // reset all controllers
         else if (status == 0xb0 && (note == 120 || note == 123))
             impl->stopNotes (note == 123, channel);
     }
@@ -319,5 +356,6 @@ void PreviewSynth::render (juce::AudioBuffer<float>& buffer, const juce::MidiBuf
 }
 void PreviewSynth::allNotesOff (bool allowTailOff)
 {
+    impl->sustainDown.fill (false);   // the pedal-up may never arrive (bypass, sound switched off): never keep sustaining
     impl->stopNotes (allowTailOff);
 }

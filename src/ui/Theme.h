@@ -56,6 +56,27 @@ inline constexpr const char* kPropProminent = "cb.prominent";
 inline constexpr const char* kPropChip      = "cb.chip";
 inline constexpr const char* kPropGhost     = "cb.ghost";
 
+//==============================================================================
+// Keyboard focus (added by ui-shell, round 2). Chordbloom never takes keyboard focus away from the host, so FL Studio's
+// spacebar and shortcuts keep working: turns off wantsKeyboardFocus and mouseClickGrabsKeyboardFocus on `root` and
+// every descendant. Text editors are left alone (they need focus to be typed into).
+void neverTakeKeyboardFocus (juce::Component& root);
+
+// Wraps a JUCE widget (ToggleButton, TextButton, Slider, ...) so that right-clicks / ctrl-clicks are ignored instead of
+// acting like a left click (FL users right-click expecting a menu; a plain click must never change a parameter).
+// Usage: cb::ui::LeftClickOnly<juce::ToggleButton> toggle { "Name" };
+template <typename WidgetType>
+class LeftClickOnly : public WidgetType
+{
+public:
+    using WidgetType::WidgetType;
+
+    void mouseDown (const juce::MouseEvent& e) override        { if (! e.mods.isPopupMenu()) WidgetType::mouseDown (e); }
+    void mouseDrag (const juce::MouseEvent& e) override        { if (! e.mods.isPopupMenu()) WidgetType::mouseDrag (e); }
+    void mouseUp (const juce::MouseEvent& e) override          { if (! e.mods.isPopupMenu()) WidgetType::mouseUp (e); }
+    void mouseDoubleClick (const juce::MouseEvent& e) override { if (! e.mods.isPopupMenu()) WidgetType::mouseDoubleClick (e); }
+};
+
 class LookAndFeel : public juce::LookAndFeel_V4
 {
 public:

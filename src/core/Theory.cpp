@@ -112,6 +112,30 @@ namespace
                 return i;
         return 0;
     }
+
+    // Letter index (0 = C .. 6 = B) plus a single accidental for pitch class p, or "" when p is more than a
+    // semitone away from that letter's natural pitch class (would need a double accidental).
+    std::string letterWithAccidental (int letterIndex, int p)
+    {
+        static const char letters[] = { 'C', 'D', 'E', 'F', 'G', 'A', 'B' };
+        static const int letterPcs[] = { 0, 2, 4, 5, 7, 9, 11 };
+
+        const int l = ((letterIndex % 7) + 7) % 7;
+        int diff = pc (p) - letterPcs[l];
+        while (diff > 6)  diff -= 12;
+        while (diff < -6) diff += 12;
+
+        if (diff == 0)  return std::string (1, letters[l]);
+        if (diff == 1)  return std::string (1, letters[l]) + "#";
+        if (diff == -1) return std::string (1, letters[l]) + "b";
+        return {};
+    }
+
+    // Enharmonics that read badly as a single out-of-key note or chord root.
+    bool isAwkwardSpelling (const std::string& s)
+    {
+        return s == "E#" || s == "B#" || s == "Cb" || s == "Fb";
+    }
 } // namespace
 
 std::string Key::spell (int pitchClass) const
@@ -130,7 +154,7 @@ std::string Key::spell (int pitchClass) const
     // that G Major's bVI is "Eb" (not "D#") and A Minor's Picardy third is "C#". Awkward enharmonics
     // (E#, B#, Cb, Fb) are avoided for out-of-scale tones.
     auto s = spellWithLetters (tonicLetter, parallel().pitchClasses(), p);
-    if (! s.empty() && s != "E#" && s != "B#" && s != "Cb" && s != "Fb")
+    if (! s.empty() && ! isAwkwardSpelling (s))
         return s;
 
     return pitchClassName (p, prefersFlats());
@@ -217,8 +241,6 @@ std::vector<int> Chord::pitchClasses() const
     return result;
 }
 
-std::string Chord::name (const Key& key) const { return key.spell (root) + qualitySuffix (quality); }
-
 //==============================================================================
 const char* functionName (HarmonicFunction f)
 {
@@ -259,9 +281,27 @@ namespace
         return third >= 4 ? ChordQuality::Major : ChordQuality::Minor;
     }
 
+    // Chords that can act as a (secondary) dominant: major triad, 7, 9, 13 and 7b9.
     bool isDominantShaped (ChordQuality q)
     {
-        return q == ChordQuality::Major || q == ChordQuality::Dominant7 || q == ChordQuality::Dominant9;
+        return q == ChordQuality::Major || q == ChordQuality::Dominant7 || q == ChordQuality::Dominant9
+            || q == ChordQuality::Dominant13 || q == ChordQuality::Dominant7Flat9;
+    }
+
+    // Minor-family scales other than Natural Minor (Harmonic / Melodic Minor, Dorian, Phrygian, Locrian). Besides the
+    // parallel major they also borrow from the natural minor on the same tonic (A Harmonic Minor: G, C, Em, Am7 ...).
+    bool borrowsFromNaturalMinor (const Key& key)
+    {
+        return scaleInfo (key.scale).isMinorFamily && key.scale != ScaleType::NaturalMinor;
+    }
+
+    Key naturalMinorOf (const Key& key) { return { key.tonic, ScaleType::NaturalMinor }; }
+
+    // Harmonic and Melodic Minor are read as "minor keys": their natural-minor degrees keep the familiar natural-minor
+    // numerals (A Harmonic Minor: G = VII next to G#dim = vii°, as in classical minor-key analysis).
+    bool usesNaturalMinorNumerals (const Key& key)
+    {
+        return key.scale == ScaleType::HarmonicMinor || key.scale == ScaleType::MelodicMinor;
     }
 
     bool isDiminishedFamily (ChordQuality q)
@@ -282,6 +322,7 @@ namespace
             case ChordQuality::Diminished7:
             case ChordQuality::MinorMajor7:
             case ChordQuality::Minor9:
+            case ChordQuality::Minor11:
                 return true;
             default:
                 return false;
@@ -311,7 +352,25 @@ namespace
             case ChordQuality::Minor9:          return "9";
             case ChordQuality::Dominant9:       return "9";
             case ChordQuality::MinorMajor7:     return "(maj7)";
+            case ChordQuality::Minor11:         return "11";
+            case ChordQuality::Major69:         return "6/9";
+            case ChordQuality::Dominant13:      return "13";
+            case ChordQuality::Major7Sharp11:   return "maj7#11";
+            case ChordQuality::Dominant7Flat9:  return "7b9";
             default:                            return "";
+        }
+    }
+
+    // Suffix after "V" in a secondary-dominant label ("V7/V", "V9/ii", "V7b9/iv").
+    const char* secondarySuffix (ChordQuality q)
+    {
+        switch (q)
+        {
+            case ChordQuality::Dominant7:      return "7";
+            case ChordQuality::Dominant9:      return "9";
+            case ChordQuality::Dominant13:     return "13";
+            case ChordQuality::Dominant7Flat9: return "7b9";
+            default:                           return "";
         }
     }
 
@@ -359,6 +418,15 @@ namespace
             if (diff == +1) return { parDegree, +1 };
         }
 
+        // Harmonic / Melodic Minor: natural-minor roots keep their natural-minor numeral (A Harmonic Minor: G -> VII,
+        // A Melodic Minor: F -> VI), so a progression reads the same after switching between the minor scales.
+        if (usesNaturalMinorNumerals (key))
+        {
+            const int natDegree = naturalMinorOf (key).degreeOf (root);
+            if (natDegree >= 0)
+                return { natDegree, 0 };
+        }
+
         // Default: "b" + the degree above (C major: Db -> bII, Gb -> bV).
         if (above >= 0) return { above, -1 };
         if (below >= 0) return { below, +1 };
@@ -388,7 +456,8 @@ namespace
             && scaleInfo (key.scale).offsets[4] == 7;
     }
 
-    // Degree (1..6) of the diatonic, non-diminished target a dominant-shaped chord points to (a fifth below), or -1.
+    // Degree (1..6) of the diatonic target a dominant-shaped chord points to (a fifth below), or -1. Diminished targets
+    // (vii°) and augmented ones (III+ of Harmonic / Melodic Minor) are not resolution targets.
     int secondaryTargetDegree (const Chord& chord, const Key& key)
     {
         if (! isDominantShaped (chord.quality))
@@ -398,12 +467,89 @@ namespace
         if (degree <= 0)
             return -1;
 
-        if (stackedTriadQuality (key, degree) == ChordQuality::Diminished)
+        const auto targetQuality = stackedTriadQuality (key, degree);
+        if (targetQuality == ChordQuality::Diminished || targetQuality == ChordQuality::Augmented)
             return -1;
 
         return degree;
     }
+
+    //==========================================================================
+    // Root spelling shared by Chord::name and chordToneNames, so a chord's name, its tones and its numeral agree.
+    //  - roots in the key or its parallel key: Key::spell (C major: Ab, Bb, Eb; A minor: C#, F#, G#)
+    //  - natural-minor roots of the other minor-family scales: natural-minor letters (A Harmonic Minor: G)
+    //  - anything else follows the numeral's degree letter and accidental (C major F#dim = #iv°, A minor Bb = bII,
+    //    G major Ab = bII), unless that would need a double accidental or read as E#/B#/Cb/Fb.
+    std::string spellRoot (const Chord& chord, const Key& key)
+    {
+        const int r = pc (chord.root);
+        if (key.contains (r) || key.parallel().contains (r))
+            return key.spell (r);
+
+        const int tonicLetter = letterIndexOf (key.tonicName()[0]);
+
+        if (borrowsFromNaturalMinor (key))
+        {
+            const Key nat = naturalMinorOf (key);
+            if (nat.contains (r))
+            {
+                const auto s = spellWithLetters (tonicLetter, nat.pitchClasses(), r);
+                return s.empty() || isAwkwardSpelling (s) ? key.spell (r) : s;
+            }
+        }
+
+        const auto ref = locateRoot (r, chord.quality, key);
+        const auto s = letterWithAccidental (tonicLetter + std::clamp (ref.degree, 0, 6), r);
+        return s.empty() || isAwkwardSpelling (s) ? key.spell (r) : s;
+    }
+
+    // Letter steps above the root's letter for a chord interval (0..23 semitones), or -1 when unknown.
+    // b5 of diminished chords -> 5th letter, #11 -> 4th letter (F# over C), bb7 of dim7 -> 7th letter.
+    int letterStepForInterval (int interval, ChordQuality quality)
+    {
+        switch (interval)
+        {
+            case 0:  case 12:                   return 0;
+            case 1:  case 2:  case 13: case 14: case 15: return 1;
+            case 3:  case 4:  case 16:          return 2;
+            case 5:  case 17: case 18:          return 3;
+            case 6:  case 7:  case 8:  case 19: return 4;
+            case 9:                             return quality == ChordQuality::Diminished7 ? 6 : 5;
+            case 20: case 21:                   return 5;
+            case 10: case 11: case 22: case 23: return 6;
+            default:                            return -1;
+        }
+    }
 } // namespace
+
+std::string Chord::name (const Key& key) const { return spellRoot (*this, key) + qualitySuffix (quality); }
+
+std::string spellChordTone (const Chord& chord, int interval, const Key& key)
+{
+    const auto rootName = spellRoot (chord, key);
+    const int p = pc (chord.root + interval);
+
+    if (p == pc (chord.root))
+        return rootName;
+
+    const int step = letterStepForInterval (interval, chord.quality);
+    if (step >= 0)
+    {
+        const auto s = letterWithAccidental (letterIndexOf (rootName[0]) + step, p);
+        if (! s.empty())
+            return s;
+    }
+
+    return key.spell (p);
+}
+
+std::vector<std::string> chordToneNames (const Chord& chord, const Key& key)
+{
+    std::vector<std::string> names;
+    for (int interval : qualityIntervals (chord.quality))
+        names.push_back (spellChordTone (chord, interval, key));
+    return names;
+}
 
 HarmonicFunction harmonicFunction (const Chord& chord, const Key& key)
 {
@@ -423,6 +569,9 @@ HarmonicFunction harmonicFunction (const Chord& chord, const Key& key)
     if (isDiatonic (chord, key.parallel()))
         return HarmonicFunction::Borrowed;
 
+    if (borrowsFromNaturalMinor (key) && isDiatonic (chord, naturalMinorOf (key)))
+        return HarmonicFunction::Borrowed;
+
     if (secondaryTargetDegree (chord, key) > 0)
         return HarmonicFunction::Secondary;
 
@@ -435,11 +584,7 @@ std::string romanNumeral (const Chord& chord, const Key& key, bool detectSeconda
     {
         const int targetDegree = secondaryTargetDegree (chord, key);
         const Chord target { key.pitchClasses()[(size_t) targetDegree], stackedTriadQuality (key, targetDegree) };
-
-        std::string s = "V";
-        if (chord.quality == ChordQuality::Dominant7) s += "7";
-        if (chord.quality == ChordQuality::Dominant9) s += "9";
-        return s + "/" + plainNumeral (target, key);
+        return std::string ("V") + secondarySuffix (chord.quality) + "/" + plainNumeral (target, key);
     }
 
     return plainNumeral (chord, key);

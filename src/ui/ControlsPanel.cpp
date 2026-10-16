@@ -37,11 +37,52 @@ void paintInset (juce::Graphics& g, juce::Rectangle<float> b, float radius)
 class Segmented final : public juce::Component, public juce::SettableTooltipClient
 {
 public:
-    Segmented (juce::RangedAudioParameter& p, juce::StringArray segmentLabels)
+    Segmented (juce::RangedAudioParameter& p, juce::StringArray segmentLabels, const juce::String& accessibleTitle)
         : labels (std::move (segmentLabels)),
-          attachment (p, [this] (float v) { selected = juce::roundToInt (v); repaint(); })
+          attachment (p, [this] (float v)
+                      {
+                          selected = juce::roundToInt (v);
+                          repaint();
+
+                          if (onValueChange != nullptr)
+                              onValueChange();
+
+                          if (auto* handler = getAccessibilityHandler())
+                              handler->notifyAccessibilityEvent (juce::AccessibilityEvent::valueChanged);
+                      })
     {
+        setTitle (accessibleTitle);
+        setDescription ("Choose one of: " + labels.joinIntoString (", "));
         attachment.sendInitialUpdate();
+    }
+
+    int getSelectedIndex() const noexcept { return selected; }
+    std::function<void()> onValueChange;   // after the parameter changed (message thread)
+
+    std::unique_ptr<juce::AccessibilityHandler> createAccessibilityHandler() override
+    {
+        struct Value final : public juce::AccessibilityTextValueInterface
+        {
+            explicit Value (Segmented& s) : owner (s) {}
+            bool isReadOnly() const override { return false; }
+            juce::String getCurrentValueAsString() const override { return owner.labels[owner.selected]; }
+
+            void setValueAsString (const juce::String& newValue) override
+            {
+                const int index = owner.labels.indexOf (newValue.trim(), true);
+
+                if (index >= 0)
+                    owner.select (index);
+            }
+
+            Segmented& owner;
+        };
+
+        return std::make_unique<juce::AccessibilityHandler> (
+            *this, juce::AccessibilityRole::comboBox,
+            juce::AccessibilityActions().addAction (juce::AccessibilityActionType::press,
+                                                    [this] { select ((selected + 1) % juce::jmax (1, labels.size())); }),
+            juce::AccessibilityHandler::Interfaces { std::make_unique<Value> (*this) });
     }
 
     void paint (juce::Graphics& g) override
@@ -96,13 +137,19 @@ public:
 
     void mouseDown (const juce::MouseEvent& e) override
     {
-        const int index = indexAt (e.position.x);
+        if (e.mods.isPopupMenu())   // right-click never changes the parameter
+            return;
 
-        if (index >= 0 && index != selected)
-            attachment.setValueAsCompleteGesture ((float) index);
+        select (indexAt (e.position.x));
     }
 
 private:
+    void select (int index)
+    {
+        if (index >= 0 && index < labels.size() && index != selected)
+            attachment.setValueAsCompleteGesture ((float) index);
+    }
+
     int indexAt (float x) const
     {
         const int n = labels.size();
@@ -134,13 +181,39 @@ private:
 class Stepper final : public juce::Component, public juce::SettableTooltipClient
 {
 public:
-    explicit Stepper (juce::RangedAudioParameter& p)
-        : attachment (p, [this] (float v) { value = juce::roundToInt (v); repaint(); })
+    Stepper (juce::RangedAudioParameter& p, const juce::String& accessibleTitle)
+        : attachment (p, [this] (float v)
+                      {
+                          value = juce::roundToInt (v);
+                          repaint();
+
+                          if (auto* handler = getAccessibilityHandler())
+                              handler->notifyAccessibilityEvent (juce::AccessibilityEvent::valueChanged);
+                      })
     {
         const auto& range = p.getNormalisableRange();
         minValue = juce::roundToInt (range.start);
         maxValue = juce::roundToInt (range.end);
+        setTitle (accessibleTitle);
         attachment.sendInitialUpdate();
+    }
+
+    std::unique_ptr<juce::AccessibilityHandler> createAccessibilityHandler() override
+    {
+        struct Value final : public juce::AccessibilityRangedNumericValueInterface
+        {
+            explicit Value (Stepper& s) : owner (s) {}
+            bool isReadOnly() const override { return false; }
+            double getCurrentValue() const override { return owner.value; }
+            void setValue (double newValue) override { owner.step (juce::roundToInt (newValue) - owner.value); }
+            AccessibleValueRange getRange() const override { return { { (double) owner.minValue, (double) owner.maxValue }, 1.0 }; }
+
+            Stepper& owner;
+        };
+
+        return std::make_unique<juce::AccessibilityHandler> (
+            *this, juce::AccessibilityRole::slider, juce::AccessibilityActions(),
+            juce::AccessibilityHandler::Interfaces { std::make_unique<Value> (*this) });
     }
 
     void paint (juce::Graphics& g) override
@@ -164,26 +237,58 @@ public:
     }
 
     void mouseMove (const juce::MouseEvent& e) override { setHover (zoneAt (e.position.x)); }
-    void mouseExit (const juce::MouseEvent&) override { setHover (0); }
+
+    void mouseExit (const juce::MouseEvent&) override
+    {
+        setHover (0);
+        wheelAccum = 0.0f;
+    }
 
     void mouseDown (const juce::MouseEvent& e) override
     {
+        if (e.mods.isPopupMenu())   // right-click never changes the parameter
+            return;
+
         if (const int dir = zoneAt (e.position.x); dir != 0)
             step (dir);
     }
 
     void mouseDoubleClick (const juce::MouseEvent& e) override
     {
-        if (zoneAt (e.position.x) == 0)
+        if (! e.mods.isPopupMenu() && zoneAt (e.position.x) == 0)
             attachment.setValueAsCompleteGesture (0.0f);
     }
 
+    // Accumulates wheel motion so that touchpads and smooth-scrolling / hi-res wheels (many tiny events per gesture)
+    // move one octave per notch-worth of travel instead of one octave per event. A classic notched wheel sends
+    // ~0.234 per notch (120 units), just above the threshold, so it still steps once per notch.
     void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails& wheel) override
     {
-        const float delta = std::abs (wheel.deltaY) > std::abs (wheel.deltaX) ? wheel.deltaY : wheel.deltaX;
+        if (wheel.isInertial)
+            return;
 
-        if (delta != 0.0f)
-            step (delta > 0.0f ? 1 : -1);
+        float delta = std::abs (wheel.deltaY) > std::abs (wheel.deltaX) ? wheel.deltaY : wheel.deltaX;
+
+        if (wheel.isReversed)
+            delta = -delta;
+
+        if (delta == 0.0f)
+            return;
+
+        const auto now = juce::Time::getMillisecondCounter();
+
+        // Direction change or a pause restarts the accumulation (leftovers never carry into the next gesture).
+        if ((delta > 0.0f) != (wheelAccum > 0.0f) || now - lastWheelMs > 400)
+            wheelAccum = 0.0f;
+
+        lastWheelMs = now;
+        wheelAccum += delta;
+
+        if (std::abs (wheelAccum) < kWheelStep)
+            return;
+
+        step (wheelAccum > 0.0f ? 1 : -1);
+        wheelAccum = 0.0f;
     }
 
 private:
@@ -241,8 +346,12 @@ private:
             attachment.setValueAsCompleteGesture ((float) newValue);
     }
 
+    static constexpr float kWheelStep = 0.2f;
+
     int value = 0, minValue = -3, maxValue = 3;
     int hoverZone = 0;
+    float wheelAccum = 0.0f;
+    juce::uint32 lastWheelMs = 0;
     juce::ParameterAttachment attachment;
 };
 
@@ -260,7 +369,9 @@ public:
         slider.setRotaryParameters (juce::MathConstants<float>::pi * 1.25f, juce::MathConstants<float>::pi * 2.75f, true);
         slider.setMouseDragSensitivity (160);
         slider.setScrollWheelEnabled (true);
-        slider.setTooltip (tooltip + " (double-click to reset)");
+        slider.setTitle (captionText);
+        slider.setDescription (tooltip);
+        setTooltipText (tooltip);
         slider.setWantsKeyboardFocus (false);
         slider.setMouseClickGrabsKeyboardFocus (false);
         addAndMakeVisible (slider);
@@ -296,12 +407,23 @@ public:
     void mouseEnter (const juce::MouseEvent&) override { hovering = true; repaint(); }
     void mouseExit (const juce::MouseEvent&) override { hovering = false; repaint(); }
 
+    // `note` (may be empty) is appended to the tooltip, e.g. why the control has no effect right now.
+    void setTooltipText (const juce::String& tooltip, const juce::String& note = {})
+    {
+        auto text = tooltip + " (double-click to reset)";
+
+        if (note.isNotEmpty())
+            text << "\n\n" << note;
+
+        slider.setTooltip (text);
+    }
+
 private:
     void sliderValueChanged (juce::Slider*) override { repaint (captionArea); }
     void sliderDragStarted (juce::Slider*) override { dragging = true; repaint (captionArea); }
     void sliderDragEnded (juce::Slider*) override { dragging = false; repaint (captionArea); }
 
-    juce::Slider slider;
+    cb::ui::LeftClickOnly<juce::Slider> slider;
     std::unique_ptr<juce::SliderParameterAttachment> attachment;
     juce::String caption;
     std::function<juce::String (double)> format;
@@ -318,11 +440,10 @@ struct ControlsPanel::Impl
     Impl (ControlsPanel& o, ChordbloomProcessor& p)
         : owner (o),
           apvts (p.getAPVTS()),
-          rate (param (apvts, cb::ParamIDs::rate), choiceNames (apvts, cb::ParamIDs::rate)),
-          style (param (apvts, cb::ParamIDs::voicing), choiceNames (apvts, cb::ParamIDs::voicing)),
-          octave (param (apvts, cb::ParamIDs::octave)),
-          swing (param (apvts, cb::ParamIDs::swing), "Swing", percent,
-                 "Swing: delays every second step for a shuffled groove"),
+          rate (param (apvts, cb::ParamIDs::rate), choiceNames (apvts, cb::ParamIDs::rate), "Rate"),
+          style (param (apvts, cb::ParamIDs::voicing), choiceNames (apvts, cb::ParamIDs::voicing), "Voicing style"),
+          octave (param (apvts, cb::ParamIDs::octave), "Octave"),
+          swing (param (apvts, cb::ParamIDs::swing), "Swing", percent, swingTip),
           gate (param (apvts, cb::ParamIDs::gate), "Gate", percent,
                 "Gate: how long each note sounds, relative to its step (short = staccato, full = legato)"),
           velocity (param (apvts, cb::ParamIDs::velocity), "Velocity",
@@ -350,14 +471,27 @@ struct ControlsPanel::Impl
         updateSeventhsLook();
 
         pattern.setTooltip ("Rhythm pattern for playback and MIDI export: held chords, strums, pulses, arpeggios or broken chords");
-        rate.setTooltip ("Step length for pulses, arpeggios and moving bass lines (1/8T = eighth-note triplets)");
         style.setTooltip ("Voicing: Close keeps the notes compact, Open spreads them (drop-2), Spread gives wide pad-like chords");
         bass.setTooltip ("Bass line, sent on MIDI channel 2");
         octave.setTooltip ("Octave of the chords (the bass follows). Scroll or click - / +, double-click to reset");
         voiceLeading.setTooltip ("Voice leading: picks inversions automatically so each chord moves smoothly to the next");
         scaleLock.setTooltip ("Scale lock: notes you play on your MIDI keyboard snap to the nearest note of the key");
-        chordTrigger.setTooltip ("Chord trigger: white keys C to B on your MIDI keyboard play the key's chords I to VII");
+        chordTrigger.setTooltip ("Chord trigger: white keys C to B on your MIDI keyboard play the key's chords I to VII "
+                                 "(black keys pass through)");
         sevenths.setTooltip ("Chord trigger plays seventh chords instead of triads");
+
+        voiceLeading.setTitle ("Voice leading");
+        scaleLock.setTitle ("Scale lock");
+        chordTrigger.setTitle ("Chord trigger");
+        pattern.setTitle ("Rhythm pattern");
+        bass.setTitle ("Bass line");
+        sevenths.setTitle ("Chord trigger sevenths");
+
+        // Rate and swing only matter for some patterns / bass lines: dim them (with a tooltip saying why) otherwise.
+        pattern.onChange = [this] { updateRateSwingLook(); };
+        bass.onChange = [this] { updateRateSwingLook(); };
+        rate.onValueChange = [this] { updateRateSwingLook(); };
+        updateRateSwingLook();
 
         for (juce::Component* c : std::initializer_list<juce::Component*> {
                  &pattern, &rate, &swing, &gate, &style, &bass, &octave, &voiceLeading,
@@ -374,6 +508,63 @@ struct ControlsPanel::Impl
         sevenths.setAlpha (chordTrigger.getToggleState() ? 1.0f : 0.5f);
     }
 
+    // I12: with the Block / Strum patterns and a held bass (Off, Root, Root + 5th) nothing runs on the rate grid, so Rate
+    // and Swing have no audible effect; 1/8T is already a shuffle and is never swung. Offbeat sits on the "&" of each
+    // beat whatever the rate, and only swings on the 1/8 grid.
+    void updateRateSwingLook()
+    {
+        using P = cb::RhythmPattern;
+        using B = cb::BassMode;
+
+        const auto pat = (P) juce::jlimit (0, cb::numRhythmPatterns - 1, pattern.getSelectedItemIndex());
+        const auto bassMode = (B) juce::jlimit (0, cb::numBassModes - 1, bass.getSelectedItemIndex());
+        const auto rateDiv = (cb::RateDivision) juce::jlimit (0, cb::numRateDivisions - 1, rate.getSelectedIndex());
+
+        const bool patternOnGrid = ! (pat == P::Block || pat == P::Strum || pat == P::Offbeat);
+        const bool bassOnGrid = bassMode == B::Octaves || bassMode == B::Pulse;
+        const bool triplet = rateDiv == cb::RateDivision::EighthTriplet;
+
+        const bool rateActive = patternOnGrid || bassOnGrid;
+        const bool swingActive = ((patternOnGrid || bassOnGrid) && ! triplet)
+                              || (pat == P::Offbeat && rateDiv == cb::RateDivision::Eighth);
+
+        juce::String rateNote, swingNote;
+
+        if (! rateActive)
+        {
+            rateNote = pat == P::Offbeat
+                         ? "No effect with Offbeat (it always plays on the \"&\"), except that swing needs 1/8."
+                         : "No effect right now: " + juce::String (cb::rhythmPatternName (pat))
+                               + " holds each chord and the bass is held too. Try Pulse, an Arp or Broken, "
+                                 "or the Octaves / Pulse bass.";
+        }
+
+        if (! swingActive)
+        {
+            if (triplet && (patternOnGrid || bassOnGrid))
+                swingNote = "No effect at 1/8T: triplets are already a shuffle.";
+            else if (pat == P::Offbeat && ! bassOnGrid)
+                swingNote = "With Offbeat, swing only works at rate 1/8.";
+            else
+                swingNote = "No effect right now: " + juce::String (cb::rhythmPatternName (pat))
+                              + " holds each chord and the bass is held too. Try Pulse, an Arp or Broken, "
+                                "or the Octaves / Pulse bass.";
+        }
+
+        rate.setTooltip (juce::String (rateTip) + (rateNote.isNotEmpty() ? "\n\n" + rateNote : juce::String()));
+        swing.setTooltipText (swingTip, swingNote);
+
+        rate.setAlpha (rateActive ? 1.0f : kInactiveAlpha);
+        swing.setAlpha (swingActive ? 1.0f : kInactiveAlpha);
+        rateInactive = ! rateActive;
+        owner.repaint();   // the "Rate" caption dims with the control
+    }
+
+    static constexpr float kInactiveAlpha = 0.45f;
+    static constexpr const char* rateTip = "Step length for pulses, arpeggios and moving bass lines (1/8T = eighth-note triplets)";
+    static constexpr const char* swingTip = "Swing: delays every second step for a shuffled groove";
+    bool rateInactive = false;
+
     struct Caption
     {
         juce::Rectangle<int> area;
@@ -387,8 +578,9 @@ struct ControlsPanel::Impl
     Segmented rate, style;
     Stepper octave;
     Knob swing, gate, velocity, humanize;
-    juce::ToggleButton voiceLeading { "Voice leading" }, scaleLock { "Scale lock" }, chordTrigger { "Chord trigger" };
-    juce::TextButton sevenths { "7ths" };
+    cb::ui::LeftClickOnly<juce::ToggleButton> voiceLeading { "Voice leading" }, scaleLock { "Scale lock" },
+                                              chordTrigger { "Chord trigger" };
+    cb::ui::LeftClickOnly<juce::TextButton> sevenths { "7ths" };
 
     std::unique_ptr<APVTS::ComboBoxAttachment> patternAtt, bassAtt;
     std::unique_ptr<APVTS::ButtonAttachment> voiceLeadingAtt, scaleLockAtt, chordTriggerAtt, seventhsAtt;
@@ -412,10 +604,13 @@ void ControlsPanel::paint (juce::Graphics& g)
         cb::ui::drawSectionTitle (g, titles[i], d.titleAreas[i]);
 
     g.setFont (cb::ui::font (12.0f));
-    g.setColour (Col::textDim);
 
     for (const auto& c : d.captions)
+    {
+        const bool dim = d.rateInactive && c.text == "Rate";
+        g.setColour (dim ? Col::textDim.withMultipliedAlpha (Impl::kInactiveAlpha + 0.1f) : Col::textDim);
         g.drawText (c.text, c.area, juce::Justification::centredLeft, true);
+    }
 
     for (int x : d.dividerX)
     {

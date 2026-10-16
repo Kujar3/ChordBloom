@@ -9,7 +9,7 @@ namespace cb
 
 enum class RhythmPattern
 {
-    Block = 0,   // whole chord held for the slot (gate applies to the slot length)
+    Block = 0,   // whole chord held for the slot (gate removes a fixed tail of at most one beat)
     Strum,       // like Block, notes staggered upward by 0.03 beats each
     Pulse,       // whole chord retriggered every rate step
     Offbeat,     // whole chord on the off-beat half of every beat (the "&"), length = gate * half a beat
@@ -27,8 +27,8 @@ enum class BassMode
 {
     Off = 0,     // no bass events
     Root,        // chord root held for the slot
-    RootFifth,   // root and fifth (above the root) alternating every beat, starting with the root
-    Octaves,     // root alternating low/high octave every rate step
+    RootFifth,   // bass and the chord's fifth (b5 / #5 for dim / aug) alternating each beat; slash chords alternate bass and root
+    Octaves,     // bass alternating with an upper/lower octave every rate step
     Pulse,       // root retriggered every rate step
     NumModes
 };
@@ -55,7 +55,7 @@ struct RenderSettings
     RateDivision rate = RateDivision::Eighth;
     BassMode bass = BassMode::Root;
     float velocity = 0.75f;   // 0..1, base velocity for chord notes (bass uses the same)
-    float gate = 0.9f;        // 0.05..1, fraction of each step (or of the slot for Block/Strum) a note sounds
+    float gate = 0.9f;        // 0.05..1, step fraction; held notes release at length - (1-gate)*min(length,1)
     float swing = 0.0f;       // 0..1, delays every second rate step by swing * stepLength / 3 (1.0 = triplet shuffle)
     float humanize = 0.0f;    // 0..1, deterministic jitter (hash of slot/step/note, never std::rand):
                               //   timing up to +-0.015 * humanize beats (never before 0, never across the slot end),
@@ -78,8 +78,14 @@ struct NoteEvent
 };
 
 // Renders one loop of the progression. voicings[i] are the notes for progression.slots[i] (as from voiceProgression).
-// Bass notes: the chord root placed in the octave whose note is in [lowest voicing note - 12, lowest voicing note - 1],
-// then clamped into [28, 55] by octaves. No event extends past its slot's end. Result sorted by (startBeat, channel, note).
+// Bass uses the lowest voicing pitch class for explicit inversions, otherwise the chord root.
+// Missing voicings use the requested inversion's chord tone and a chord floor of MIDI 60.
+// Octaves are chosen in [28,55] nearest the previous bass note (first: MIDI 40), preferring
+// notes at least 5 semitones below the lowest chord note whenever possible; ties go lower.
+// RootFifth voice-leads each beat; slash chords alternate with the chord root. Octaves keeps
+// its entry note, alternating with an upper/lower octave within range. The last played bass note leads into the next slot.
+// Block, Strum and Root bass release at slotLength - (1-gate)*min(slotLength,1 beat).
+// Strum notes share that release. No event extends past its slot; sorted by (startBeat, channel, note).
 std::vector<NoteEvent> renderProgression (const Progression&, const std::vector<std::vector<int>>& voicings,
                                           const RenderSettings&);
 

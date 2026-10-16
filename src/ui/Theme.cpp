@@ -115,6 +115,20 @@ void drawPanel (juce::Graphics& g, juce::Rectangle<float> bounds, float radius)
     g.drawRoundedRectangle (b, radius, 1.0f);
 }
 
+void neverTakeKeyboardFocus (juce::Component& root)
+{
+    // A text editor (and its inner text holder) must be able to take focus when clicked.
+    if (dynamic_cast<juce::TextEditor*> (&root) != nullptr)
+        return;
+
+    root.setWantsKeyboardFocus (false);
+    root.setMouseClickGrabsKeyboardFocus (false);
+
+    for (auto* child : root.getChildren())
+        if (child != nullptr)
+            neverTakeKeyboardFocus (*child);
+}
+
 void drawSectionTitle (juce::Graphics& g, const juce::String& text, juce::Rectangle<int> area,
                        juce::Justification justification)
 {

@@ -122,3 +122,43 @@ target_compile_definitions(ChordbloomDev PRIVATE
 target_link_libraries(ChordbloomDev
     PRIVATE ChordbloomData ${CB_JUCE_MODULES}
     PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
+
+# ---------------------------------------------------------------------------
+# Optional CLAP format (clap-juce-extensions). CLAP has first-class note output,
+# which FL Studio can route to other instruments. Only active when the checkout
+# exists (scripts\fetch_clap.bat clones the pinned version); without it the
+# build is exactly the VST3/Standalone/CoreTests/ChordbloomDev build.
+#   scripts\build.bat build-clap Chordbloom_CLAP
+#   -> build-clap\Chordbloom_artefacts\Release\CLAP\Chordbloom.clap
+# ---------------------------------------------------------------------------
+option(CHORDBLOOM_CLAP "Build the CLAP format (needs third_party/clap-juce-extensions)" ON)
+set(CHORDBLOOM_CLAP_EXT_PATH "${CMAKE_CURRENT_SOURCE_DIR}/third_party/clap-juce-extensions"
+    CACHE PATH "Path to the clap-juce-extensions checkout (with submodules)")
+if(CHORDBLOOM_CLAP)
+    if(EXISTS "${CHORDBLOOM_CLAP_EXT_PATH}/CMakeLists.txt"
+       AND EXISTS "${CHORDBLOOM_CLAP_EXT_PATH}/clap-libs/clap/CMakeLists.txt"
+       AND EXISTS "${CHORDBLOOM_CLAP_EXT_PATH}/clap-libs/clap-helpers/CMakeLists.txt")
+        add_subdirectory("${CHORDBLOOM_CLAP_EXT_PATH}" clap-juce-extensions EXCLUDE_FROM_ALL)
+        # "instrument" first so hosts (FL: Channel rack generator) load it as an instrument
+        # with a note output port; JUCE's NEEDS_MIDI_OUTPUT makes the wrapper expose that port.
+        clap_juce_extensions_plugin(TARGET Chordbloom
+            CLAP_ID "com.kujar3.chordbloom"
+            CLAP_FEATURES instrument note-effect utility stereo)
+        message(STATUS "Chordbloom: CLAP enabled (target Chordbloom_CLAP)")
+
+        # Headless CLAP host smoke test for note output / state / hanging notes (not built by default):
+        #   scripts\build.bat build-clap ChordbloomClapNoteTest
+        #   build-clap\ChordbloomClapNoteTest.exe build-clap\Chordbloom_artefacts\Release\CLAP\Chordbloom.clap
+        if(WIN32)
+            add_executable(ChordbloomClapNoteTest EXCLUDE_FROM_ALL scripts/clap_note_test/ClapNoteTest.cpp)
+            target_link_libraries(ChordbloomClapNoteTest PRIVATE clap)
+            if(MSVC)
+                target_compile_options(ChordbloomClapNoteTest PRIVATE /W4)
+            endif()
+            add_dependencies(ChordbloomClapNoteTest Chordbloom_CLAP)
+        endif()
+    else()
+        message(STATUS "Chordbloom: CLAP disabled, ${CHORDBLOOM_CLAP_EXT_PATH} not found "
+                       "(run scripts/fetch_clap.bat to enable it)")
+    endif()
+endif()

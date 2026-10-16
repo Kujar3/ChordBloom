@@ -1,5 +1,6 @@
 #include "ui/ProgressionLane.h"
 
+#include "core/Generate.h"
 #include "ui/DragPayload.h"
 #include "ui/Theme.h"
 
@@ -15,6 +16,29 @@ constexpr float kTopBar = 3.0f;
 constexpr float kDragThreshold = 6.0f;
 constexpr float kEdgeGrab = 6.0f;
 constexpr int kMinVisibleBeats = 16;
+constexpr int kPillH = 24;
+
+// Spark settings live as plain properties on the APVTS state tree, so they are saved with the plugin state.
+constexpr const char* kSparkMoodProp   = "cbSparkMood";
+constexpr const char* kSparkChordsProp = "cbSparkChords";
+constexpr const char* kSparkBeatsProp  = "cbSparkBeats";
+
+// Popup menu item ids
+enum MenuIds
+{
+    idDuplicate = 1, idDelete = 2, idClear = 3,
+    idLengthBase = 100,       // + beats
+    idInversionAuto = 200,    // 201 + inversion
+    idOctaveBase = 310,       // + octave shift (-2..+2)
+    idChangeBase = 400,       // + ChordQuality
+    idSuggestBase = 500,      // + index into the captured suggestion list
+    idTransposeUp = 600, idTransposeDown = 601, idMoveToKey = 602,
+    idSpark = 700,
+    idMoodBase = 800,         // + Mood
+    idChordsBase = 810,       // + number of chords
+    idBeatsBase = 820,        // + beats per chord
+    idPresetBase = 1000       // + preset index
+};
 
 juce::String toJuce (const std::string& s) { return juce::String::fromUTF8 (s.data(), (int) s.size()); }
 
@@ -68,6 +92,29 @@ juce::String totalText (int beats)
 
 int roundUpToBar (int beats) { return ((beats + 3) / 4) * 4; }
 
+// "+3" / "-2" (typographic minus)
+juce::String signedSemitones (int n)
+{
+    return (n > 0 ? juce::String ("+") : juce::String::charToString ((juce::juce_wchar) 0x2212)) + juce::String (std::abs (n));
+}
+
+// "A minor", "Eb major", "D Dorian"
+juce::String shortKeyName (const cb::Key& k)
+{
+    juce::String scale;
+
+    switch (k.scale)
+    {
+        case cb::ScaleType::Major:         scale = "major"; break;
+        case cb::ScaleType::NaturalMinor:  scale = "minor"; break;
+        case cb::ScaleType::HarmonicMinor: scale = "harmonic minor"; break;
+        case cb::ScaleType::MelodicMinor:  scale = "melodic minor"; break;
+        default:                           scale = cb::scaleInfo (k.scale).name; break;
+    }
+
+    return toJuce (k.tonicName()) + " " + scale;
+}
+
 // Small "x" remove button shown on the hovered block.
 bool hasCloseButton (juce::Rectangle<float> block) { return block.getWidth() >= 56.0f && block.getHeight() >= 40.0f; }
 
@@ -88,13 +135,366 @@ void drawHalo (juce::Graphics& g, juce::Rectangle<float> r, float radius, juce::
     }
 }
 
+void noFocus (juce::Component& c)
+{
+    c.setWantsKeyboardFocus (false);
+    c.setMouseClickGrabsKeyboardFocus (false);
+}
+
+//==============================================================================
+// Icons (drawn with Path, sized to `r`)
+enum class Glyph { none, spark, presets, move, live, stop };
+
+void drawSparkle (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour colour)
+{
+    auto star = [] (juce::Point<float> c, float rad)
+    {
+        juce::Path p;
+        const float w = rad * 0.28f;
+        p.startNewSubPath (c.x, c.y - rad);
+        p.quadraticTo (c.x + w, c.y - w, c.x + rad, c.y);
+        p.quadraticTo (c.x + w, c.y + w, c.x, c.y + rad);
+        p.quadraticTo (c.x - w, c.y + w, c.x - rad, c.y);
+        p.quadraticTo (c.x - w, c.y - w, c.x, c.y - rad);
+        p.closeSubPath();
+        return p;
+    };
+
+    const float s = std::min (r.getWidth(), r.getHeight());
+    const auto c = r.getCentre();
+    g.setColour (colour);
+    g.fillPath (star ({ c.x - s * 0.08f, c.y + s * 0.06f }, s * 0.42f));
+    g.fillPath (star ({ c.x + s * 0.34f, c.y - s * 0.32f }, s * 0.17f));
+}
+
+void drawPresetsIcon (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour colour)
+{
+    // Three stacked rows with a leading dot: a list of ready-made progressions.
+    const float s = std::min (r.getWidth(), r.getHeight());
+    const auto c = r.getCentre();
+    g.setColour (colour);
+
+    for (int i = -1; i <= 1; ++i)
+    {
+        const float y = c.y + (float) i * s * 0.34f;
+        g.fillEllipse (juce::Rectangle<float> (2.4f, 2.4f).withCentre ({ c.x - s * 0.38f, y }));
+        g.fillRoundedRectangle (c.x - s * 0.18f, y - 0.7f, s * 0.62f, 1.4f, 0.7f);
+    }
+}
+
+void drawMoveIcon (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour colour)
+{
+    // Arrow into a bar: "snap the chords to the key".
+    const float s = std::min (r.getWidth(), r.getHeight());
+    const auto c = r.getCentre();
+    juce::Path p;
+    p.startNewSubPath (c.x - s * 0.45f, c.y);
+    p.lineTo (c.x + s * 0.22f, c.y);
+    p.startNewSubPath (c.x - s * 0.02f, c.y - s * 0.26f);
+    p.lineTo (c.x + s * 0.24f, c.y);
+    p.lineTo (c.x - s * 0.02f, c.y + s * 0.26f);
+    p.startNewSubPath (c.x + s * 0.45f, c.y - s * 0.36f);
+    p.lineTo (c.x + s * 0.45f, c.y + s * 0.36f);
+    g.setColour (colour);
+    g.strokePath (p, juce::PathStrokeType (1.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+}
+
+void drawStopIcon (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour colour)
+{
+    // Speaker with a cross: "stop playing along".
+    const float s = std::min (r.getWidth(), r.getHeight());
+    const auto c = r.getCentre();
+    juce::Path speaker;
+    speaker.startNewSubPath (c.x - s * 0.48f, c.y - s * 0.16f);
+    speaker.lineTo (c.x - s * 0.28f, c.y - s * 0.16f);
+    speaker.lineTo (c.x - s * 0.04f, c.y - s * 0.40f);
+    speaker.lineTo (c.x - s * 0.04f, c.y + s * 0.40f);
+    speaker.lineTo (c.x - s * 0.28f, c.y + s * 0.16f);
+    speaker.lineTo (c.x - s * 0.48f, c.y + s * 0.16f);
+    speaker.closeSubPath();
+    g.setColour (colour);
+    g.fillPath (speaker);
+
+    juce::Path cross;
+    const float x0 = c.x + s * 0.14f, x1 = c.x + s * 0.46f, y0 = c.y - s * 0.16f, y1 = c.y + s * 0.16f;
+    cross.startNewSubPath (x0, y0);
+    cross.lineTo (x1, y1);
+    cross.startNewSubPath (x1, y0);
+    cross.lineTo (x0, y1);
+    g.strokePath (cross, juce::PathStrokeType (1.4f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+}
+
+void drawChevron (juce::Graphics& g, juce::Point<float> c, juce::Colour colour)
+{
+    juce::Path p;
+    p.startNewSubPath (c.x - 3.5f, c.y - 1.6f);
+    p.lineTo (c.x, c.y + 1.9f);
+    p.lineTo (c.x + 3.5f, c.y - 1.6f);
+    g.setColour (colour);
+    g.strokePath (p, juce::PathStrokeType (1.4f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+}
+
+//==============================================================================
+// Pill-shaped header button: optional icon, label, dim detail text and a chevron (optionally its own click zone).
+class PillButton : public juce::Button
+{
+public:
+    enum class Style { outline, accent, filled, info, live };
+
+    PillButton (const juce::String& name, Glyph g, Style s) : juce::Button (name), glyph (g), style (s)
+    {
+        noFocus (*this);
+        setMouseCursor (juce::MouseCursor::PointingHandCursor);
+        setTitle (name);
+    }
+
+    juce::String text, detail;
+    bool chevron = false;        // draws a small chevron at the right
+    bool splitChevron = false;   // the chevron is its own click zone (onMenu), the rest is onPrimary
+    bool compact = false;        // icon (+ chevron) only
+    bool showDetail = true;
+    float fontSize = 12.0f;
+    float pulse = 0.0f;          // live dot animation 0..1
+    std::function<void()> onPrimary, onMenu;
+
+    static constexpr float kChevronZone = 22.0f;
+
+    juce::Font labelFont() const { return cb::ui::font (fontSize, 600); }
+    juce::Font detailFont() const { return cb::ui::font (fontSize - 0.5f, 400); }
+
+    // Right-hand zones: split chevron, plain chevron, stop icon (live style).
+    float trailingZone() const
+    {
+        return (chevron ? (splitChevron ? kChevronZone : 16.0f) : 0.0f) + (style == Style::live ? 24.0f : 0.0f);
+    }
+
+    int idealWidth (bool compactMode, bool withDetail, const juce::String& label) const
+    {
+        const float iconW = glyph == Glyph::none ? 0.0f : 13.0f;
+        float w = 1.0f + 11.0f + iconW;
+
+        if (! compactMode && label.isNotEmpty())
+        {
+            w += (iconW > 0.0f ? 6.0f : 0.0f) + widthOf (labelFont(), label);
+
+            if (withDetail && detail.isNotEmpty())
+                w += 6.0f + widthOf (detailFont(), detail);
+        }
+
+        const float zone = trailingZone();
+        w += zone > 0.0f ? (compactMode ? 3.0f : 6.0f) + zone : 11.0f;
+        return (int) std::ceil (w);
+    }
+
+    int idealWidth() const { return idealWidth (compact, showDetail, text); }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        lastDownX = e.position.x;
+        juce::Button::mouseDown (e);
+    }
+
+    void clicked (const juce::ModifierKeys& mods) override
+    {
+        const bool menuZone = mods.isPopupMenu() || (chevron && ! splitChevron)
+                              || (splitChevron && lastDownX >= (float) getWidth() - kChevronZone);
+
+        if (menuZone && onMenu != nullptr)
+            onMenu();
+        else if (onPrimary != nullptr)
+            onPrimary();
+    }
+
+    void paintButton (juce::Graphics& g, bool over, bool down) override
+    {
+        auto r = getLocalBounds().toFloat().reduced (0.5f);
+        const float radius = r.getHeight() * 0.5f;
+        const bool enabled = isEnabled();
+        const float alpha = enabled ? 1.0f : 0.38f;
+        over = over && enabled;
+
+        const bool chevronHot = splitChevron && over && getMouseXYRelative().x >= getWidth() - (int) kChevronZone;
+        const bool mainHot = over && ! chevronHot;
+
+        juce::Colour tint, edge, ink, iconInk;
+
+        switch (style)
+        {
+            case Style::accent:
+                tint = Col::accent.withAlpha (mainHot || chevronHot ? 0.17f : 0.10f);
+                edge = Col::accent.withAlpha (over ? 0.75f : 0.45f);
+                ink = Col::text;
+                iconInk = Col::accent;
+                break;
+
+            case Style::filled:
+                tint = (down ? Col::accent.darker (0.12f) : (over ? Col::accent.brighter (0.12f) : Col::accent));
+                edge = juce::Colours::white.withAlpha (0.16f);
+                ink = Col::background;
+                iconInk = Col::background;
+                break;
+
+            case Style::info:
+                tint = Col::secondary.withAlpha (over ? 0.20f : 0.12f);
+                edge = Col::secondary.withAlpha (over ? 0.8f : 0.5f);
+                ink = Col::text;
+                iconInk = Col::secondary.brighter (0.2f);
+                break;
+
+            case Style::live:
+                tint = (over ? Col::dominant.withAlpha (0.14f) : Col::accent.withAlpha (0.08f));
+                edge = over ? Col::dominant.withAlpha (0.7f) : Col::accent.withAlpha (0.35f);
+                ink = over ? Col::text : Col::textDim.brighter (0.2f);
+                iconInk = over ? Col::dominant : Col::textDim;
+                break;
+
+            case Style::outline:
+            default:
+                tint = over || down ? (down ? Col::panelRaised : Col::panelHover) : juce::Colours::transparentBlack;
+                edge = Col::outline;
+                ink = over ? Col::text : Col::textDim;
+                iconInk = ink;
+                break;
+        }
+
+        if (style == Style::filled)
+        {
+            g.setColour (Col::accent.withAlpha (0.16f * alpha));
+            g.fillRoundedRectangle (r.expanded (1.5f), radius + 1.5f);
+            g.setGradientFill (juce::ColourGradient::vertical (tint.brighter (0.08f).withMultipliedAlpha (alpha), r.getY(),
+                                                               tint.darker (0.10f).withMultipliedAlpha (alpha), r.getBottom()));
+            g.fillRoundedRectangle (r, radius);
+        }
+        else
+        {
+            if (style != Style::outline)
+            {
+                g.setGradientFill (juce::ColourGradient::vertical (Col::panelRaised.withMultipliedAlpha (alpha), r.getY(),
+                                                                   Col::panelRaised.darker (0.08f).withMultipliedAlpha (alpha), r.getBottom()));
+                g.fillRoundedRectangle (r, radius);
+            }
+
+            g.setColour (tint.withMultipliedAlpha (alpha));
+            g.fillRoundedRectangle (r, radius);
+
+            if (chevronHot)
+            {
+                juce::Graphics::ScopedSaveState save (g);
+                juce::Path clip;
+                clip.addRoundedRectangle (r, radius);
+                g.reduceClipRegion (clip);
+                g.setColour (juce::Colours::white.withAlpha (0.06f));
+                g.fillRect (r.withLeft (r.getRight() - kChevronZone));
+            }
+        }
+
+        g.setColour (edge.withMultipliedAlpha (alpha));
+        g.drawRoundedRectangle (r.reduced (0.5f), radius - 0.5f, 1.0f);
+
+        ink = ink.withMultipliedAlpha (alpha);
+        iconInk = iconInk.withMultipliedAlpha (alpha);
+
+        // Content
+        auto content = r;
+
+        if (chevron)
+        {
+            auto zone = content.removeFromRight (splitChevron ? kChevronZone : 16.0f);
+
+            if (splitChevron)
+            {
+                g.setColour (edge.withMultipliedAlpha (0.6f * alpha));
+                g.fillRect (juce::Rectangle<float> (zone.getX(), r.getY() + 5.0f, 1.0f, r.getHeight() - 10.0f));
+                drawChevron (g, zone.getCentre().translated (-0.5f, 0.0f), (chevronHot ? Col::text : ink));
+            }
+            else
+            {
+                drawChevron (g, zone.getCentre().translated (-3.0f, 0.0f), ink.withMultipliedAlpha (0.85f));
+            }
+        }
+
+        if (style == Style::live)
+        {
+            auto zone = content.removeFromRight (24.0f);
+            drawStopIcon (g, zone.withSizeKeepingCentre (12.0f, 12.0f).translated (-3.0f, 0.0f), iconInk);
+        }
+
+        const auto lf = labelFont();
+        const auto df = detailFont();
+        const bool withLabel = ! compact && text.isNotEmpty();
+        const bool withDetail = withLabel && showDetail && detail.isNotEmpty();
+        const float iconW = glyph == Glyph::none ? 0.0f : 13.0f;
+        const float labelW = withLabel ? widthOf (lf, text) : 0.0f;
+        const float detailW = withDetail ? widthOf (df, detail) : 0.0f;
+        const float totalW = iconW + (withLabel && iconW > 0.0f ? 6.0f : 0.0f) + labelW + (withDetail ? 6.0f + detailW : 0.0f);
+
+        float x = (chevron || style == Style::live) && withLabel ? content.getX() + 11.0f
+                                                                 : std::round (content.getCentreX() - totalW * 0.5f);
+        x = std::max (x, content.getX() + (withLabel ? 8.0f : 3.0f));
+        const float cy = r.getCentreY();
+
+        if (iconW > 0.0f)
+        {
+            const auto iconArea = juce::Rectangle<float> (x, cy - 6.5f, 13.0f, 13.0f);
+
+            switch (glyph)
+            {
+                case Glyph::spark:   drawSparkle (g, iconArea, iconInk); break;
+                case Glyph::presets: drawPresetsIcon (g, iconArea, iconInk); break;
+                case Glyph::move:    drawMoveIcon (g, iconArea, iconInk); break;
+                case Glyph::live:
+                {
+                    const auto c = iconArea.getCentre();
+                    const float grow = 3.0f + 3.0f * pulse;
+                    g.setColour (Col::accent.withAlpha ((0.35f * (1.0f - pulse)) * alpha));
+                    g.fillEllipse (juce::Rectangle<float> (6.0f + grow, 6.0f + grow).withCentre (c));
+                    g.setColour (Col::accent.withMultipliedAlpha (alpha));
+                    g.fillEllipse (juce::Rectangle<float> (6.0f, 6.0f).withCentre (c));
+                    break;
+                }
+                case Glyph::stop:    drawStopIcon (g, iconArea, iconInk); break;
+                case Glyph::none:
+                default: break;
+            }
+
+            x += iconW + (withLabel ? 6.0f : 0.0f);
+        }
+
+        if (withLabel)
+        {
+            const float maxW = std::max (0.0f, content.getRight() - x);
+            g.setFont (lf);
+            g.setColour (ink);
+            g.drawText (text, juce::Rectangle<float> (x, r.getY(), std::min (labelW + 2.0f, maxW), r.getHeight()),
+                        juce::Justification::centredLeft, true);
+            x += labelW + 6.0f;
+
+            if (withDetail && x + detailW <= content.getRight() + 0.5f)
+            {
+                g.setFont (df);
+                g.setColour ((style == Style::filled ? Col::background.withAlpha (0.7f) : Col::textFaint.brighter (0.25f))
+                                 .withMultipliedAlpha (alpha));
+                g.drawText (detail, juce::Rectangle<float> (x, r.getY(), detailW + 2.0f, r.getHeight()),
+                            juce::Justification::centredLeft, false);
+            }
+        }
+    }
+
+private:
+    Glyph glyph;
+    Style style;
+    float lastDownX = 0.0f;
+};
+
 //==============================================================================
 class PlayButton : public juce::Button
 {
 public:
     PlayButton() : juce::Button ("Play")
     {
+        noFocus (*this);   // FL keeps its shortcuts: Enter must never toggle playback here
         setTooltip ("Play / stop the progression loop");
+        setTitle ("Play or stop the progression loop");
         setMouseCursor (juce::MouseCursor::PointingHandCursor);
     }
 
@@ -148,7 +548,10 @@ class ClearButton : public juce::Button
 public:
     ClearButton() : juce::Button ("Clear")
     {
+        noFocus (*this);
         setTooltip ("Clear the progression (undo brings it back)");
+        setTitle ("Clear the progression");
+        setMouseCursor (juce::MouseCursor::PointingHandCursor);
     }
 
     void paintButton (juce::Graphics& g, bool over, bool down) override
@@ -172,7 +575,8 @@ public:
         const juce::String label ("Clear");
         const float textW = widthOf (font, label);
         const float iconW = 10.0f;
-        const float x = std::round (r.getCentreX() - (iconW + 6.0f + textW) * 0.5f);
+        const bool iconOnly = r.getWidth() < iconW + 6.0f + textW + 16.0f;
+        const float x = std::round (r.getCentreX() - (iconOnly ? iconW : (iconW + 6.0f + textW)) * 0.5f);
         const float cy = r.getCentreY();
 
         // Trash-can icon
@@ -183,9 +587,34 @@ public:
         body.addRoundedRectangle (x + 1.2f, cy - 2.5f, iconW - 2.4f, 7.5f, 1.2f);
         g.strokePath (body, juce::PathStrokeType (1.3f));
 
-        g.setFont (font);
-        g.drawText (label, juce::Rectangle<float> (x + iconW + 6.0f, r.getY(), textW + 2.0f, r.getHeight()),
-                    juce::Justification::centredLeft, false);
+        if (! iconOnly)
+        {
+            g.setFont (font);
+            g.drawText (label, juce::Rectangle<float> (x + iconW + 6.0f, r.getY(), textW + 2.0f, r.getHeight()),
+                        juce::Justification::centredLeft, false);
+        }
+    }
+};
+
+// Invisible, click-through child that exposes one painted block to accessibility clients.
+class AccessibleItem : public juce::Component
+{
+public:
+    AccessibleItem()
+    {
+        setInterceptsMouseClicks (false, false);
+        noFocus (*this);
+        setAccessible (true);
+    }
+
+    std::function<void()> onPress, onMenu;
+
+    std::unique_ptr<juce::AccessibilityHandler> createAccessibilityHandler() override
+    {
+        juce::AccessibilityActions actions;
+        actions.addAction (juce::AccessibilityActionType::press, [this] { if (onPress != nullptr) onPress(); });
+        actions.addAction (juce::AccessibilityActionType::showMenu, [this] { if (onMenu != nullptr) onMenu(); });
+        return std::make_unique<juce::AccessibilityHandler> (*this, juce::AccessibilityRole::button, std::move (actions));
     }
 };
 
@@ -201,6 +630,98 @@ struct Block
     float textInset = 6.0f;
     float flash = 0.0f;
 };
+
+//==============================================================================
+// "Change to": same-root variants of a chord, split into the ones that fit the key and a few spicier ones.
+struct ChangeOption
+{
+    cb::ChordQuality quality;
+    bool inKey;
+};
+
+std::vector<ChangeOption> changeToOptions (const cb::Chord& chord, const cb::Key& key)
+{
+    using Q = cb::ChordQuality;
+    const auto q = chord.quality;
+    const bool dimFamily = q == Q::Diminished || q == Q::HalfDiminished7 || q == Q::Diminished7;
+    const auto& iv = cb::qualityIntervals (q);
+    const auto has = [&iv] (int x) { return std::find (iv.begin(), iv.end(), x) != iv.end(); };
+
+    bool minorThird = ! dimFamily && has (3);
+    const bool majorThird = has (4);
+
+    if (! dimFamily && ! minorThird && ! majorThird)   // sus chords: follow the key's third above the root
+        minorThird = key.contains (cb::pc (chord.root + 3)) && ! key.contains (cb::pc (chord.root + 4));
+
+    std::vector<Q> candidates;
+
+    if (dimFamily)
+        candidates = { Q::Diminished, Q::HalfDiminished7, Q::Diminished7 };
+    else if (minorThird)
+        candidates = { Q::Minor, Q::Minor7, Q::MinorAdd9, Q::Minor9, Q::Minor11, Q::Minor6, Q::MinorMajor7, Q::Sus2, Q::Sus4 };
+    else
+        candidates = { Q::Major, Q::Major7, Q::Add9, Q::Major9, Q::Major6, Q::Major69, Q::Major7Sharp11,
+                       Q::Dominant7, Q::Dominant9, Q::Dominant13, Q::Dominant7Flat9, Q::Sus2, Q::Sus4, Q::Dominant7Sus4 };
+
+    if (std::find (candidates.begin(), candidates.end(), q) == candidates.end())
+        candidates.insert (candidates.begin(), q);
+
+    const auto parallel = key.parallel();
+    // Tones that "belong": the key, its parallel key and (for chromatic chords such as secondary dominants) the
+    // chord's own tones, so A7 in C major can still become A or A7b9.
+    const auto ownTones = chord.pitchClasses();
+    const auto fitsKeyOrParallel = [&] (const cb::Chord& c)
+    {
+        for (int pcl : c.pitchClasses())
+            if (! key.contains (pcl) && ! parallel.contains (pcl)
+                && std::find (ownTones.begin(), ownTones.end(), pcl) == ownTones.end())
+                return false;
+        return true;
+    };
+
+    const auto isDominantType = [] (Q x)
+    {
+        return x == Q::Dominant7 || x == Q::Dominant9 || x == Q::Dominant13 || x == Q::Dominant7Flat9 || x == Q::Dominant7Sus4;
+    };
+
+    // Dominant colours make sense where a dominant 7th on this root actually functions as one (V, V/x) or when
+    // the chord already is a dominant; maj7#11 on chords whose maj7 belongs to the key (or its parallel).
+    const cb::Chord dom7 { chord.root, Q::Dominant7 };
+    const auto domFunction = cb::harmonicFunction (dom7, key);
+    const bool dominantSensible = isDominantType (q) || domFunction == cb::HarmonicFunction::Dominant
+                                  || domFunction == cb::HarmonicFunction::Secondary;
+    const bool lydianSensible = fitsKeyOrParallel ({ chord.root, Q::Major7 });
+
+    std::vector<ChangeOption> out;
+
+    for (auto cand : candidates)
+    {
+        const cb::Chord c { chord.root, cand };
+        const bool inKey = cb::isDiatonic (c, key);
+
+        if (! inKey && cand != q)
+        {
+            if (isDominantType (cand) && ! dominantSensible)
+                continue;
+
+            if (cand == Q::Major7Sharp11 && ! lydianSensible)
+                continue;
+
+            if (cand == Q::MinorMajor7 && key.degreeOf (chord.root) != 0)
+                continue;
+
+            // Other outside colours only when they at least belong to the parallel key (borrowed sound); Dorian
+            // m6 and the dominant colours above are the deliberate exceptions.
+            if (! isDominantType (cand) && cand != Q::Minor6 && cand != Q::MinorMajor7 && ! fitsKeyOrParallel (c))
+                continue;
+        }
+
+        out.push_back ({ cand, inKey });
+    }
+
+    std::stable_partition (out.begin(), out.end(), [] (const ChangeOption& o) { return o.inKey; });
+    return out;
+}
 } // namespace
 
 //==============================================================================
@@ -212,8 +733,17 @@ struct ProgressionLane::Impl : public juce::Component,
     Impl (ProgressionLane& o, ChordbloomProcessor& p) : owner (o), processor (p)
     {
         setOpaque (false);
-        addAndMakeVisible (playButton);
-        addAndMakeVisible (clearButton);
+        noFocus (*this);
+        setTitle ("Progression");
+        setDescription ("The chord progression timeline");
+
+        for (juce::Component* c : { (juce::Component*) &playButton, (juce::Component*) &clearButton,
+                                    (juce::Component*) &sparkButton, (juce::Component*) &presetsButton })
+            addAndMakeVisible (c);
+
+        for (juce::Component* c : { (juce::Component*) &moveButton, (juce::Component*) &hostButton,
+                                    (juce::Component*) &emptySparkButton, (juce::Component*) &emptyPresetsButton })
+            addChildComponent (c);
 
         playButton.onClick = [this]
         {
@@ -222,19 +752,41 @@ struct ProgressionLane::Impl : public juce::Component,
             pollTransport();
         };
 
-        clearButton.onClick = [this]
-        {
-            if (previewing)
-            {
-                processor.stopPreview();
-                previewing = false;
-            }
+        clearButton.onClick = [this] { clearAll(); };
 
-            processor.clearProgression();
-            setSelected (-1, true);
-            sync();
-        };
+        // Spark: click = new progression, chevron / right-click = settings
+        sparkButton.text = "Spark";
+        sparkButton.chevron = true;
+        sparkButton.splitChevron = true;
+        sparkButton.onPrimary = [this] { spark(); };
+        sparkButton.onMenu = [this] { showSparkMenu (sparkButton); };
 
+        presetsButton.text = "Presets";
+        presetsButton.chevron = true;
+        presetsButton.onMenu = [this] { showPresetsMenu (presetsButton); };
+        presetsButton.setTooltip ("Ready-made progressions for this key, grouped by mood (replaces the lane; undo brings it back)");
+
+        moveButton.onPrimary = [this] { transposeBy (moveShift); };
+        moveButton.onMenu = [this] { showLaneMenu (&moveButton); };
+
+        hostButton.text = "Playing with FL";
+        hostButton.onPrimary = [this] { stopPlayingWithHost(); };
+        hostButton.onMenu = hostButton.onPrimary;
+        hostButton.setTooltip ("Chordbloom is looping the progression along with FL's transport (Play with FL is on).\n"
+                               "Already dropped the clip into FL? Click to stop Chordbloom playing along, so you don't hear it twice.");
+
+        emptySparkButton.text = "Spark a progression";
+        emptySparkButton.fontSize = 12.5f;
+        emptySparkButton.onPrimary = [this] { spark(); };
+        emptySparkButton.onMenu = [this] { showSparkMenu (emptySparkButton); };
+
+        emptyPresetsButton.text = "Presets";
+        emptyPresetsButton.fontSize = 12.5f;
+        emptyPresetsButton.chevron = true;
+        emptyPresetsButton.onMenu = [this] { showPresetsMenu (emptyPresetsButton); };
+        emptyPresetsButton.setTooltip (presetsButton.getTooltip());
+
+        updateSparkLabels();
         sync();
         startTimerHz (idleHz);
     }
@@ -282,8 +834,15 @@ struct ProgressionLane::Impl : public juce::Component,
             syncedKey = processor.getKey();
             const int n = (int) prog.slots.size();
 
+            // Any pending press refers to the old progression (a host state load, undo, a second touch...):
+            // cancel it so a later drag can never index past the new blocks or grab a different chord.
+            cancelPress();
+
             if (resizeSlot >= n)
                 resizeSlot = -1;
+
+            if (dragSourceSlot >= n)
+                dragSourceSlot = -1;
 
             layoutBlocks();
 
@@ -299,11 +858,47 @@ struct ProgressionLane::Impl : public juce::Component,
             if (hoverSlot >= n)
                 hoverSlot = -1;
 
+            moveShift = n > 0 ? processor.bestTranspositionForKey() : 0;
+            updateMoveButton();
+            layoutHeader();
+            layoutEmptyState();
+            syncProxies();
             repaint();
         }
 
         clearButton.setEnabled (! prog.empty());
-        playButton.setEnabled (! prog.empty() || processor.isLocalPlaybackOn());
+        updatePlayButtonEnablement();
+    }
+
+    // B5: while FL plays and Play with FL is on, Chordbloom follows FL's transport and its own Play has no effect
+    // (FL's Stop also stops it), so the button is disabled with an explanation instead of lighting up silently.
+    void updatePlayButtonEnablement()
+    {
+        const bool local = processor.isLocalPlaybackOn();
+        const bool hostDriven = processor.isHostPlaying() && syncToHostOn();
+        const bool wantEnabled = (! processor.getProgression().empty() || local) && ! hostDriven;
+
+        if (playButton.isEnabled() != wantEnabled)
+            playButton.setEnabled (wantEnabled);
+
+        if (hostDriven != playButtonHostDriven)
+        {
+            playButtonHostDriven = hostDriven;
+            playButton.setTooltip (hostDriven ? "FL is playing: Chordbloom follows FL's transport (Play with FL is on).\n"
+                                                "Stop FL to loop the progression here, or click \"Playing with FL\" to mute it."
+                                              : "Play / stop the progression loop");
+        }
+    }
+
+    void cancelPress()
+    {
+        if (pressedSlot >= 0 && previewing)
+        {
+            processor.stopPreview();
+            previewing = false;
+        }
+
+        pressedSlot = -1;
     }
 
     void setSelected (int index, bool notify)
@@ -313,12 +908,23 @@ struct ProgressionLane::Impl : public juce::Component,
         if (index == selected)
             return;
 
+        repaintSelectionMarker();
         repaintBlock (selected);
         selected = index;
         repaintBlock (selected);
+        repaintSelectionMarker();
 
         if (notify && owner.onSelectionChanged != nullptr)
             owner.onSelectionChanged (selected);
+    }
+
+    void flashAll()
+    {
+        for (auto& b : blocks)
+            b.flash = 1.0f;
+
+        speedUp();
+        repaint();
     }
 
     //==============================================================================
@@ -326,14 +932,12 @@ struct ProgressionLane::Impl : public juce::Component,
     void resized() override
     {
         auto area = getLocalBounds().reduced (12, 8);
-        const bool compact = area.getHeight() < 104;
+        compact = area.getHeight() < 104;
 
         auto head = area.removeFromTop (compact ? 28 : 32);
         playButton.setBounds (head.removeFromLeft (head.getHeight()));
         head.removeFromLeft (10);
-        clearButton.setBounds (head.removeFromRight (74).withSizeKeepingCentre (74, 24));
-        head.removeFromRight (10);
-        headerText = head.toFloat();
+        headerRow = head;
 
         area.removeFromTop (compact ? 4 : 6);
         rulerArea = area.removeFromTop (compact ? 14 : 16).toFloat();
@@ -341,6 +945,221 @@ struct ProgressionLane::Impl : public juce::Component,
         trackArea = area.toFloat();
 
         layoutBlocks();
+        layoutHeader();
+        layoutEmptyState();
+        syncProxies();
+    }
+
+    // Left part of the header: "PROGRESSION  4 bars  · 4 chords"
+    struct HeaderText
+    {
+        juce::String title, readout, detail;
+        juce::Font titleFont { juce::FontOptions() }, readoutFont { juce::FontOptions() }, detailFont { juce::FontOptions() };
+        float titleW = 0, readoutW = 0, detailW = 0;
+
+        float width() const { return titleW + 12.0f + readoutW + (detailW > 0.0f ? 8.0f + detailW : 0.0f); }
+    };
+
+    HeaderText headerText() const
+    {
+        HeaderText t;
+        t.title = "PROGRESSION";
+        t.titleFont = cb::ui::font (10.5f, 600).withExtraKerningFactor (0.12f);
+        t.readoutFont = cb::ui::font (13.0f, 600);
+        t.detailFont = cb::ui::font (12.0f, 400);
+
+        const int n = (int) cached.slots.size();
+        t.readout = n == 0 ? juce::String ("Empty") : totalText (effectiveTotal());
+
+        if (n > 0)
+            t.detail << middleDot() << "  " << n << (n == 1 ? " chord" : " chords");
+
+        t.titleW = widthOf (t.titleFont, t.title) + 2.0f;
+        t.readoutW = widthOf (t.readoutFont, t.readout) + 2.0f;
+        t.detailW = t.detail.isNotEmpty() ? widthOf (t.detailFont, t.detail) + 2.0f : 0.0f;
+        return t;
+    }
+
+    juce::String hintText() const
+    {
+        // B4: FL's pattern loop is shorter than the progression; Chordbloom keeps going across it - say so.
+        if (hostLoopBeats > 0.0 && ! cached.slots.empty())
+            return "FL loops every " + totalText (juce::roundToInt (hostLoopBeats)) + "  " + middleDot()
+                   + "  the progression keeps going";
+
+        return cached.slots.empty() ? juce::String ("Click a pad to hear it, double-click to add it")
+                                    : juce::String ("Scroll a chord to change its length") + "  " + middleDot() + "  right-click for more";
+    }
+
+    void updateMoveButton()
+    {
+        const bool show = moveShift != 0 && ! cached.slots.empty();
+
+        if (show)
+        {
+            const auto keyName = shortKeyName (processor.getKey());
+            moveFullText = "Move chords to " + keyName + " (" + signedSemitones (moveShift) + ")";
+            moveShortText = "To " + keyName + " (" + signedSemitones (moveShift) + ")";
+            moveButton.setTitle (moveFullText);
+            moveButton.setTooltip ("Most of these chords sit outside " + toJuce (processor.getKey().name()) + ".\n"
+                                   "Transpose the whole progression by " + signedSemitones (moveShift)
+                                   + " semitones so it fits the key (undo brings it back).");
+        }
+
+        moveButton.setVisible (show);
+    }
+
+    void updateSparkLabels()
+    {
+        const auto s = loadSparkSettings();
+        shownSpark = s;
+        const juce::String mood (cb::moodName (s.mood));
+        sparkButton.detail = mood;
+        emptySparkButton.detail = {};
+
+        juce::String tip;
+        tip << "Spark: generate a fresh " << mood << " progression (" << s.numChords << " chords, "
+            << lengthText (s.beatsPerChord) << " each). It replaces the lane; undo brings the old one back.\n"
+            << "Click the arrow or right-click for mood, length and rhythm.";
+        sparkButton.setTooltip (tip);
+        emptySparkButton.setTooltip (tip);
+        sparkButton.setTitle ("Spark a " + mood + " progression");
+        emptySparkButton.setTitle (sparkButton.getTitle());
+        sparkButton.repaint();
+        emptySparkButton.repaint();
+    }
+
+    // Places the header pills right-to-left and decides how much text fits (pills shrink before anything clips).
+    void layoutHeader()
+    {
+        if (headerRow.isEmpty())
+            return;
+
+        auto head = headerRow;
+        const int pillH = std::min (kPillH, head.getHeight());
+        const auto text = headerText();
+        const bool showMove = moveButton.isVisible();
+        const bool showHost = hostButton.isVisible();
+
+        const int clearFull = 74, clearCompact = 34;
+
+        struct Level { bool sparkDetail, moveFull, presetsText, sparkText, hostText, clearText; };
+        const Level levels[] = {
+            { true,  true,  true,  true,  true,  true  },
+            { false, true,  true,  true,  true,  true  },
+            { false, false, true,  true,  true,  true  },
+            { false, false, true,  true,  false, true  },
+            { false, false, false, true,  false, true  },
+            { false, false, false, false, false, true  },
+            { false, false, false, false, false, false },
+        };
+
+        const float available = (float) head.getWidth();
+        Level chosen = levels[std::size (levels) - 1];
+        int sparkW = 0, presetsW = 0, moveW = 0, hostW = 0, clearW = 0;
+
+        for (const auto& level : levels)
+        {
+            sparkW = sparkButton.idealWidth (! level.sparkText, level.sparkDetail, sparkButton.text);
+            presetsW = presetsButton.idealWidth (! level.presetsText, false, presetsButton.text);
+            moveW = showMove ? moveButton.idealWidth (false, false, level.moveFull ? moveFullText : moveShortText) : 0;
+            hostW = showHost ? hostButton.idealWidth (! level.hostText, false, hostButton.text) : 0;
+            clearW = level.clearText ? clearFull : clearCompact;
+
+            const float needed = text.width() + (showHost ? 10.0f + (float) hostW : 0.0f) + 16.0f
+                                 + (showMove ? (float) moveW + 8.0f : 0.0f) + (float) sparkW + 8.0f + (float) presetsW + 8.0f
+                                 + (float) clearW;
+            chosen = level;
+
+            if (needed <= available)
+                break;
+        }
+
+        sparkButton.compact = ! chosen.sparkText;
+        sparkButton.showDetail = chosen.sparkDetail;
+        presetsButton.compact = ! chosen.presetsText;
+        hostButton.compact = ! chosen.hostText;
+        moveButton.text = chosen.moveFull ? moveFullText : moveShortText;
+
+        auto placeRight = [&head, pillH] (juce::Component& c, int w)
+        {
+            w = std::min (w, std::max (0, head.getWidth()));
+            c.setBounds (head.removeFromRight (w).withSizeKeepingCentre (w, pillH));
+            head.removeFromRight (8);
+        };
+
+        placeRight (clearButton, clearW);
+        placeRight (presetsButton, presetsW);
+        placeRight (sparkButton, sparkW);
+
+        if (showMove)
+            placeRight (moveButton, moveW);
+
+        // Left text, then the host pill right after it.
+        float x = (float) head.getX() + text.width();
+
+        if (showHost)
+        {
+            const int hx = (int) std::ceil (x + 10.0f);
+            const int w = std::min (hostW, std::max (0, head.getRight() - hx));
+            hostButton.setBounds (juce::Rectangle<int> (hx, head.getY(), w, head.getHeight()).withSizeKeepingCentre (w, pillH));
+            x = (float) hostButton.getRight();
+        }
+
+        hintArea = juce::Rectangle<float> (x + 16.0f, (float) head.getY(), (float) head.getRight() - (x + 16.0f),
+                                           (float) head.getHeight());
+
+        for (auto* b : { &sparkButton, &presetsButton, &moveButton, &hostButton })
+            b->repaint();
+
+        repaint (headerRow.withLeft (0));
+    }
+
+    // Empty lane: hint text plus Spark / Presets buttons, centred together in the track.
+    void layoutEmptyState()
+    {
+        const bool show = cached.slots.empty() && ! dropActive && ! trackArea.isEmpty();
+        emptySparkButton.setVisible (show);
+        emptyPresetsButton.setVisible (show);
+
+        if (! show)
+            return;
+
+        const auto r = trackArea.reduced (3.0f);
+        const int h = (int) std::min (28.0f, r.getHeight() - 8.0f);
+        const int sparkW = emptySparkButton.idealWidth (false, false, emptySparkButton.text);
+        const int presetsW = emptyPresetsButton.idealWidth (false, false, emptyPresetsButton.text);
+        const float buttonsW = (float) (sparkW + 8 + presetsW);
+
+        emptyText = "Drag chords here or double-click a pad";
+        emptyFont = cb::ui::font (juce::jlimit (12.0f, 14.0f, r.getHeight() * 0.22f), 600);
+        float textW = widthOf (emptyFont, emptyText);
+        const float icon = 16.0f, sepW = 30.0f;
+        float total = icon + 8.0f + textW + sepW + buttonsW;
+
+        if (total > r.getWidth() - 24.0f)
+        {
+            emptyText = "Drag or double-click chords";
+            textW = widthOf (emptyFont, emptyText);
+            total = icon + 8.0f + textW + sepW + buttonsW;
+        }
+
+        showEmptyText = total <= r.getWidth() - 24.0f;
+
+        if (! showEmptyText)
+            total = buttonsW;
+
+        float x = std::round (r.getCentreX() - total * 0.5f);
+        const int cy = (int) std::round (r.getCentreY());
+
+        if (showEmptyText)
+        {
+            emptyTextArea = { x, r.getY(), icon + 8.0f + textW + 4.0f, r.getHeight() };
+            x += icon + 8.0f + textW + sepW;
+        }
+
+        emptySparkButton.setBounds ((int) x, cy - h / 2, sparkW, h);
+        emptyPresetsButton.setBounds ((int) x + sparkW + 8, cy - h / 2, presetsW, h);
     }
 
     int lengthOf (int index) const
@@ -411,7 +1230,7 @@ struct ProgressionLane::Impl : public juce::Component,
             b.name = toJuce (chord.name (key));
 
             if (b.slot.inversion > 0 && b.slot.inversion < chord.numTones())
-                b.name << "/" << toJuce (key.spell (chord.pitchClasses()[(size_t) b.slot.inversion]));
+                b.name << "/" << toJuce (cb::spellChordTone (chord, chord.intervals()[(size_t) b.slot.inversion], key));
 
             b.roman = toJuce (cb::romanNumeral (chord, key));
             b.colour = cb::ui::functionColour (cb::harmonicFunction (chord, key));
@@ -430,7 +1249,7 @@ struct ProgressionLane::Impl : public juce::Component,
             const float textW = b.bounds.getWidth() - 2.0f * b.textInset;
             b.showName = false;
 
-            for (const auto& candidate : { b.name, toJuce (chord.name (key)), toJuce (key.spell (chord.root)) })
+            for (const auto& candidate : { b.name, toJuce (chord.name (key)), toJuce (cb::spellChordTone (chord, 0, key)) })
             {
                 const auto f = fittedFont (nameH, 600, candidate, textW, 9.0f);
 
@@ -449,6 +1268,51 @@ struct ProgressionLane::Impl : public juce::Component,
         }
 
         blocks = std::move (newBlocks);
+    }
+
+    // Accessibility: one invisible, click-through proxy per block (never touched from paint()).
+    void syncProxies()
+    {
+        while (proxies.size() > blocks.size())
+            proxies.pop_back();
+
+        while (proxies.size() < blocks.size())
+        {
+            proxies.push_back (std::make_unique<AccessibleItem>());
+            addAndMakeVisible (*proxies.back());
+            proxies.back()->toBack();
+        }
+
+        const int n = (int) blocks.size();
+
+        for (int i = 0; i < n; ++i)
+        {
+            const auto& b = blocks[(size_t) i];
+            auto& proxy = *proxies[(size_t) i];
+            proxy.setBounds (b.bounds.getSmallestIntegerContainer());
+            proxy.setTitle (b.name + " (" + b.roman + "), " + b.length);
+            proxy.setDescription ("Chord " + juce::String (i + 1) + " of " + juce::String (n));
+            proxy.setHelpText ("Press to hear it; open the menu to change, resize or remove it");
+
+            juce::Component::SafePointer<Impl> safe (this);
+            proxy.onPress = [safe, i]
+            {
+                if (safe == nullptr || i >= (int) safe->processor.getProgression().slots.size())
+                    return;
+
+                safe->processor.startPreviewSlot (i);
+                juce::Timer::callAfterDelay (700, [safe]
+                {
+                    if (safe != nullptr && ! safe->previewing)
+                        safe->processor.stopPreview();
+                });
+            };
+            proxy.onMenu = [safe, i]
+            {
+                if (safe != nullptr)
+                    safe->showSlotMenu (i);
+            };
+        }
     }
 
     //==============================================================================
@@ -477,6 +1341,7 @@ struct ProgressionLane::Impl : public juce::Component,
         if (blocks.empty())
             paintEmptyState (g);
 
+        paintSelectionMarker (g);
         paintPlayhead (g);
         paintDropCaret (g);
     }
@@ -492,57 +1357,37 @@ struct ProgressionLane::Impl : public juce::Component,
 
     void paintHeader (juce::Graphics& g) const
     {
-        auto r = headerText;
-        const auto titleFont = cb::ui::font (10.5f, 600).withExtraKerningFactor (0.12f);
-        const juce::String title ("PROGRESSION");
-        const float titleW = widthOf (titleFont, title) + 2.0f;
+        auto r = headerRow.toFloat();
+        const auto t = headerText();
 
-        g.setFont (titleFont);
+        g.setFont (t.titleFont);
         g.setColour (Col::textDim);
-        g.drawText (title, r.removeFromLeft (titleW), juce::Justification::centredLeft, false);
+        g.drawText (t.title, r.removeFromLeft (t.titleW), juce::Justification::centredLeft, false);
         r.removeFromLeft (12.0f);
 
-        const int n = (int) cached.slots.size();
-        juce::String readout;
+        const bool empty = cached.slots.empty();
+        g.setFont (t.readoutFont);
+        g.setColour (empty ? Col::textFaint : Col::text);
+        g.drawText (t.readout, r.removeFromLeft (t.readoutW), juce::Justification::centredLeft, false);
 
-        if (n == 0)
-            readout = "Empty";
-        else
-            readout << totalText (effectiveTotal());
-
-        const auto readoutFont = cb::ui::font (13.0f, 600);
-        const float readoutW = widthOf (readoutFont, readout) + 2.0f;
-        g.setFont (readoutFont);
-        g.setColour (n == 0 ? Col::textFaint : Col::text);
-        g.drawText (readout, r.removeFromLeft (readoutW), juce::Justification::centredLeft, false);
-
-        if (n > 0)
+        if (t.detail.isNotEmpty())
         {
-            juce::String detail;
-            detail << middleDot() << "  " << n << (n == 1 ? " chord" : " chords");
-
-            if (hostPlaying && playing)
-                detail << "  " << middleDot() << "  following the host";
-
-            const auto detailFont = cb::ui::font (12.0f, 400);
-            const float detailW = widthOf (detailFont, detail) + 2.0f;
             r.removeFromLeft (8.0f);
-            g.setFont (detailFont);
+            g.setFont (t.detailFont);
             g.setColour (Col::textDim);
-            g.drawText (detail, r.removeFromLeft (std::min (detailW, r.getWidth())), juce::Justification::centredLeft, true);
+            g.drawText (t.detail, r.removeFromLeft (std::min (t.detailW, std::max (0.0f, r.getWidth()))),
+                        juce::Justification::centredLeft, true);
         }
 
-        // Discoverability hint on the right, only when there is room for it.
-        const juce::String hint = n == 0 ? juce::String ("Click a pad to hear it, double-click to add it")
-                                         : juce::String ("Scroll a chord to change its length") + "  " + middleDot()
-                                               + "  right-click for more";
+        // Discoverability hint, only when there is room for it.
+        const auto hint = hintText();
         const auto hintFont = cb::ui::font (11.5f, 400);
 
-        if (widthOf (hintFont, hint) + 24.0f < r.getWidth())
+        if (widthOf (hintFont, hint) + 8.0f < hintArea.getWidth())
         {
             g.setFont (hintFont);
             g.setColour (Col::textFaint);
-            g.drawText (hint, r, juce::Justification::centredRight, false);
+            g.drawText (hint, hintArea, juce::Justification::centredRight, false);
         }
     }
 
@@ -652,11 +1497,11 @@ struct ProgressionLane::Impl : public juce::Component,
         g.setColour (Col::textFaint.withAlpha (dropActive ? 0.9f : 0.45f));
         g.fillPath (dashed);
 
-        const juce::String text ("Drag chords here or double-click a pad");
-        const auto font = cb::ui::font (juce::jlimit (12.0f, 14.0f, r.getHeight() * 0.22f), 600);
-        const float textW = widthOf (font, text);
+        if (dropActive || ! showEmptyText)
+            return;
+
         const float icon = 16.0f;
-        const float x = std::round (r.getCentreX() - (icon + 8.0f + textW) * 0.5f);
+        const float x = emptyTextArea.getX();
         const float cy = r.getCentreY();
 
         // Plus-in-circle icon
@@ -666,10 +1511,19 @@ struct ProgressionLane::Impl : public juce::Component,
         g.fillRoundedRectangle (juce::Rectangle<float> (7.0f, 1.4f).withCentre (circle.getCentre()), 0.7f);
         g.fillRoundedRectangle (juce::Rectangle<float> (1.4f, 7.0f).withCentre (circle.getCentre()), 0.7f);
 
-        g.setFont (font);
+        g.setFont (emptyFont);
         g.setColour (Col::textDim);
-        g.drawText (text, juce::Rectangle<float> (x + icon + 8.0f, r.getY(), textW + 4.0f, r.getHeight()),
+        g.drawText (emptyText, juce::Rectangle<float> (x + icon + 8.0f, r.getY(), emptyTextArea.getWidth() - icon - 8.0f, r.getHeight()),
                     juce::Justification::centredLeft, false);
+
+        // "or" between the hint and the buttons
+        if (emptySparkButton.isVisible())
+        {
+            const float gapL = emptyTextArea.getRight(), gapR = (float) emptySparkButton.getX();
+            g.setFont (cb::ui::font (11.5f, 400));
+            g.setColour (Col::textFaint);
+            g.drawText ("or", juce::Rectangle<float> (gapL, r.getY(), gapR - gapL, r.getHeight()), juce::Justification::centred, false);
+        }
     }
 
     void paintBlock (juce::Graphics& g, int index, const Block& b, juce::Rectangle<float> r, bool forDragImage) const
@@ -808,6 +1662,41 @@ struct ProgressionLane::Impl : public juce::Component,
         }
     }
 
+    // Where the palette adds chords: a small notch after the selected block.
+    juce::Rectangle<float> selectionMarkerBounds() const
+    {
+        if (selected < 0 || selected >= (int) blocks.size() || dropActive || resizeSlot >= 0)
+            return {};
+
+        const float x = juce::jlimit (trackArea.getX() + 1.0f, trackArea.getRight() - 1.0f, boundaryX (selected + 1));
+        return { x - 6.0f, rulerArea.getBottom() - 8.0f, 12.0f, trackArea.getY() - rulerArea.getBottom() + 9.0f };
+    }
+
+    void repaintSelectionMarker()
+    {
+        const auto r = selectionMarkerBounds();
+
+        if (! r.isEmpty())
+            repaint (r.expanded (3.0f).getSmallestIntegerContainer());
+    }
+
+    void paintSelectionMarker (juce::Graphics& g) const
+    {
+        const auto r = selectionMarkerBounds();
+
+        if (r.isEmpty())
+            return;
+
+        const float x = r.getCentreX();
+        const float tip = trackArea.getY() + 0.5f;
+        juce::Path notch;
+        notch.addTriangle (x - 5.0f, tip - 6.5f, x + 5.0f, tip - 6.5f, x, tip);
+        g.setColour (Col::panel);
+        g.strokePath (notch, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        g.setColour (Col::accent);
+        g.fillPath (notch);
+    }
+
     void paintPlayhead (juce::Graphics& g) const
     {
         if (! playing)
@@ -841,9 +1730,66 @@ struct ProgressionLane::Impl : public juce::Component,
         return (blocks[(size_t) index - 1].bounds.getRight() + blocks[(size_t) index].bounds.getX()) * 0.5f;
     }
 
+    void paintRulerPill (juce::Graphics& g, const juce::String& label, float x, juce::Colour colour) const
+    {
+        const auto font = cb::ui::font (11.0f, 600);
+        const float w = widthOf (font, label) + 14.0f;
+        auto pill = juce::Rectangle<float> (w, rulerArea.getHeight() + 2.0f).withCentre ({ x, rulerArea.getCentreY() - 1.0f });
+        pill = pill.withX (juce::jlimit (getLocalBounds().toFloat().getX() + 4.0f,
+                                         std::max (4.0f, (float) getWidth() - 4.0f - w), pill.getX()));
+        g.setColour (colour);
+        g.fillRoundedRectangle (pill, pill.getHeight() * 0.5f);
+        g.setColour (Col::background);
+        g.setFont (font);
+        g.drawText (label, pill, juce::Justification::centred, false);
+    }
+
     void paintDropCaret (juce::Graphics& g) const
     {
-        if (! dropActive || dropIndex < 0)
+        if (! dropActive)
+            return;
+
+        // Replace: the target block lights up and previews the incoming chord.
+        if (dropReplace >= 0 && dropReplace < (int) blocks.size())
+        {
+            const auto& b = blocks[(size_t) dropReplace];
+            const auto r = b.bounds;
+
+            drawHalo (g, r, kBlockRadius, Col::accent, 0.42f, 4);
+            g.setGradientFill (juce::ColourGradient::vertical (Col::panelRaised.brighter (0.05f), r.getY(),
+                                                               Col::panelRaised.darker (0.08f), r.getBottom()));
+            g.fillRoundedRectangle (r, kBlockRadius);
+            g.setGradientFill (juce::ColourGradient::vertical (Col::accent.withAlpha (0.22f), r.getY(),
+                                                               Col::accent.withAlpha (0.10f), r.getBottom()));
+            g.fillRoundedRectangle (r, kBlockRadius);
+            g.setColour (Col::accent);
+            g.drawRoundedRectangle (r.reduced (1.0f), kBlockRadius - 1.0f, 2.0f);
+
+            const auto content = r.reduced (4.0f, 2.0f);
+            const auto nameFont = fittedFont (juce::jlimit (12.0f, 17.0f, r.getHeight() * 0.25f), 700, dropLabel, content.getWidth(), 9.0f);
+            const juce::String caption ("replaces " + b.displayName);
+            const auto captionFont = cb::ui::font (10.5f, 400);
+            const bool showCaption = r.getHeight() >= 38.0f && widthOf (captionFont, caption) <= content.getWidth();
+            const float blockH = nameFont.getHeight() + (showCaption ? 2.0f + captionFont.getHeight() : 0.0f);
+            const float y = std::round (content.getCentreY() - blockH * 0.5f);
+
+            g.setFont (nameFont);
+            g.setColour (Col::text);
+            g.drawText (dropLabel, content.withY (y).withHeight (nameFont.getHeight()), juce::Justification::centred, false);
+
+            if (showCaption)
+            {
+                g.setFont (captionFont);
+                g.setColour (Col::accent.brighter (0.3f));
+                g.drawText (caption, content.withY (y + nameFont.getHeight() + 2.0f).withHeight (captionFont.getHeight()),
+                            juce::Justification::centred, false);
+            }
+
+            paintRulerPill (g, "Replace with " + dropLabel, r.getCentreX(), Col::accent);
+            return;
+        }
+
+        if (dropIndex < 0)
             return;
 
         const bool noMove = dropFromSlot >= 0 && (dropIndex == dropFromSlot || dropIndex == dropFromSlot + 1);
@@ -869,18 +1815,7 @@ struct ProgressionLane::Impl : public juce::Component,
             label = "+ " + dropLabel;
 
         if (label.isNotEmpty())
-        {
-            const auto font = cb::ui::font (11.0f, 600);
-            const float w = widthOf (font, label) + 14.0f;
-            auto pill = juce::Rectangle<float> (w, rulerArea.getHeight() + 2.0f).withCentre ({ x, rulerArea.getCentreY() - 1.0f });
-            pill = pill.withX (juce::jlimit (getLocalBounds().toFloat().getX() + 4.0f,
-                                             std::max (4.0f, (float) getWidth() - 4.0f - w), pill.getX()));
-            g.setColour (colour);
-            g.fillRoundedRectangle (pill, pill.getHeight() * 0.5f);
-            g.setColour (Col::background);
-            g.setFont (font);
-            g.drawText (label, pill, juce::Justification::centred, false);
-        }
+            paintRulerPill (g, label, x, colour);
     }
 
     //==============================================================================
@@ -941,6 +1876,26 @@ struct ProgressionLane::Impl : public juce::Component,
         return (int) blocks.size();
     }
 
+    // A chord dropped on the middle of a block replaces it; near the edges it is inserted.
+    int replaceTargetAt (juce::Point<float> p) const
+    {
+        if (! trackArea.expanded (0.0f, 8.0f).contains (p))
+            return -1;
+
+        for (int i = 0; i < (int) blocks.size(); ++i)
+        {
+            const auto& r = blocks[(size_t) i].bounds;
+
+            if (p.x >= r.getX() && p.x <= r.getRight())
+            {
+                const float edge = juce::jlimit (8.0f, 36.0f, r.getWidth() * 0.25f);
+                return p.x > r.getX() + edge && p.x < r.getRight() - edge ? i : -1;
+            }
+        }
+
+        return -1;
+    }
+
     //==============================================================================
     // Mouse
     void updateHover (juce::Point<float> p, bool inside)
@@ -981,7 +1936,11 @@ struct ProgressionLane::Impl : public juce::Component,
 
         if (hit.slot < 0)
         {
-            if (trackArea.contains (e.position) && ! e.mods.isPopupMenu())
+            // Anywhere that is not a block (track gaps, ruler, header): right-click = progression menu,
+            // left-click = deselect (also possible when the chords fill the whole track).
+            if (e.mods.isPopupMenu())
+                showLaneMenu (nullptr);
+            else
                 setSelected (-1, true);
 
             return;
@@ -1034,13 +1993,15 @@ struct ProgressionLane::Impl : public juce::Component,
             {
                 resizeLength = newLength;
                 layoutBlocks();
+                layoutHeader();   // the length readout changes width
                 repaint();
             }
 
             return;
         }
 
-        if (pressedSlot < 0 || dragStarted || e.position.getDistanceFrom (downPos) < kDragThreshold)
+        if (pressedSlot < 0 || pressedSlot >= (int) blocks.size() || dragStarted
+            || e.position.getDistanceFrom (downPos) < kDragThreshold)
             return;
 
         dragStarted = true;
@@ -1055,9 +2016,14 @@ struct ProgressionLane::Impl : public juce::Component,
         {
             juce::Point<int> offset;
             auto image = makeDragImage (pressedSlot, offset);
+
+            if (image.getImage().isNull())
+                return;
+
             dragSourceSlot = pressedSlot;
             repaintBlock (dragSourceSlot);
-            container->startDragging (cb::ui::drag::makeSlotPayload (pressedSlot), this, image, false, &offset, &e.source);
+            // allowDraggingToExternalWindows: after ~0.7 s outside the plugin the editor turns it into a MIDI file drag.
+            container->startDragging (cb::ui::drag::makeSlotPayload (pressedSlot), this, image, true, &offset, &e.source);
         }
     }
 
@@ -1078,7 +2044,10 @@ struct ProgressionLane::Impl : public juce::Component,
                 processor.updateSlot (slot, s);
             }
 
+            sync();
             layoutBlocks();
+            layoutHeader();
+            syncProxies();
             repaint();
             updateHover (e.position, getLocalBounds().toFloat().contains (e.position));
             return;
@@ -1101,17 +2070,11 @@ struct ProgressionLane::Impl : public juce::Component,
         updateHover (e.position, getLocalBounds().toFloat().contains (e.position));
     }
 
-    void mouseDoubleClick (const juce::MouseEvent& e) override
+    void mouseDoubleClick (const juce::MouseEvent&) override
     {
-        if (outOfDate())
-            sync();
-
-        const auto hit = hitTest (e.position);
-
-        if (hit.slot < 0 || hit.edge || hit.close || e.mods.isPopupMenu())
-            return;
-
-        removeSlot (hit.slot);
+        // Deliberately nothing: the presses of a double-click already selected and auditioned the block. Deleting
+        // here used to chain onto the neighbours that slide under the cursor when a user taps a block quickly
+        // (JUCE also reports clicks 3 and 4 as double-clicks). Remove with the hover "x" or right-click > Delete.
     }
 
     void mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override
@@ -1167,6 +2130,12 @@ struct ProgressionLane::Impl : public juce::Component,
 
     juce::ScaledImage makeDragImage (int index, juce::Point<int>& offset) const
     {
+        if (index < 0 || index >= (int) blocks.size())
+        {
+            offset = {};
+            return {};
+        }
+
         const auto& b = blocks[(size_t) index];
         const float scale = juce::jmax (1.0f, (float) juce::Component::getApproximateScaleFactorForComponent (this));
         const float margin = 12.0f;
@@ -1209,28 +2178,305 @@ struct ProgressionLane::Impl : public juce::Component,
         setSelected (newSelected, true);
     }
 
-    void showSlotMenu (int index)
+    void clearAll()
     {
-        if (index < 0 || index >= (int) blocks.size())
+        if (previewing)
+        {
+            processor.stopPreview();
+            previewing = false;
+        }
+
+        processor.clearProgression();
+        setSelected (-1, true);
+        sync();
+    }
+
+    // Spark / presets: replace the whole lane in one undoable step.
+    void replaceProgression (cb::Progression p)
+    {
+        if (p.empty())
             return;
+
+        if ((int) p.slots.size() > cb::kMaxSlots)
+            p.slots.resize ((size_t) cb::kMaxSlots);
+
+        cancelPress();
+
+        if (p == processor.getProgression())
+        {
+            flashAll();
+            return;
+        }
+
+        processor.setProgression (p);
+        sync();
+        setSelected (-1, true);
+        flashAll();
+    }
+
+    void transposeBy (int semitones)
+    {
+        if (semitones == 0 || processor.getProgression().empty())
+            return;
+
+        cancelPress();
+        processor.transposeProgression (semitones);
+        sync();
+        flashAll();
+    }
+
+    cb::SparkSettings loadSparkSettings() const
+    {
+        const auto& state = processor.getAPVTS().state;
+        cb::SparkSettings s;
+
+        const auto snap = [] (int v, std::initializer_list<int> allowed, int fallback)
+        {
+            for (int a : allowed)
+                if (a == v)
+                    return v;
+            return fallback;
+        };
+
+        s.mood = (cb::Mood) juce::jlimit (0, cb::numMoods - 1, (int) state.getProperty (kSparkMoodProp, (int) cb::Mood::Emotional));
+        s.numChords = snap ((int) state.getProperty (kSparkChordsProp, 4), { 4, 6, 8 }, 4);
+        s.beatsPerChord = snap ((int) state.getProperty (kSparkBeatsProp, 4), { 2, 4, 8 }, 4);
+        return s;
+    }
+
+    void saveSparkSettings (const cb::SparkSettings& s)
+    {
+        auto state = processor.getAPVTS().state;
+        state.setProperty (kSparkMoodProp, (int) s.mood, nullptr);
+        state.setProperty (kSparkChordsProp, s.numChords, nullptr);
+        state.setProperty (kSparkBeatsProp, s.beatsPerChord, nullptr);
+        updateSparkLabels();
+        layoutHeader();
+    }
+
+    void spark()
+    {
+        const auto settings = loadSparkSettings();
+        const auto current = processor.getProgression();
+        cb::Progression result;
+
+        // A fresh seed every click; retry a few times so a click never "does nothing" by landing on the same chords.
+        for (int attempt = 0; attempt < 8; ++attempt)
+        {
+            const auto seed = (std::uint32_t) juce::Random::getSystemRandom().nextInt() | 1u;
+            result = cb::sparkProgression (processor.getKey(), processor.getPalette(), seed, settings);
+
+            if (! result.empty() && result != current)
+                break;
+        }
+
+        replaceProgression (result);
+    }
+
+    //==============================================================================
+    // Menus
+    juce::PopupMenu buildTransposeMenu() const
+    {
+        juce::PopupMenu m;
+        const bool any = ! cached.slots.empty();
+        m.addItem (idTransposeUp, "Up a semitone", any);
+        m.addItem (idTransposeDown, "Down a semitone", any);
+
+        if (moveShift != 0 && any)
+            m.addItem (idMoveToKey, "Move chords to " + shortKeyName (processor.getKey()) + "  (" + signedSemitones (moveShift) + ")");
+
+        return m;
+    }
+
+    juce::PopupMenu buildSparkMenu() const
+    {
+        const auto s = loadSparkSettings();
+        juce::PopupMenu m;
+        m.addSectionHeader ("Mood");
+
+        for (int i = 0; i < cb::numMoods; ++i)
+            m.addItem (idMoodBase + i, cb::moodName ((cb::Mood) i), true, (int) s.mood == i);
+
+        m.addSectionHeader ("Chords");
+
+        for (int n : { 4, 6, 8 })
+            m.addItem (idChordsBase + n, juce::String (n) + " chords", true, s.numChords == n);
+
+        m.addSectionHeader ("Each chord");
+
+        for (int b : { 2, 4, 8 })
+            m.addItem (idBeatsBase + b, juce::String (b) + " beats  (" + (b == 2 ? juce::String ("half a bar") : lengthText (b)) + ")",
+                       true, s.beatsPerChord == b);
+
+        m.addSeparator();
+        m.addItem (idSpark, "Spark a new progression");
+        return m;
+    }
+
+    juce::PopupMenu buildPresetsMenu (const std::vector<cb::Preset>& presets) const
+    {
+        juce::PopupMenu m;
+        const auto& current = processor.getProgression();
+
+        if (presets.empty())
+        {
+            m.addItem (-1, "No presets for this key yet", false);
+            return m;
+        }
+
+        for (int mood = 0; mood < cb::numMoods; ++mood)
+        {
+            bool header = false;
+
+            for (size_t i = 0; i < presets.size(); ++i)
+            {
+                const auto& preset = presets[i];
+
+                if ((int) preset.mood != mood)
+                    continue;
+
+                if (! header)
+                {
+                    m.addSectionHeader (cb::moodName ((cb::Mood) mood));
+                    header = true;
+                }
+
+                juce::PopupMenu::Item item (toJuce (preset.name));
+                item.itemID = idPresetBase + (int) i;
+                item.shortcutKeyDescription = toJuce (preset.romanSummary);
+                item.isTicked = preset.progression == current;
+                m.addItem (std::move (item));
+            }
+        }
+
+        return m;
+    }
+
+    struct Suggestion
+    {
+        cb::Chord chord;
+        float score;
+        juce::String roman;
+    };
+
+    // Chords from the palette that fit between the slot's neighbours (the loop wraps around).
+    std::vector<Suggestion> suggestionsFor (int index) const
+    {
+        std::vector<Suggestion> all;
+        const int n = (int) cached.slots.size();
+
+        if (index < 0 || index >= n)
+            return all;
+
+        const auto current = cached.slots[(size_t) index].chord;
+        const auto prev = cached.slots[(size_t) ((index - 1 + n) % n)].chord;
+        const auto next = cached.slots[(size_t) ((index + 1) % n)].chord;
+
+        for (const auto& section : processor.getPalette())
+        {
+            for (const auto& pc : section.chords)
+            {
+                const auto& c = pc.chord;
+
+                if (c.root == current.root || (n > 1 && (c.root == prev.root || c.root == next.root))
+                    || std::any_of (all.begin(), all.end(), [&c] (const Suggestion& s) { return s.chord == c; }))
+                    continue;
+
+                float score;
+
+                if (n == 1)
+                {
+                    score = cb::openingScore (c, key);
+                }
+                else
+                {
+                    score = std::sqrt (std::max (0.0f, cb::transitionScore (prev, c, key)) * std::max (0.0f, cb::transitionScore (c, next, key)));
+
+                    if (index == 0)
+                        score = 0.75f * score + 0.25f * cb::openingScore (c, key);
+                }
+
+                if (std::isfinite (score) && score > 0.05f)
+                    all.push_back ({ c, score, toJuce (pc.roman) });
+            }
+        }
+
+        std::stable_sort (all.begin(), all.end(), [] (const Suggestion& a, const Suggestion& b) { return a.score > b.score; });
+
+        // At most two variants per root, eight in total, so the list offers different ideas.
+        std::vector<Suggestion> out;
+
+        for (const auto& s : all)
+        {
+            const auto sameRoot = std::count_if (out.begin(), out.end(), [&s] (const Suggestion& o) { return o.chord.root == s.chord.root; });
+
+            if (sameRoot < 2)
+                out.push_back (s);
+
+            if (out.size() >= 8)
+                break;
+        }
+
+        return out;
+    }
+
+    juce::PopupMenu buildSlotMenu (int index, const std::vector<Suggestion>& suggestions) const
+    {
+        juce::PopupMenu menu;
+
+        if (index < 0 || index >= (int) blocks.size())
+            return menu;
 
         const auto expected = cached.slots[(size_t) index];
         const auto& chord = expected.chord;
         const auto& b = blocks[(size_t) index];
 
-        juce::PopupMenu menu;
-        menu.setLookAndFeel (&getLookAndFeel());
         menu.addSectionHeader (b.name + "  (" + b.roman + ")");
+
+        // Change to: same root, other qualities
+        juce::PopupMenu changeMenu;
+        const auto options = changeToOptions (chord, key);
+        bool outsideHeader = false;
+
+        for (const auto& o : options)
+        {
+            if (! o.inKey && ! outsideHeader)
+            {
+                changeMenu.addSectionHeader ("Outside the key");
+                outsideHeader = true;
+            }
+
+            const cb::Chord c { chord.root, o.quality };
+            juce::PopupMenu::Item item (toJuce (c.name (key)));
+            item.itemID = idChangeBase + (int) o.quality;
+            item.shortcutKeyDescription = toJuce (cb::romanNumeral (c, key));
+            item.isTicked = o.quality == chord.quality;
+            changeMenu.addItem (std::move (item));
+        }
+
+        // Suggested here: what fits between the neighbours
+        juce::PopupMenu suggestMenu;
+
+        for (size_t i = 0; i < suggestions.size(); ++i)
+        {
+            juce::PopupMenu::Item item (toJuce (suggestions[i].chord.name (key)));
+            item.itemID = idSuggestBase + (int) i;
+            item.shortcutKeyDescription = suggestions[i].roman;
+            suggestMenu.addItem (std::move (item));
+        }
+
+        if (suggestions.empty())
+            suggestMenu.addItem (-1, "Nothing stands out here", false);
 
         juce::PopupMenu lengthMenu;
 
         for (int beats : { 1, 2, 3, 4, 6, 8, 12, 16 })
-            lengthMenu.addItem (100 + beats, beats % 4 == 0 && beats > 4 ? juce::String (beats) + " beats  (" + lengthText (beats) + ")"
-                                                                       : (beats == 4 ? juce::String ("4 beats  (1 bar)") : lengthText (beats)),
+            lengthMenu.addItem (idLengthBase + beats, beats % 4 == 0 && beats > 4 ? juce::String (beats) + " beats  (" + lengthText (beats) + ")"
+                                                                                  : (beats == 4 ? juce::String ("4 beats  (1 bar)") : lengthText (beats)),
                                 true, expected.lengthBeats == beats);
 
         juce::PopupMenu inversionMenu;
-        inversionMenu.addItem (200, "Auto (voice leading)", true, expected.inversion < 0);
+        inversionMenu.addItem (idInversionAuto, "Auto (voice leading)", true, expected.inversion < 0);
         const char* inversionNames[] = { "Root position", "1st inversion", "2nd inversion", "3rd inversion" };
         const auto tones = chord.pitchClasses();
 
@@ -1239,9 +2485,9 @@ struct ProgressionLane::Impl : public juce::Component,
             juce::String label (inversionNames[inv]);
 
             if (inv > 0 && inv < (int) tones.size())
-                label << "  (" << toJuce (chord.name (key)) << "/" << toJuce (key.spell (tones[(size_t) inv])) << ")";
+                label << "  (" << toJuce (chord.name (key)) << "/" << toJuce (cb::spellChordTone (chord, chord.intervals()[(size_t) inv], key)) << ")";
 
-            inversionMenu.addItem (201 + inv, label, inv < (int) tones.size(), expected.inversion == inv);
+            inversionMenu.addItem (idInversionAuto + 1 + inv, label, inv < (int) tones.size(), expected.inversion == inv);
         }
 
         juce::PopupMenu octaveMenu;
@@ -1250,35 +2496,164 @@ struct ProgressionLane::Impl : public juce::Component,
         {
             const juce::String label = oct == 0 ? juce::String ("Default")
                                                 : (oct > 0 ? "+" : "") + juce::String (oct) + (std::abs (oct) == 1 ? " octave" : " octaves");
-            octaveMenu.addItem (310 + oct, label, true, expected.octaveShift == oct);
+            octaveMenu.addItem (idOctaveBase + oct, label, true, expected.octaveShift == oct);
         }
 
+        menu.addSubMenu ("Change to", changeMenu);
+        menu.addSubMenu ("Suggested here", suggestMenu);
+        menu.addSeparator();
         menu.addSubMenu ("Length", lengthMenu);
         menu.addSubMenu ("Inversion", inversionMenu);
         menu.addSubMenu ("Octave", octaveMenu);
         menu.addSeparator();
-        menu.addItem (1, "Duplicate", (int) cached.slots.size() < cb::kMaxSlots);
-        menu.addItem (2, "Delete");
+        menu.addSubMenu ("Transpose all", buildTransposeMenu());
+        menu.addItem (idDuplicate, "Duplicate", (int) cached.slots.size() < cb::kMaxSlots);
+        menu.addItem (idDelete, "Delete");
+        return menu;
+    }
+
+    juce::PopupMenu buildLaneMenu (const std::vector<cb::Preset>& presets) const
+    {
+        juce::PopupMenu menu;
+        menu.addSectionHeader ("Progression");
+        const bool any = ! cached.slots.empty();
+        menu.addItem (idTransposeUp, "Transpose up a semitone", any);
+        menu.addItem (idTransposeDown, "Transpose down a semitone", any);
+
+        if (moveShift != 0 && any)
+            menu.addItem (idMoveToKey, "Move chords to " + shortKeyName (processor.getKey()) + "  (" + signedSemitones (moveShift) + ")");
+
+        menu.addSeparator();
+        menu.addItem (idSpark, "Spark a new progression");
+        menu.addSubMenu ("Presets", buildPresetsMenu (presets));
+        menu.addSeparator();
+        menu.addItem (idClear, "Clear", any);
+        return menu;
+    }
+
+    static juce::PopupMenu::Options menuOptions (juce::Component* target, bool atMouse)
+    {
+        auto o = juce::PopupMenu::Options().withTargetComponent (target);
+        return atMouse ? o.withMousePosition() : o;
+    }
+
+    void showSlotMenu (int index)
+    {
+        if (index < 0 || index >= (int) blocks.size())
+            return;
+
+        const auto expected = cached.slots[(size_t) index];
+        const auto suggestions = suggestionsFor (index);
+        auto menu = buildSlotMenu (index, suggestions);
+        menu.setLookAndFeel (&getLookAndFeel());
 
         juce::Component::SafePointer<Impl> safe (this);
         // Target component (for the plug-in window's DPI scale and look-and-feel), opened at the mouse position.
-        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this).withMousePosition(),
-                            [safe, index, expected] (int result)
+        menu.showMenuAsync (menuOptions (this, true), [safe, index, expected, suggestions] (int result)
         {
             if (safe != nullptr && result != 0)
-                safe->applyMenuResult (index, expected, result);
+                safe->applySlotMenuResult (index, expected, suggestions, result);
         });
     }
 
-    void applyMenuResult (int index, const cb::ProgressionSlot& expected, int result)
+    void showLaneMenu (juce::Component* anchor)
     {
+        auto presets = cb::presetsFor (processor.getKey());
+        auto menu = buildLaneMenu (presets);
+        menu.setLookAndFeel (&getLookAndFeel());
+
+        juce::Component::SafePointer<Impl> safe (this);
+        const auto keyAtOpen = processor.getKey();
+        menu.showMenuAsync (menuOptions (anchor != nullptr ? anchor : this, anchor == nullptr),
+                            [safe, presets, keyAtOpen] (int result)
+        {
+            if (safe != nullptr && result != 0)
+                safe->applyLaneMenuResult (result, presets, keyAtOpen);
+        });
+    }
+
+    void showSparkMenu (juce::Component& anchor)
+    {
+        auto menu = buildSparkMenu();
+        menu.setLookAndFeel (&getLookAndFeel());
+
+        juce::Component::SafePointer<Impl> safe (this);
+        menu.showMenuAsync (menuOptions (&anchor, false), [safe] (int result)
+        {
+            if (safe == nullptr || result == 0)
+                return;
+
+            auto s = safe->loadSparkSettings();
+
+            if (result == idSpark)
+            {
+                safe->spark();
+                return;
+            }
+
+            if (result >= idBeatsBase && result < idBeatsBase + 10)
+                s.beatsPerChord = result - idBeatsBase;
+            else if (result >= idChordsBase && result < idChordsBase + 10)
+                s.numChords = result - idChordsBase;
+            else if (result >= idMoodBase && result < idMoodBase + cb::numMoods)
+                s.mood = (cb::Mood) (result - idMoodBase);
+
+            safe->saveSparkSettings (s);
+
+            // Picking a mood is a request to hear it: spark right away (undo brings the old progression back).
+            if (result >= idMoodBase && result < idMoodBase + cb::numMoods)
+                safe->spark();
+        });
+    }
+
+    void showPresetsMenu (juce::Component& anchor)
+    {
+        auto presets = cb::presetsFor (processor.getKey());
+        auto menu = buildPresetsMenu (presets);
+        menu.setLookAndFeel (&getLookAndFeel());
+
+        juce::Component::SafePointer<Impl> safe (this);
+        const auto keyAtOpen = processor.getKey();
+        menu.showMenuAsync (menuOptions (&anchor, false), [safe, presets, keyAtOpen] (int result)
+        {
+            if (safe != nullptr && result != 0)
+                safe->applyLaneMenuResult (result, presets, keyAtOpen);
+        });
+    }
+
+    void applyLaneMenuResult (int result, const std::vector<cb::Preset>& presets, const cb::Key& keyAtOpen)
+    {
+        if (outOfDate())
+            sync();
+
+        if (result == idTransposeUp)        transposeBy (1);
+        else if (result == idTransposeDown) transposeBy (-1);
+        else if (result == idMoveToKey)     transposeBy (processor.bestTranspositionForKey());
+        else if (result == idSpark)         spark();
+        else if (result == idClear)         clearAll();
+        else if (result >= idPresetBase && result - idPresetBase < (int) presets.size())
+        {
+            // Presets are spelled for the key the menu was opened in; ignore a stale pick after a key change.
+            if (processor.getKey() == keyAtOpen)
+                replaceProgression (presets[(size_t) (result - idPresetBase)].progression);
+        }
+    }
+
+    void applySlotMenuResult (int index, const cb::ProgressionSlot& expected, const std::vector<Suggestion>& suggestions, int result)
+    {
+        if (result == idTransposeUp || result == idTransposeDown || result == idMoveToKey)
+        {
+            applyLaneMenuResult (result, {}, processor.getKey());
+            return;
+        }
+
         const auto& prog = processor.getProgression();
 
         // The progression may have changed while the menu was open (undo, host automation...).
         if (index >= (int) prog.slots.size() || prog.slots[(size_t) index] != expected)
             return;
 
-        if (result == 1)
+        if (result == idDuplicate)
         {
             if (processor.duplicateSlot (index))
             {
@@ -1289,26 +2664,72 @@ struct ProgressionLane::Impl : public juce::Component,
             return;
         }
 
-        if (result == 2)
+        if (result == idDelete)
         {
             removeSlot (index);
             return;
         }
 
         auto s = expected;
+        bool chordChanged = false;
 
-        if (result >= 300)
-            s.octaveShift = juce::jlimit (-2, 2, result - 310);
-        else if (result >= 200)
-            s.inversion = result == 200 ? -1 : result - 201;
-        else if (result >= 100)
-            s.lengthBeats = juce::jlimit (cb::kMinSlotBeats, cb::kMaxSlotBeats, result - 100);
+        if (result >= idPresetBase)
+            return;
+
+        if (result >= idSuggestBase && result < idSuggestBase + 100)
+        {
+            const int k = result - idSuggestBase;
+
+            if (k >= (int) suggestions.size())
+                return;
+
+            s.chord = suggestions[(size_t) k].chord;
+            s.inversion = -1;
+            chordChanged = true;
+        }
+        else if (result >= idChangeBase && result < idChangeBase + cb::numChordQualities)
+        {
+            s.chord.quality = (cb::ChordQuality) (result - idChangeBase);
+            s.inversion = s.inversion < s.chord.numTones() ? s.inversion : -1;
+            chordChanged = s.chord != expected.chord;
+        }
+        else if (result >= idOctaveBase - 2 && result <= idOctaveBase + 2)
+            s.octaveShift = juce::jlimit (-2, 2, result - idOctaveBase);
+        else if (result >= idInversionAuto && result <= idInversionAuto + 4)
+            s.inversion = result == idInversionAuto ? -1 : result - idInversionAuto - 1;
+        else if (result >= idLengthBase && result < idLengthBase + 100)
+            s.lengthBeats = juce::jlimit (cb::kMinSlotBeats, cb::kMaxSlotBeats, result - idLengthBase);
 
         if (s != expected)
         {
             processor.updateSlot (index, s);
             sync();
+
+            if (chordChanged && index < (int) blocks.size())
+            {
+                blocks[(size_t) index].flash = 1.0f;
+                speedUp();
+                processor.startPreviewSlot (index);   // let the user hear the new chord in place
+                juce::Component::SafePointer<Impl> safe (this);
+                juce::Timer::callAfterDelay (600, [safe]
+                {
+                    if (safe != nullptr && ! safe->previewing)
+                        safe->processor.stopPreview();
+                });
+            }
         }
+    }
+
+    void stopPlayingWithHost()
+    {
+        if (auto* param = processor.getAPVTS().getParameter (cb::ParamIDs::syncToHost))
+        {
+            param->beginChangeGesture();
+            param->setValueNotifyingHost (0.0f);
+            param->endChangeGesture();
+        }
+
+        pollTransport();
     }
 
     //==============================================================================
@@ -1319,20 +2740,29 @@ struct ProgressionLane::Impl : public juce::Component,
             sync();
 
         const auto pos = getLocalPoint (&owner, details.localPosition).toFloat();
+        const bool wasActive = dropActive;
         dropActive = true;
         dropIndex = insertionIndexAt (pos.x);
         dropFromSlot = -1;
         dropRefused = false;
+        dropReplace = -1;
 
         if (cb::ui::drag::isChordPayload (details.description))
         {
             const auto chord = cb::ui::drag::chordFromPayload (details.description);
             dropLabel = toJuce (chord.name (key));
-            dropRefused = (int) cached.slots.size() >= cb::kMaxSlots;
+            dropReplace = replaceTargetAt (pos);
+            dropRefused = dropReplace < 0 && (int) cached.slots.size() >= cb::kMaxSlots;
         }
         else
         {
             dropFromSlot = cb::ui::drag::slotFromPayload (details.description);
+        }
+
+        if (! wasActive)
+        {
+            layoutEmptyState();
+            repaintSelectionMarker();
         }
 
         repaint();
@@ -1346,6 +2776,8 @@ struct ProgressionLane::Impl : public juce::Component,
         dropActive = false;
         dropIndex = -1;
         dropFromSlot = -1;
+        dropReplace = -1;
+        layoutEmptyState();
         repaint();
     }
 
@@ -1353,13 +2785,33 @@ struct ProgressionLane::Impl : public juce::Component,
     {
         updateDrop (details);
         const int index = dropIndex;
+        const int replace = dropReplace;
         int newSelected = selected;
+        int flashIndex = -1;
 
         if (cb::ui::drag::isChordPayload (details.description))
         {
-            if (! dropRefused && processor.addChord (cb::ui::drag::chordFromPayload (details.description), index))
-                if (selected >= index)
-                    newSelected = selected + 1;
+            const auto chord = cb::ui::drag::chordFromPayload (details.description);
+
+            if (replace >= 0 && replace < (int) cached.slots.size())
+            {
+                // Replace the chord, keep the slot's length and octave; inversion back to auto (the old one may not exist).
+                auto s = cached.slots[(size_t) replace];
+
+                if (s.chord != chord)
+                {
+                    s.chord = chord;
+                    s.inversion = -1;
+                    processor.updateSlot (replace, s);
+                }
+
+                newSelected = replace;
+                flashIndex = replace;
+            }
+            else if (! dropRefused && processor.addChord (chord, index))
+            {
+                newSelected = index;   // the selection follows what was added (the palette glow continues from it)
+            }
         }
         else if (cb::ui::drag::isSlotPayload (details.description))
         {
@@ -1384,6 +2836,12 @@ struct ProgressionLane::Impl : public juce::Component,
         clearDrop();
         sync();
         setSelected (newSelected, true);
+
+        if (flashIndex >= 0 && flashIndex < (int) blocks.size())
+        {
+            blocks[(size_t) flashIndex].flash = 1.0f;
+            speedUp();
+        }
     }
 
     //==============================================================================
@@ -1404,13 +2862,17 @@ struct ProgressionLane::Impl : public juce::Component,
 
             juce::String tip;
             tip << b.name << "  (" << b.roman << ")  " << middleDot() << "  " << b.length
-                << "\nClick to hear " << middleDot() << " drag to reorder " << middleDot() << " double-click to remove"
-                << "\nScroll to change the length " << middleDot() << " right-click for inversion, octave and more";
+                << "\nClick to hear " << middleDot() << " drag to reorder, or out into FL Studio"
+                << "\nDrop a pad on it to replace it " << middleDot() << " scroll to change the length"
+                << "\nRight-click to change the chord, inversion, octave or remove it";
             return tip;
         }
 
         if (blocks.empty() && trackArea.contains (lastMouse))
-            return "Drag chords here from the palette, or double-click a pad to add it";
+            return "Drag chords here from the palette, double-click a pad, or let Spark start one for you";
+
+        if (! blocks.empty() && trackArea.contains (lastMouse))
+            return "Click empty space to deselect (chords are then added at the end) " + middleDot() + " right-click to transpose";
 
         return {};
     }
@@ -1426,6 +2888,14 @@ struct ProgressionLane::Impl : public juce::Component,
         }
     }
 
+    bool syncToHostOn() const
+    {
+        if (auto* v = processor.getAPVTS().getRawParameterValue (cb::ParamIDs::syncToHost))
+            return v->load() >= 0.5f;
+
+        return false;
+    }
+
     void pollTransport()
     {
         const bool local = processor.isLocalPlaybackOn();
@@ -1433,20 +2903,47 @@ struct ProgressionLane::Impl : public juce::Component,
         if (playButton.getToggleState() != local)
             playButton.setToggleState (local, juce::dontSendNotification);
 
-        const bool wantEnabled = ! cached.slots.empty() || local;
-
-        if (playButton.isEnabled() != wantEnabled)
-            playButton.setEnabled (wantEnabled);
+        updatePlayButtonEnablement();
 
         const int ps = processor.getPlayingSlot();
         const bool nowPlaying = ps >= 0 && ps < (int) blocks.size();
         const double beat = nowPlaying ? juce::jlimit (0.0, (double) visibleBeats, processor.getPlaybackBeat()) : 0.0;
         const bool host = processor.isHostPlaying();
 
-        if (host != hostPlaying || nowPlaying != playing)
-            repaint (headerText.getSmallestIntegerContainer());
-
         hostPlaying = host;
+
+        // "Following host" pill: the progression loops along with the host transport.
+        const bool following = host && nowPlaying && syncToHostOn();
+
+        if (following != hostButton.isVisible())
+        {
+            hostButton.setVisible (following);
+            layoutHeader();
+        }
+
+        if (following)
+        {
+            hostButton.pulse = (float) std::fmod (juce::Time::getMillisecondCounterHiRes() / 1400.0, 1.0);
+            hostButton.repaint();
+        }
+
+        // B4: a host loop shorter than the progression (FL pattern mode) - shown in the header hint and tooltip.
+        const double loop = following ? processor.getHostLoopBeats() : 0.0;
+
+        if (std::abs (loop - hostLoopBeats) > 1.0e-6)
+        {
+            hostLoopBeats = loop;
+            juce::String tip ("Chordbloom is looping the progression along with FL's transport (Play with FL is on).\n");
+
+            if (loop > 0.0)
+                tip << "FL loops every " << totalText (juce::roundToInt (loop)) << ", shorter than the progression ("
+                    << totalText (effectiveTotal()) << "): Chordbloom keeps going across FL's loop. Set the FL pattern to "
+                    << totalText (effectiveTotal()) << " to line them up.\n";
+
+            tip << "Already dropped the clip into FL? Click to stop Chordbloom playing along, so you don't hear it twice.";
+            hostButton.setTooltip (tip);
+            repaint (headerRow);
+        }
 
         if (nowPlaying != playing || ps != playingSlot || (nowPlaying && std::abs (beat - playBeat) > 1.0e-6))
         {
@@ -1474,6 +2971,25 @@ struct ProgressionLane::Impl : public juce::Component,
             sync();
 
         pollTransport();
+
+        // The Spark settings live in the plugin state: a host state load can change them under us.
+        {
+            const auto s = loadSparkSettings();
+
+            if (s.mood != shownSpark.mood || s.numChords != shownSpark.numChords || s.beatsPerChord != shownSpark.beatsPerChord)
+            {
+                updateSparkLabels();
+                layoutHeader();
+            }
+        }
+
+        // A block dragged out into the DAW never gets its mouse-up here (the OS drag swallows it): drop the ghost
+        // as soon as no button is held any more.
+        if (dragSourceSlot >= 0 && ! juce::ModifierKeys::getCurrentModifiersRealtime().isAnyMouseButtonDown())
+        {
+            repaintBlock (dragSourceSlot);
+            dragSourceSlot = -1;
+        }
 
         bool flashing = false;
 
@@ -1504,12 +3020,27 @@ struct ProgressionLane::Impl : public juce::Component,
 
     PlayButton playButton;
     ClearButton clearButton;
+    PillButton sparkButton { "Spark", Glyph::spark, PillButton::Style::accent };
+    PillButton presetsButton { "Presets", Glyph::presets, PillButton::Style::outline };
+    PillButton moveButton { "Move chords to key", Glyph::move, PillButton::Style::info };
+    PillButton hostButton { "Stop playing along with FL", Glyph::live, PillButton::Style::live };
+    PillButton emptySparkButton { "Spark a progression", Glyph::spark, PillButton::Style::filled };
+    PillButton emptyPresetsButton { "Presets", Glyph::presets, PillButton::Style::outline };
+    std::vector<std::unique_ptr<AccessibleItem>> proxies;
 
     cb::Progression cached, synced;
     cb::Key key, syncedKey;
     std::vector<Block> blocks;
 
-    juce::Rectangle<float> headerText, rulerArea, trackArea;
+    juce::Rectangle<int> headerRow;
+    juce::Rectangle<float> hintArea, rulerArea, trackArea, emptyTextArea;
+    bool compact = false;
+    juce::String emptyText;
+    juce::Font emptyFont { juce::FontOptions() };
+    bool showEmptyText = true;
+    juce::String moveFullText, moveShortText;
+    cb::SparkSettings shownSpark;
+    int moveShift = 0;
     int visibleBeats = kMinVisibleBeats;
     float pxPerBeat = 1.0f;
 
@@ -1538,11 +3069,14 @@ struct ProgressionLane::Impl : public juce::Component,
     bool dropActive = false;
     int dropIndex = -1;
     int dropFromSlot = -1;
+    int dropReplace = -1;
     bool dropRefused = false;
     juce::String dropLabel;
 
     bool playing = false;
     bool hostPlaying = false;
+    double hostLoopBeats = 0.0;   // processor.getHostLoopBeats() while following the host, else 0
+    bool playButtonHostDriven = false;
     int playingSlot = -1;
     double playBeat = 0.0;
 
@@ -1555,6 +3089,9 @@ struct ProgressionLane::Impl : public juce::Component,
 ProgressionLane::ProgressionLane (ChordbloomProcessor& p) : impl (std::make_unique<Impl> (*this, p))
 {
     setOpaque (false);
+    setWantsKeyboardFocus (false);
+    setMouseClickGrabsKeyboardFocus (false);
+    setTitle ("Progression");
     addAndMakeVisible (*impl);
 }
 
@@ -1574,6 +3111,14 @@ int ProgressionLane::getSelectedSlot() const noexcept
 }
 
 void ProgressionLane::setSelectedSlot (int index) { impl->setSelected (index, false); }
+
+void ProgressionLane::setSelectedSlot (int index, bool notify)
+{
+    if (impl->outOfDate())
+        impl->sync();
+
+    impl->setSelected (index, notify);
+}
 
 bool ProgressionLane::isInterestedInDragSource (const SourceDetails& details)
 {

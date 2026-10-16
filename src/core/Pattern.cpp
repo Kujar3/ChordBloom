@@ -12,7 +12,7 @@
 //    swing * step / 3; each step's "span" runs to the next step's (swung) start or the slot end, and a note lasts
 //    gate * span, so swung notes never overlap the next step. Triplet rate (1/8T) is already a shuffle and is not
 //    swung (swinging every second triplet would push every other downbeat late).
-//  - Block: whole chord for gate * slot length. Strum: the same, note i (low -> high) starts 0.03 * i later.
+//  - Block/Strum: release at slotLength - (1-gate)*min(slotLength,1); strum onsets stagger by 0.03 beats.
 //  - Pulse: whole chord on every step. Arp Up / Down / Up-Down: one note per step (Up-Down: 1 2 3 4 3 2 | 1 2 ...).
 //  - Offbeat: whole chord on the "&" of every beat, gate * half a beat long. The "&" is swung like an odd step when
 //    it is one (1/8 rate); at other rates it is not on an odd step and stays straight.
@@ -20,11 +20,11 @@
 //    every beat the lowest note, on the following steps of the beat the remaining notes together.
 //  - Humanize: deterministic hash of (slot, step, voice, channel); timing +-0.015 * humanize beats (clamped to the
 //    slot), velocity +-0.12 * humanize. Velocities always stay in [1/127, 1].
-//  - Bass (channel 2): chord root in [lowest voicing note - 12, lowest - 1], folded into [28, 55] by octaves.
-//    Root: held for gate * slot. Root + 5th: alternating every beat (root first), gate * 1 beat.
-//    Octaves: low/high octave alternating every step. Pulse: root on every step.
-//    For Root + 5th and Octaves the whole figure moves down an octave when its upper note would exceed 55, so
-//    every bass note stays in [28, 55].
+//  - Bass (channel 2): explicit inversion bass, otherwise root. Choose the octave in [28,55]
+//    nearest the previous bass note (initially 40), at least 5 below the chord when possible.
+//    Root uses the held release above; Pulse uses rate steps. Root+5th alternates with the
+//    chord's fifth (b5/#5 of dim/aug), or the chord root for slash chords, voice-leading each beat. Octaves alternates with an upper/lower octave
+//    in range; the last played bass note carries into the next slot.
 //  - Safety: a note never overlaps another instance of the same note on the same channel (an earlier one is
 //    shortened), so hosts never see a second note-on before the note-off.
 // Output is sorted by (startBeat, channel, note).
@@ -160,15 +160,26 @@ struct SlotRenderer
     }
 };
 
-int bassRootNote (int rootPc, int lowestVoicingNote)
+// Prefer clear separation whenever any octave can provide it; ties choose the lower note.
+int bassRootNote (int bassPc, int lowestVoicingNote, int previous)
 {
-    const int low = lowestVoicingNote - 12;
-    int n = low + pc (rootPc - low);   // in [lowest - 12, lowest - 1]
-    while (n < kBassLow)
-        n += 12;
-    while (n > kBassHigh)
-        n -= 12;
-    return n;
+    int best = -1;
+    for (int n = kBassLow; n <= kBassHigh; ++n)
+    {
+        if (pc (n) != bassPc)
+            continue;
+        const bool clear = n <= lowestVoicingNote - 5;
+        const bool bestClear = best >= 0 && best <= lowestVoicingNote - 5;
+        if (best < 0 || (clear && ! bestClear)
+            || (clear == bestClear && std::abs (n - previous) < std::abs (best - previous)))
+            best = n;
+    }
+    return best;
+}
+
+double heldLength (double slotLength, double gate)
+{
+    return slotLength - (1.0 - gate) * std::min (slotLength, 1.0);
 }
 
 void renderChords (const SlotRenderer& r, const std::vector<int>& notes, const RenderSettings& s, double slotLength,
@@ -186,7 +197,7 @@ void renderChords (const SlotRenderer& r, const std::vector<int>& notes, const R
     {
         case RhythmPattern::Strum:
             for (int i = 0; i < n; ++i)
-                r.emit (notes[(size_t) i], kStrumOffset * i, gate * slotLength, kChordChannel, 0, i);
+                r.emit (notes[(size_t) i], kStrumOffset * i, heldLength (slotLength, gate) - kStrumOffset * i, kChordChannel, 0, i);
             break;
 
         case RhythmPattern::Pulse:
@@ -247,18 +258,19 @@ void renderChords (const SlotRenderer& r, const std::vector<int>& notes, const R
         case RhythmPattern::NumPatterns:
         default:
             for (int i = 0; i < n; ++i)
-                r.emit (notes[(size_t) i], 0.0, gate * slotLength, kChordChannel, 0, i);
+                r.emit (notes[(size_t) i], 0.0, heldLength (slotLength, gate), kChordChannel, 0, i);
             break;
     }
 }
 
-void renderBass (const SlotRenderer& r, int rootPc, int lowestVoicingNote, const RenderSettings& s, double slotLength,
-                 double gate, double swing)
+void renderBass (const SlotRenderer& r, int rootPc, int bassPc, int fifthPc, int lowestVoicingNote, int& previousBass,
+                 const RenderSettings& s, double slotLength, double gate, double swing)
 {
     if (s.bass == BassMode::Off || (int) s.bass < 0 || (int) s.bass >= numBassModes)
         return;
 
-    int root = bassRootNote (rootPc, lowestVoicingNote);
+    int root = bassRootNote (bassPc, lowestVoicingNote, previousBass);
+    int last = root;
 
     const double rate = rateInBeats (s.rate);
     const double swingDelay = s.rate == RateDivision::EighthTriplet ? 0.0 : swing * rate / 3.0;
@@ -266,28 +278,38 @@ void renderBass (const SlotRenderer& r, int rootPc, int lowestVoicingNote, const
     switch (s.bass)
     {
         case BassMode::Root:
-            r.emit (root, 0.0, gate * slotLength, kBassChannel, 0, 0);
+            r.emit (root, 0.0, heldLength (slotLength, gate), kBassChannel, 0, 0);
             break;
 
         case BassMode::RootFifth:
         {
-            if (root + 7 > kBassHigh && root - 12 >= kBassLow)
-                root -= 12;
+            const int otherPc = bassPc == rootPc ? fifthPc : rootPc;
+            int lastNote = root;
             const int beats = (int) std::ceil (slotLength - 1.0e-6);
             for (int b = 0; b < beats; ++b)
             {
                 const double span = std::min (1.0, slotLength - b);
-                r.emit ((b & 1) == 0 ? root : root + 7, (double) b, gate * span, kBassChannel, b, b & 1);
+                lastNote = b == 0 ? root : bassRootNote ((b & 1) == 0 ? bassPc : otherPc, lowestVoicingNote, lastNote);
+                r.emit (lastNote, (double) b, gate * span, kBassChannel, b, b & 1);
+                last = lastNote;
             }
             break;
         }
 
         case BassMode::Octaves:
-            if (root + 12 > kBassHigh && root - 12 >= kBassLow)
-                root -= 12;
+        {
+            // Keep the voice-led entry note. Alternate upwards when clear and in range,
+            // otherwise downwards when available, without moving the entry an octave.
+            int other = root + 12;
+            if (other > kBassHigh || (other > lowestVoicingNote - 5 && root - 12 >= kBassLow))
+                other = root - 12;
             for (auto& st : stepGrid (slotLength, rate, swingDelay))
-                r.emit ((st.index & 1) == 0 ? root : root + 12, st.start, gate * st.span, kBassChannel, st.index, st.index & 1);
+            {
+                last = (st.index & 1) == 0 ? root : other;
+                r.emit (last, st.start, gate * st.span, kBassChannel, st.index, st.index & 1);
+            }
             break;
+        }
 
         case BassMode::Pulse:
             for (auto& st : stepGrid (slotLength, rate, swingDelay))
@@ -299,6 +321,7 @@ void renderBass (const SlotRenderer& r, int rootPc, int lowestVoicingNote, const
         default:
             break;
     }
+    previousBass = last;
 }
 
 // An earlier instance of a note is shortened so it ends before the same note (same channel) starts again.
@@ -344,6 +367,7 @@ std::vector<NoteEvent> renderProgression (const Progression& progression, const 
     const float velocity = std::clamp (settings.velocity, kMinVelocity, 1.0f);
 
     double slotStart = 0.0;
+    int previousBass = 40;
 
     for (int i = 0; i < (int) progression.slots.size(); ++i)
     {
@@ -363,7 +387,22 @@ std::vector<NoteEvent> renderProgression (const Progression& progression, const 
         SlotRenderer r { events, i, slotStart, slotStart + slotLength, velocity, humanize };
 
         renderChords (r, notes, settings, slotLength, gate, swing);
-        renderBass (r, pc (slot.chord.root), notes.empty() ? 60 : notes.front(), settings, slotLength, gate, swing);
+        const int rootPc = pc (slot.chord.root);
+        const auto chordPcs = slot.chord.pitchClasses();
+        const int bassPc = slot.inversion >= 0
+            ? (notes.empty() ? chordPcs[(size_t) std::min (slot.inversion, (int) chordPcs.size() - 1)] : pc (notes.front()))
+            : rootPc;
+        // Root + 5th uses the chord's own fifth (b5 of dim / m7b5 chords, #5 of augmented), never a clashing P5.
+        const auto& intervals = qualityIntervals (slot.chord.quality);
+        int fifthInterval = 7;
+        for (int candidate : { 7, 6, 8 })
+            if (std::find (intervals.begin(), intervals.end(), candidate) != intervals.end())
+            {
+                fifthInterval = candidate;
+                break;
+            }
+        renderBass (r, rootPc, bassPc, pc (rootPc + fifthInterval), notes.empty() ? 60 : notes.front(), previousBass,
+                    settings, slotLength, gate, swing);
 
         slotStart += slotLength;
     }

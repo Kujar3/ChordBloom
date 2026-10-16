@@ -8,36 +8,17 @@
 //==============================================================================
 // Voicing rules (how a Chord becomes MIDI notes)
 //
-// Chord tones are split into the "core" (root, 3rd/sus tone, 5th, 6th/7th: every interval below 12) and an optional
-// added 9th (interval 14). A voicing is built as an ORDER of chord tones from bottom to top; the notes are then
-// stacked so every tone sits at the next higher occurrence of its pitch class above the tone below it. The shape is
-// finally placed in the octave whose mean is closest to the (effective) centre note.
-//
-// Inversion k always means "chord tone k (in interval order) is the lowest note", in every style:
-//   0 = root, 1 = 3rd (or sus tone), 2 = 5th, 3 = 6th/7th (or the 9th of an add9 chord), 4 = 9th of a 9th chord.
-//
-// Close   Core tones in close position starting from the bass tone (a rotation of root-3-5-7), packed within an
-//         octave. The 9th is never jammed a whole tone above the root at the bottom: it is always voiced ABOVE the
-//         3rd, as the top voice (Cadd9 = C E G D, Cmaj9 = C E G B D, Cadd9/G = G C E D). Only when the 9th itself
-//         is the requested bass does it sit at the bottom, with the core packed above it (D E G B C).
-//         Consequently 9th chords may span up to a 12th; everything else spans less than an octave.
-// Open    Drop-2: the close voicing whose second-highest voice, dropped an octave, lands on the requested bass
-//         tone (C G E, C G B E, E B C G, ...). For 9th chords the drop-2 is applied to the core and the 9th stays
-//         on top (Cmaj9 = C G B E D). 9th in the bass: 9th, then the core in drop-2 from its 5th (D G C E B).
-// Spread  Wide pad voicing over ~2 octaves: bass tone low, then every other core tone first (in 5ths/6ths), then the
-//         rest an octave up, 9th on top (C G E B D, C G E A). Three-note chords double their bass tone two octaves
-//         up so pads stay full (C G E C). Below MIDI 52 no two adjacent notes are closer than a perfect 4th (any
-//         such upper note is moved up an octave), so low settings stay clear rather than muddy.
-//
-// Voice leading (inversion == -1 with a previous voicing): candidates are every inversion of the style at every
-// octave placement whose mean lies within +-7 semitones of the effective centre. The 9th-in-bass inversion is only
-// used when asked for explicitly (an automatic choice should not put the 9th under the 3rd). Cost = sum of
-// |movement|, pairing notes in sorted order; when the note counts differ the best order-preserving pairing is used
-// and every unpaired note costs its distance to the nearest note of the other voicing. Ties: mean closest to the
-// centre, then lower mean, then lower inversion. Because every candidate is inside the window there is no drift.
-//
-// octaveShift: the voicing is placed around centerNote + 12 * octaveShift (identical to shifting after placement,
-// but lets the low-register Spread rule see the real register). Every note always ends up in [21, 108].
+// Core tones have intervals below 12; all remaining tones are extensions, in interval order
+// (9/b9, 11/#11, 13). Every tone is retained. Extensions sit above the entire core,
+// except an explicitly requested extension bass. Inversion indices always refer to the
+// original interval list. Auto voice leading never chooses an extension bass.
+// Close rotates the core; Open uses drop-2 on the core; Spread interleaves core tones
+// and doubles triad basses. Spread clears intervals below a fourth under MIDI 52.
+// Close placement and its voice-leading window use the core mean so upper extensions
+// do not drag the chord down. Other styles use the full mean.
+// Auto cost is movement plus penalties for a sixth/seventh bass and bottom-voice rubs.
+// Ties prefer the centre, then lower placement, then lower inversion. Explicit inversions
+// bypass quality penalties. Octave shifts affect placement; range [21,108] takes priority.
 //==============================================================================
 
 namespace cb
@@ -62,7 +43,7 @@ struct ChordTones
 {
     std::vector<int> pcs;    // pitch class of every chord tone, in interval order
     std::vector<int> core;   // indices (into pcs) of the tones below the octave: root, 3rd, 5th, 6th/7th
-    int ninth = -1;          // index of the added 9th (interval >= 12), or -1
+    std::vector<int> extensions; // indices of all intervals >= 12
 };
 
 ChordTones analyse (const Chord& chord)
@@ -74,8 +55,8 @@ ChordTones analyse (const Chord& chord)
     {
         t.pcs.push_back (pc (chord.root + intervals[(size_t) i]));
 
-        if (intervals[(size_t) i] >= 12 && t.ninth < 0)
-            t.ninth = i;
+        if (intervals[(size_t) i] >= 12)
+            t.extensions.push_back (i);
         else
             t.core.push_back (i);
     }
@@ -141,14 +122,17 @@ std::vector<int> toneOrder (const ChordTones& t, VoicingStyle style, int inv)
         return order;
     }
 
-    if (inv == t.ninth)
+    if (std::find (t.extensions.begin(), t.extensions.end(), inv) != t.extensions.end())
     {
         // 9th in the bass: Close packs the core above it from the 3rd (D E G B C); Open/Spread continue from the
         // 5th, a 4th above the 9th (D G C E B), which keeps the low end clear.
         const int nextBass = std::min (style == VoicingStyle::Close ? 1 : 2, nc - 1);
-        order.push_back (t.ninth);
+        order.push_back (inv);
         for (int p : coreOrder (style, nc, nextBass))
             order.push_back (t.core[(size_t) p]);
+        for (int extension : t.extensions)
+            if (extension != inv)
+                order.push_back (extension);
         return order;
     }
 
@@ -160,9 +144,9 @@ std::vector<int> toneOrder (const ChordTones& t, VoicingStyle style, int inv)
     for (int p : coreOrder (style, nc, bassPos))
         order.push_back (t.core[(size_t) p]);
 
-    if (t.ninth >= 0)
-        order.push_back (t.ninth);   // the 9th always sits on top, above the 3rd
-    else if (style == VoicingStyle::Spread && t.pcs.size() == 3)
+    for (int extension : t.extensions)
+        order.push_back (extension);
+    if (style == VoicingStyle::Spread && t.pcs.size() == 3)
         order.push_back (order.front());   // triad pads: double the bass tone two octaves up
 
     return order;
@@ -265,12 +249,46 @@ std::vector<Candidate> placements (const ChordTones& t, VoicingStyle style, int 
             notes.push_back (bass + o);
 
         if (style == VoicingStyle::Spread)
+        {
             clearLowRegister (notes);
+            // Clearing a low core tone can lift it past an extension. Restore the upper
+            // extension stack, preserving an explicitly requested extension bass.
+            for (int extension : t.extensions)
+            {
+                if (extension == inv) continue;
+                const int extensionPc = t.pcs[(size_t) extension];
+                auto it = std::find_if (notes.begin(), notes.end(), [extensionPc] (int note)
+                {
+                    return pc (note) == extensionPc;
+                });
+                if (it == notes.end()) continue;
+                int note = *it;
+                notes.erase (it);
+                // Only compare with core and earlier extensions, not later ones.
+                int floor = notes.front();
+                for (int other : notes)
+                {
+                    bool laterExtension = false;
+                    for (int later : t.extensions)
+                        if (later > extension && later != inv && pc (other) == t.pcs[(size_t) later])
+                            laterExtension = true;
+                    if (! laterExtension) floor = std::max (floor, other);
+                }
+                while (note <= floor || (floor < kMudThreshold && note - floor < kMinClearInterval))
+                    note += 12;
+                notes.insert (std::upper_bound (notes.begin(), notes.end(), note), note);
+            }
+        }
 
         if (! inRange (notes))
             continue;
 
-        result.push_back ({ notes, meanOf (notes), inv });
+        std::vector<int> coreNotes;
+        for (int note : notes)
+            for (int tone : t.core)
+                if (pc (note) == t.pcs[(size_t) tone])
+                    coreNotes.push_back (note);
+        result.push_back ({ notes, meanOf (style == VoicingStyle::Close ? coreNotes : notes), inv });
     }
 
     return result;
@@ -405,7 +423,7 @@ std::vector<int> voiceChord (const Chord& chord, const VoicingSettings& settings
 
         for (int inv = 0; inv < n; ++inv)
         {
-            if (inv == tones.ninth && n > 1)
+            if (std::find (tones.extensions.begin(), tones.extensions.end(), inv) != tones.extensions.end())
                 continue;   // 9th in the bass only on explicit request
 
             for (auto& c : placements (tones, style, inv))
@@ -414,7 +432,12 @@ std::vector<int> voiceChord (const Chord& chord, const VoicingSettings& settings
                 if (dist > kVoiceLeadingWindow + kEps)
                     continue;
 
-                const int cost = movementCost (c.notes, prev);
+                int cost = movementCost (c.notes, prev);
+                const int bassInterval = pc (c.notes.front() - chord.root);
+                if (bassInterval >= 9 && bassInterval <= 11)
+                    cost += 4;
+                if (c.notes.size() >= 2 && c.notes[1] - c.notes[0] <= 2)
+                    cost += 8;
 
                 bool better = ! found;
                 if (! better)

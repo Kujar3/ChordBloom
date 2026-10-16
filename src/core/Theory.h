@@ -123,6 +123,9 @@ struct Chord
     int numTones() const { return (int) qualityIntervals (quality).size(); }
 
     std::string name (const Key& key) const;     // key.spell (root) + qualitySuffix, e.g. "Am7", "Bbmaj7", "F#dim"
+                                                 // (roots outside both the key and its parallel key are spelled
+                                                 // like their roman numeral: C major F#dim = #iv°, not "Gbdim";
+                                                 // A minor Bb = bII, not "A#")
 
     bool operator== (const Chord& o) const { return root == o.root && quality == o.quality; }
     bool operator!= (const Chord& o) const { return ! (*this == o); }
@@ -133,9 +136,12 @@ enum class HarmonicFunction
 {
     Tonic,        // diatonic degrees 1, 3, 6
     Subdominant,  // diatonic degrees 2, 4
-    Dominant,     // diatonic degrees 5, 7 (also a major/dominant-7 chord on degree 5 in minor keys)
-    Borrowed,     // not diatonic, but every tone is in key.parallel()
-    Secondary,    // secondary dominant (V or V7 of a diatonic, non-diminished, non-tonic chord)
+    Dominant,     // diatonic degrees 5, 7 (also a major/dominant-7 chord on degree 5 in minor keys; 9, 13 and 7b9
+                  // chords count as dominant 7ths everywhere)
+    Borrowed,     // not diatonic, but every tone is in key.parallel(); for minor-family scales other than Natural
+                  // Minor also every tone in the natural minor on the same tonic (A Harmonic Minor: G, C, Em, Am7)
+    Secondary,    // secondary dominant (V, V7, V9, V13 or V7b9 of a diatonic, non-diminished, non-augmented,
+                  // non-tonic chord)
     Chromatic     // anything else
 };
 
@@ -151,12 +157,24 @@ HarmonicFunction harmonicFunction (const Chord&, const Key&);
 //  - Upper case for Major/Augmented/Sus/6/Add9/Major7/Dominant chords, lower case for Minor/Diminished/HalfDim chords.
 //  - Suffixes: Diminished "°", Diminished7 "°7", HalfDiminished7 "ø7", Augmented "+", Major7 "maj7", Minor7 "7",
 //    Dominant7 "7", Major6/Minor6 "6", Add9/MinorAdd9 "add9", Sus2 "sus2", Sus4 "sus4", Dominant7Sus4 "7sus4",
-//    Major9 "maj9", Minor9/Dominant9 "9", MinorMajor7 "(maj7)".
+//    Major9 "maj9", Minor9/Dominant9 "9", MinorMajor7 "(maj7)", Minor11 "11" (lower case), Major69 "6/9",
+//    Dominant13 "13", Major7Sharp11 "maj7#11", Dominant7Flat9 "7b9" (C major: ii11, I6/9, V13, IVmaj7#11).
 //  - Roots outside the scale get an accidental relative to an adjacent scale degree: by default "b" + the degree
 //    above (C major: Bb -> "bVII", Ab -> "bVI", Eb -> "bIII", Db -> "bII", Gb -> "bV"); diminished-family chords
 //    (Diminished, Diminished7, HalfDiminished7) instead use "#" + the degree below (C major: F#dim -> "#iv°").
-//  - When detectSecondary and harmonicFunction == Secondary: "V/x" or "V7/x" where x is the target's diatonic numeral
-//    (C major: D7 -> "V7/V", E -> "V/vi").
+//    Roots from the parallel key use their parallel degree (A minor: C#m -> "#iii"). In Harmonic / Melodic Minor,
+//    natural-minor roots keep their natural-minor numeral (A Harmonic Minor: G -> "VII" beside G#dim "vii°").
+//  - When detectSecondary and harmonicFunction == Secondary: "V/x", "V7/x", "V9/x", "V13/x" or "V7b9/x" where x is
+//    the target's diatonic numeral (C major: D7 -> "V7/V", E -> "V/vi"; A minor: A7b9 -> "V7b9/iv").
 std::string romanNumeral (const Chord&, const Key&, bool detectSecondary = true);
+
+// Chord-relative tone spelling (round 2, B12).
+// The root is spelled as in Chord::name; every other tone takes the letter its interval implies above the root's
+// letter (3rd -> +2 letters, b5/5/#5 -> +4, #11 -> +3, bb7 of dim7 -> +6 ...) with a single accidental, falling back
+// to Key::spell when that would need a double accidental. C major: D7 = D F# A C, E7 = E G# B D, B7 = B D# F# A,
+// Ab = Ab C Eb; A minor: C7 = C E G Bb; G major: B7 = B D# F# A. Use it for keyboard note names and slash-bass names
+// (ProgressionLane: spellChordTone (chord, chord.intervals()[inversion], key)).
+std::string spellChordTone (const Chord&, int interval, const Key&);
+std::vector<std::string> chordToneNames (const Chord&, const Key&);   // in interval order
 
 } // namespace cb

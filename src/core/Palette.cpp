@@ -5,15 +5,24 @@
 // Chord palette generation.
 //
 //  Triads / Sevenths : the 7 diatonic chords stacked in thirds, degree order.
-//  Color             : up to 8 diatonic colour chords (add9, maj9/m9/9, sus2, sus4, 7sus4, 6). Chosen from a
-//                      per-family wish list (the chords modern producers reach for first), filtered to chords whose
-//                      tones are all in the key, topped up from a generic list when a mode rules many out, and finally
-//                      shown in scale-degree order (tonic colours first) so the row reads like the Triads row.
-//  Borrowed          : up to 8 chords of key.parallel() that are not diatonic in the key, ordered by how often they
-//                      turn up in pop / film music (major keys: iv, bVII, bVI, bIII, iv7, bVImaj7, v, i, ...;
-//                      minor keys: V, IV, I, V7, ii, IVmaj7, vii°, ii7, ...).
+//  Color             : up to 8 diatonic colour chords (add9, 6, 6/9, maj9/m9/m11, maj7#11, 13, 7b9, sus). Chosen from a
+//                      per-family wish list ordered by what producers actually use (out/midi_stats.md: in minor keys
+//                      VII(add9), VI(add9), VII6, III6 and iv(m9) lead; in major keys IV(add9), IV6, I(add9), maj9),
+//                      plus the extended colours of R&B / neo-soul (i11, I6/9, the Lydian IVmaj7#11 / VImaj7#11, V13,
+//                      harmonic minor's V7b9). Filtered to chords whose tones are all in the key, topped up from a
+//                      generic list when a mode rules many out, and finally shown in scale-degree order (tonic colours
+//                      first) so the row reads like the Triads row.
+//                      C major:  Cadd9, C6/9, Cmaj9, Dm9, Fadd9, F6, Fmaj7#11, G13
+//                      A minor:  Am11, C6, Dm9, Fadd9, Fmaj7#11, Gadd9, G6, Gsus4
+//  Borrowed          : up to 8 chords that are not diatonic in the key, ordered by how often they turn up in the data.
+//                      Major-family keys borrow from the parallel minor: bVI, bVII, iv, bIII, iv7, bVImaj7, v, i7 (...).
+//                      Natural Minor borrows from the parallel major: V, IV, I, V7, ii, IVmaj7, vii°, ii7 (...).
+//                      The other minor-family scales borrow the natural-minor chords they lose first (A Harmonic Minor:
+//                      G, C, Am7, Em, Em7, Cmaj7, then D, A), then parallel-major chords.
 //  Secondary         : V7/x for every diatonic, non-diminished, non-tonic target x, in target-degree order, skipping
 //                      chords already shown earlier in the palette (and augmented III+ targets of harmonic/melodic minor).
+//                      Minor-family keys also get the darker V7b9/x when the target is minor or the b9 is in the key
+//                      (A minor: A7, A7b9, B7, B7b9, C7, D7), never more than 6 pads, plain V7s first.
 
 namespace cb
 {
@@ -179,6 +188,11 @@ namespace
             case ChordQuality::Dominant7Sus4:   return "Soft, gospel-style 7sus4";
             case ChordQuality::Major6:          return "Sweet, vintage 6th";
             case ChordQuality::Minor6:          return "Bittersweet, noir minor 6th";
+            case ChordQuality::Minor11:         return "Lush, neo-soul m11";
+            case ChordQuality::Major69:         return "Smooth, open 6/9";
+            case ChordQuality::Dominant13:      return "Rich, soulful 13th";
+            case ChordQuality::Major7Sharp11:   return "Dreamy, floating Lydian maj7#11";
+            case ChordQuality::Dominant7Flat9:  return "Dark, dramatic 7b9";
             case ChordQuality::Diminished:      return "Tense diminished";
             case ChordQuality::Minor:           return "Plain minor";
             default:                            return "Plain major";
@@ -193,19 +207,35 @@ namespace
         if (chord.quality == ChordQuality::Dominant7 && wrapDegree (degree) == 4)
             return "The classic V7 - the strongest pull back to " + n.tonic + ".";
 
+        if (chord.quality == ChordQuality::Dominant7Flat9 && wrapDegree (degree) == 4)
+            return "Dark, dramatic 7b9 - the most intense pull back to " + n.tonic + ".";
+
+        if (chord.quality == ChordQuality::Dominant13 && wrapDegree (degree) == 4)
+            return "Rich, soulful 13th - a smooth, jazzy pull back to " + n.tonic + ".";
+
         if (chord.quality == ChordQuality::Sus4)
             return std::string (flavourPhrase (chord.quality)) + " - resolve it to " + triad.name (key) + ".";
 
         return std::string (flavourPhrase (chord.quality)) + " - " + rolePhrase (key, degree, triad.quality, n) + ".";
     }
 
-    std::string borrowedHint (const Key& key, int parallelDegree, bool seventh, const HintNames& n)
+    // `source` is the key the chord is borrowed from: key.parallel(), or the natural minor on the same tonic for the
+    // other minor-family scales ("Borrowed from A natural minor: ...").
+    std::string borrowedHint (const Key& key, const Key& source, int parallelDegree, bool seventh, const HintNames& n)
     {
-        const bool fromMinor = scaleInfo (key.parallel().scale).isMinorFamily;
-        const std::string source = "Borrowed from " + key.tonicName() + (fromMinor ? " minor: " : " major: ");
+        const bool fromMinor = scaleInfo (source.scale).isMinorFamily;
+        const bool keyIsMinor = scaleInfo (key.scale).isMinorFamily;
+        const std::string sourceName = "Borrowed from " + key.tonicName()
+                                     + (source.scale == ScaleType::NaturalMinor && keyIsMinor ? " natural minor: "
+                                                                                               : (fromMinor ? " minor: " : " major: "));
 
         std::string feel;
-        if (fromMinor)
+        if (fromMinor && keyIsMinor && wrapDegree (parallelDegree) == 0)
+        {
+            // Natural-minor tonic chords inside another minor scale (Harmonic Minor's Am7, Locrian's Am).
+            feel = seventh ? "a softer, mellow minor-7th home" : "a steadier, darker home";
+        }
+        else if (fromMinor)
         {
             switch (wrapDegree (parallelDegree))
             {
@@ -232,7 +262,7 @@ namespace
             }
         }
 
-        return source + feel + ".";
+        return sourceName + feel + ".";
     }
 
     PaletteChord makePad (const Chord& chord, const Key& key, std::string hint)
@@ -251,36 +281,54 @@ namespace
     {
         using Q = ChordQuality;
 
-        // Major family (Major, Lydian, Mixolydian). In C major this yields
-        // Cadd9, Cmaj9, Csus2, Csus4, Dm9, Fmaj9, G7sus4, Am9.
+        // Major family (Major, Lydian, Mixolydian), most wanted first (the row is re-sorted by degree afterwards).
+        // C major:      Cadd9, Fadd9, F6, C6/9, Fmaj7#11, G13, Dm9, Cmaj9
+        // C Lydian:     Cmaj7#11, Cadd9, C6/9, G6/9, Dadd9, Cmaj9, Am9, Gsus4
+        // C Mixolydian: Cadd9, Fadd9, F6, C6/9, Fmaj9, Dm9, C13, Bbadd9
         static const std::vector<ColourSlot> major {
-            { 0, { Q::Add9 } },
-            { 0, { Q::Major9, Q::Dominant9 } },
+            { 0, { Q::Major7Sharp11 } },                          // Lydian's signature tonic (only diatonic there)
+            { 0, { Q::Add9 } },                                   // I(add9)
+            { 3, { Q::Add9 } },                                   // IV(add9) - the most used major-key colour
+            { 3, { Q::Major6 } },                                 // IV6
+            { 0, { Q::Major69 } },                                // I6/9
+            { 3, { Q::Major7Sharp11, Q::Major9 } },               // IVmaj7#11 - Lydian colour (Mixolydian: IVmaj9)
+            { 4, { Q::Dominant13, Q::Major69, Q::Add9 } },        // V13 (Lydian: V6/9)
+            { 1, { Q::Minor9, Q::Add9, Q::Dominant9 } },          // ii9 (Lydian: II(add9))
+            { 0, { Q::Major9, Q::Dominant13, Q::Dominant9 } },    // Imaj9 (Mixolydian: I13)
+            { 6, { Q::Add9, Q::Major69, Q::Major7Sharp11 } },     // Mixolydian bVII(add9)
+            { 5, { Q::Minor9, Q::Minor11, Q::MinorAdd9 } },       // vi9
+            { 4, { Q::Sus4, Q::Dominant7Sus4, Q::Major6 } },      // Vsus4
+            { 1, { Q::Minor11 } },                                // ii11
+            { 2, { Q::Minor9, Q::MinorAdd9 } },                   // iii9
+            { 4, { Q::Minor9, Q::Minor11 } },                     // Mixolydian v9
             { 0, { Q::Sus2 } },
-            { 0, { Q::Sus4 } },
-            { 1, { Q::Minor9, Q::Add9, Q::Dominant9, Q::MinorAdd9 } },
-            { 3, { Q::Major9, Q::Add9, Q::Minor9, Q::MinorAdd9 } },
-            { 4, { Q::Dominant7Sus4, Q::Sus4 } },
-            { 5, { Q::Minor9, Q::MinorAdd9 } },
-            { 6, { Q::Major9, Q::Add9 } },          // Mixolydian bVII
-            { 2, { Q::Minor9, Q::MinorAdd9 } },     // Lydian iii
-            { 3, { Q::Major6 } },
-            { 4, { Q::Dominant9 } },
+            { 3, { Q::Sus2 } },
         };
 
-        // Minor family (Natural/Harmonic/Melodic Minor, Dorian, Phrygian, Locrian). In A minor this yields
-        // Am(add9), Am9, Asus2, Asus4, Cadd9, Dm9, Fmaj9, Gadd9.
+        // Minor family (Natural/Harmonic/Melodic Minor, Dorian, Phrygian, Locrian), most wanted first.
+        // A minor:            Gadd9, Fadd9, G6, C6, Dm9, Am11, Fmaj7#11, Gsus4
+        // A Harmonic Minor:   E7b9, F6, Dm9, Am(add9), Fmaj7#11, Asus2, E7sus4, Dm6
+        // A Dorian:           Gadd9, G6, C6, D9, Am11, Gsus4, Cadd9, Am(add9)
+        // A Melodic Minor:    D9, Am(add9), Am6, E9, D6, Bm6, E7sus4, D6/9
         static const std::vector<ColourSlot> minor {
-            { 0, { Q::MinorAdd9 } },
-            { 0, { Q::Minor9, Q::Minor6 } },
+            { 4, { Q::Dominant7Flat9 } },                         // Harmonic minor's V7b9 (only diatonic there)
+            { 6, { Q::Add9, Q::Sus4, Q::Sus2 } },                 // VII(add9) - the most used minor-key colour
+            { 5, { Q::Add9, Q::Major9, Q::Major6 } },             // VI(add9)
+            { 6, { Q::Major6 } },                                 // VII6
+            { 2, { Q::Major6, Q::Add9 } },                        // III6
+            { 3, { Q::Minor9, Q::Minor11, Q::Dominant9, Q::MinorAdd9, Q::Add9 } },   // iv9 (Dorian / Melodic: IV9)
+            { 0, { Q::Minor11, Q::Minor9, Q::MinorAdd9 } },       // i11
+            { 5, { Q::Major7Sharp11, Q::Major9 } },               // VImaj7#11 - the Lydian VI of natural minor
+            { 6, { Q::Sus4 } },                                   // VIIsus4
+            { 2, { Q::Add9, Q::Major9, Q::Major69 } },            // III(add9)
+            { 0, { Q::MinorAdd9, Q::Minor6, Q::Sus2 } },          // i(add9) / Melodic Minor's i6
+            { 1, { Q::Major9, Q::Add9, Q::Major7Sharp11 } },      // Phrygian / Locrian bII
+            { 4, { Q::Minor9, Q::Minor11, Q::Dominant9, Q::Dominant7Sus4, Q::Sus4 } },   // v9 (Melodic Minor: V9)
+            { 3, { Q::Minor6, Q::Major6 } },                      // iv6 (Dorian / Melodic: IV6)
+            { 1, { Q::Minor9, Q::Minor11, Q::Minor6 } },          // Dorian ii9 / Melodic Minor ii6
+            { 4, { Q::Dominant7Sus4 } },                          // V7sus4
+            { 3, { Q::Major69 } },                                // Dorian / Melodic IV6/9
             { 0, { Q::Sus2 } },
-            { 0, { Q::Sus4 } },
-            { 2, { Q::Add9, Q::MinorAdd9, Q::Major9, Q::Minor9 } },
-            { 3, { Q::Minor9, Q::Dominant9, Q::MinorAdd9, Q::Add9 } },
-            { 5, { Q::Major9, Q::Add9, Q::Major6 } },
-            { 6, { Q::Add9, Q::Sus4, Q::Sus2 } },
-            { 1, { Q::Major9, Q::Add9 } },          // Phrygian / Locrian bII
-            { 4, { Q::Dominant7Sus4, Q::Sus4 } },
         };
 
         return minorFamily ? minor : major;
@@ -325,7 +373,7 @@ namespace
         static const ChordQuality fallbackQualities[] = {
             ChordQuality::Add9, ChordQuality::MinorAdd9, ChordQuality::Sus2, ChordQuality::Sus4,
             ChordQuality::Major9, ChordQuality::Minor9, ChordQuality::Dominant9, ChordQuality::Dominant7Sus4,
-            ChordQuality::Major6, ChordQuality::Minor6
+            ChordQuality::Major6, ChordQuality::Minor6, ChordQuality::Major69, ChordQuality::Minor11
         };
 
         for (int degree : fallbackDegrees)
@@ -345,66 +393,172 @@ namespace
     {
         struct Want
         {
-            int degree;    // degree in the parallel key
+            int degree;      // degree in the source key
             bool seventh;
+            bool natural;    // source: the natural minor on the key's tonic (instead of key.parallel())
         };
 
-        // Ordered by how common the chord is in pop / film music.
-        static const Want fromMinor[] = {   // major-family keys borrowing from the parallel minor
-            { 3, false }, { 6, false }, { 5, false }, { 2, false },   // iv, bVII, bVI, bIII
-            { 3, true },  { 5, true },  { 4, false }, { 0, false },   // iv7, bVImaj7, v, i
-            { 1, true },  { 6, true },  { 1, false }, { 2, true },    // iiø7, bVII7, ii°, bIIImaj7
-            { 4, true },  { 0, true },                                // v7, i7
+        // Major-family keys borrowing from the parallel minor, ordered by use in the data: bVI, bVII, iv, bIII,
+        // iv7, bVImaj7, v, i7, then the rest.
+        static const std::vector<Want> fromMinor {
+            { 5, false, false }, { 6, false, false }, { 3, false, false }, { 2, false, false },   // bVI, bVII, iv, bIII
+            { 3, true, false },  { 5, true, false },  { 4, false, false }, { 0, true, false },    // iv7, bVImaj7, v, i7
+            { 0, false, false }, { 1, true, false },  { 6, true, false },  { 1, false, false },   // i, iiø7, bVII7, ii°
+            { 2, true, false },  { 4, true, false },                                             // bIIImaj7, v7
         };
 
-        static const Want fromMajor[] = {   // minor-family keys borrowing from the parallel major
-            { 4, false }, { 3, false }, { 0, false }, { 4, true },    // V, IV, I, V7
-            { 1, false }, { 3, true },  { 6, false }, { 1, true },    // ii, IVmaj7, vii°, ii7
-            { 0, true },  { 5, false }, { 2, false }, { 6, true },    // Imaj7, vi, iii, viiø7
-            { 5, true },  { 2, true },                                // vi7, iii7
+        // Minor-family keys borrowing from the parallel major.
+        static const std::vector<Want> fromMajor {
+            { 4, false, false }, { 3, false, false }, { 0, false, false }, { 4, true, false },    // V, IV, I, V7
+            { 1, false, false }, { 3, true, false },  { 6, false, false }, { 1, true, false },    // ii, IVmaj7, vii°, ii7
+            { 0, true, false },  { 5, false, false }, { 2, false, false }, { 6, true, false },    // Imaj7, vi, iii, viiø7
+            { 5, true, false },  { 2, true, false },                                             // vi7, iii7
         };
+
+        // The other minor-family scales borrowing the natural-minor chords they lose, ordered by use in the data
+        // (VII 219, VI 168, III 110, VI(maj7) 99, i7 88, v 69, iv7 69, iv 68, v7 53, III(maj7) 23).
+        static const std::vector<Want> fromNatural {
+            { 6, false, true }, { 5, false, true }, { 2, false, true }, { 5, true, true },        // VII, VI, III, VImaj7
+            { 0, true, true },  { 4, false, true }, { 3, true, true },  { 3, false, true },       // i7, v, iv7, iv
+            { 4, true, true },  { 2, true, true },  { 6, true, true },  { 0, false, true },       // v7, IIImaj7, VII7, i
+            { 1, false, true }, { 1, true, true },                                               // ii°, iiø7
+        };
+
+        // Per-scale heads; whatever is left is filled from the generic lists above.
+        static const std::vector<Want> harmonicMinor {   // A: G, C, Am7, Em, Em7, Cmaj7, D, A
+            { 6, false, true }, { 2, false, true }, { 0, true, true },  { 4, false, true },
+            { 4, true, true },  { 2, true, true },  { 3, false, false }, { 0, false, false },
+        };
+        static const std::vector<Want> dorian {          // A: E, F, Dm, A, E7, Fmaj7, Dm7, Dmaj7
+            { 4, false, false }, { 5, false, true }, { 3, false, true }, { 0, false, false },
+            { 4, true, false },  { 5, true, true },  { 3, true, true },  { 3, true, false },
+        };
+        static const std::vector<Want> phrygian {        // A: E, G, D, Em, A, E7, Em7, Cmaj7
+            { 4, false, false }, { 6, false, true }, { 3, false, false }, { 4, false, true },
+            { 0, false, false }, { 4, true, false }, { 4, true, true },   { 2, true, true },
+        };
+        static const std::vector<Want> locrian {         // A: Am, E, G, C, Em, D, Am7, A
+            { 0, false, true }, { 4, false, false }, { 6, false, true }, { 2, false, true },
+            { 4, false, true }, { 3, false, false }, { 0, true, true },  { 0, false, false },
+        };
+
+        std::vector<const std::vector<Want>*> lists;
+        if (! scaleInfo (key.scale).isMinorFamily)
+        {
+            lists = { &fromMinor };
+        }
+        else
+        {
+            switch (key.scale)
+            {
+                case ScaleType::HarmonicMinor: lists = { &harmonicMinor }; break;
+                case ScaleType::MelodicMinor:  lists = { &fromNatural }; break;   // A: G, F, C, Fmaj7, Am7, Em, Dm7, Dm
+                case ScaleType::Dorian:        lists = { &dorian }; break;
+                case ScaleType::Phrygian:      lists = { &phrygian }; break;
+                case ScaleType::Locrian:       lists = { &locrian }; break;
+                default:                       break;
+            }
+            lists.push_back (&fromMajor);
+            if (key.scale != ScaleType::NaturalMinor)
+                lists.push_back (&fromNatural);
+        }
 
         const Key par = key.parallel();
-        const bool parallelIsMinor = scaleInfo (par.scale).isMinorFamily;
+        const Key natural { key.tonic, ScaleType::NaturalMinor };
 
         std::vector<PaletteChord> pads;
-        for (auto& w : parallelIsMinor ? fromMinor : fromMajor)
-        {
-            if ((int) pads.size() >= kMaxPadsPerSection)
-                break;
+        for (auto* list : lists)
+            for (auto& w : *list)
+            {
+                if ((int) pads.size() >= kMaxPadsPerSection)
+                    return pads;
 
-            const Chord c = diatonicChord (par, w.degree, w.seventh);
-            if (isDiatonic (c, key) || contains (pads, c))
-                continue;
+                const Key& source = w.natural ? natural : par;
+                const Chord c = diatonicChord (source, w.degree, w.seventh);
+                if (isDiatonic (c, key) || contains (pads, c))
+                    continue;
 
-            pads.push_back (makePad (c, key, borrowedHint (key, w.degree, w.seventh, names)));
-        }
+                pads.push_back (makePad (c, key, borrowedHint (key, source, w.degree, w.seventh, names)));
+            }
         return pads;
     }
 
     //==========================================================================
+    constexpr int kMaxSecondaryPads = 6;   // Palette.h: "up to 6 secondary dominants"
+
     std::vector<PaletteChord> buildSecondary (const Key& key, const std::vector<PaletteSection>& earlier)
     {
         const auto pcs = key.pitchClasses();
-        std::vector<PaletteChord> pads;
 
-        for (int target = 1; target < 7 && (int) pads.size() < kMaxPadsPerSection; ++target)
+        struct Pick
         {
-            // Diminished targets are excluded by definition; augmented ones (III+ of harmonic / melodic minor) are
-            // skipped too - "pulls strongly to Ebaug" is not a move anyone wants suggested.
-            const Chord targetChord = diatonicChord (key, target, false);
-            if (targetChord.quality == ChordQuality::Diminished || targetChord.quality == ChordQuality::Augmented)
-                continue;
+            PaletteChord pad;
+            int target;
+            bool variant;
+        };
 
-            const Chord c { pc (pcs[(size_t) target] + 7), ChordQuality::Dominant7 };
-            if (harmonicFunction (c, key) != HarmonicFunction::Secondary || containsAnywhere (earlier, c) || contains (pads, c))
-                continue;
+        std::vector<Pick> picks;
+        auto isNew = [&] (const Chord& c)
+        {
+            if (containsAnywhere (earlier, c))
+                return false;
+            for (auto& p : picks)
+                if (p.pad.chord == c)
+                    return false;
+            return true;
+        };
 
-            const auto targetName = targetChord.name (key);
-            const auto hint = "Pulls strongly to " + targetName + " (" + romanNumeral (targetChord, key, false)
-                            + ") - bright, chromatic momentum.";
-            pads.push_back (makePad (c, key, hint));
-        }
+        // Pass 1: V7/x for every usable target. Pass 2 (minor-family keys only): the darker V7b9/x where it is
+        // idiomatic - the target is a minor chord (A minor: A7b9 -> Dm) or the b9 is a scale tone (B7b9 -> Em / E,
+        // whose b9 C belongs to A minor). Plain V7s always win the limited room.
+        const bool minorKey = scaleInfo (key.scale).isMinorFamily;
+
+        for (int pass = 0; pass < (minorKey ? 2 : 1); ++pass)
+            for (int target = 1; target < 7 && (int) picks.size() < kMaxSecondaryPads; ++target)
+            {
+                // Diminished targets are excluded by definition; augmented ones (III+ of harmonic / melodic minor) are
+                // skipped too - "pulls strongly to Ebaug" is not a move anyone wants suggested.
+                const Chord targetChord = diatonicChord (key, target, false);
+                if (targetChord.quality == ChordQuality::Diminished || targetChord.quality == ChordQuality::Augmented)
+                    continue;
+
+                const int root = pc (pcs[(size_t) target] + 7);
+                const bool variant = pass == 1;
+
+                if (variant)
+                {
+                    const bool minorTarget = targetChord.quality == ChordQuality::Minor;
+                    const bool flatNineInKey = key.contains (root + 1);
+                    if (! minorTarget && ! flatNineInKey)
+                        continue;
+
+                    // Only next to its plain V7 (so the row never shows a 7b9 without its V7).
+                    bool havePlain = false;
+                    for (auto& p : picks)
+                        havePlain = havePlain || (p.target == target && ! p.variant);
+                    if (! havePlain)
+                        continue;
+                }
+
+                const Chord c { root, variant ? ChordQuality::Dominant7Flat9 : ChordQuality::Dominant7 };
+                if (harmonicFunction (c, key) != HarmonicFunction::Secondary || ! isNew (c))
+                    continue;
+
+                const auto targetLabel = targetChord.name (key) + " (" + romanNumeral (targetChord, key, false) + ")";
+                const auto hint = variant ? "A darker, dramatic pull into " + targetLabel + " - the b9 adds bite."
+                                          : "Pulls strongly to " + targetLabel + " - bright, chromatic momentum.";
+                picks.push_back ({ makePad (c, key, hint), target, variant });
+            }
+
+        // Target-degree order, each 7b9 right after its V7.
+        std::stable_sort (picks.begin(), picks.end(), [] (const Pick& a, const Pick& b)
+        {
+            return a.target != b.target ? a.target < b.target : (! a.variant && b.variant);
+        });
+
+        std::vector<PaletteChord> pads;
+        for (auto& p : picks)
+            pads.push_back (std::move (p.pad));
         return pads;
     }
 } // namespace

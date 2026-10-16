@@ -143,10 +143,20 @@ public:
     double getPlaybackBeat() const noexcept;     // any thread: position inside the loop in beats (valid while playing)
     double getHostBpm() const noexcept;          // any thread: last host tempo, 120 when unknown
 
+    // Any thread (added in round 2). While the host plays, a backward host jump onto the loop start / a bar line by a
+    // whole number of bars shorter than the progression (e.g. FL Studio's pattern mode with a 1-bar pattern under a
+    // 4-bar progression) is treated as a host loop: the progression keeps running across it instead of restarting.
+    // Returns that host loop length in beats while such loops are being seen (0 = none since the transport started).
+    // The lane can show "FL pattern is N bars, progression is M bars".
+    double getHostLoopBeats() const noexcept;
+
     //==============================================================================
     // Live display (any thread)
     std::bitset<128> getSoundingNotes() const noexcept;   // notes currently on from any source (preview, playback, live input)
     int getTriggeredDegree() const noexcept;              // chord-trigger mode: degree 0..6 being held, -1 when none
+    // (Added in round 2, B26.) Message thread: the exact MIDI notes the held chord-trigger key is playing (voice-led and
+    // octave-shifted as sent), ascending; empty when no chord-trigger key is held.
+    std::vector<int> getTriggeredNotes() const;
 
     //==============================================================================
     // MIDI export
@@ -155,6 +165,11 @@ public:
     // "Chordbloom - C Major - Chords.mid". Returns the file, or File() when the progression is empty / on failure.
     juce::File writeMidiToTempFile (ExportPart) const;
     bool saveMidiFile (const juce::File& destination, ExportPart) const;
+
+    // (Added in round 2.) The file name writeMidiToTempFile uses, built from the progression, e.g.
+    // "Am F C G - A minor - Chords.mid" (at most 60 characters, '#' kept, no characters Windows forbids). Use it as
+    // the default name of a Save dialog too. "Chordbloom - <key> - <part>.mid" when the progression is empty.
+    juce::String getExportFileName (ExportPart) const;
 
     // Single-chord drags (pad or lane block dragged straight out of the plugin into FL). Writes one chord as a short
     // clip into <temp>/Chordbloom/ using the current voicing/render settings; returns File() on failure.
@@ -172,6 +187,19 @@ public:
     // Editor size persistence (stored in the plugin state)
     juce::Point<int> getSavedEditorSize() const;   // {0,0} when never saved
     void setSavedEditorSize (juce::Point<int>);
+
+    //==============================================================================
+    // User defaults (added in round 2): a freshly created instance starts with the key, scale and preview tone the
+    // user last picked in the editor (stored in <user app data>/Chordbloom/Chordbloom Defaults.settings). A loaded
+    // project state always wins. Test hook: redirect the settings file; File() disables the feature. The plugin uses
+    // the default location; the dev tool (CHORDBLOOM_DEV_TOOL) has it disabled unless a file is set here.
+    static void setUserDefaultsFile (const juce::File&);
+
+    // (Added by the integrator, round 2.) Message thread: the user just picked the key, scale or preview tone in the
+    // editor's menus - remember the resulting key / scale / tone as the defaults (written ~0.3 s later, once the pick
+    // has reached the parameters). Nothing else records defaults: host automation, presets, state loads, undo and
+    // validators that move parameters while the editor is open are ignored.
+    void rememberUserDefaults();
 
 private:
     struct Impl;

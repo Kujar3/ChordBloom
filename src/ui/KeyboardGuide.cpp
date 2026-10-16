@@ -57,11 +57,16 @@ struct KeyboardGuide::Impl : private juce::Timer
         void paint (juce::Graphics& g) override { d.paintKeys (g); }
         void mouseMove (const juce::MouseEvent& e) override { d.setHover (d.noteAt (e.position)); }
         void mouseExit (const juce::MouseEvent&) override { d.setHover (-1); }
-        void mouseDown (const juce::MouseEvent& e) override { d.press (d.noteAt (e.position)); }
+        // Right-click (FL users expect a menu) never plays a note.
+        void mouseDown (const juce::MouseEvent& e) override
+        {
+            if (! e.mods.isPopupMenu())
+                d.press (d.noteAt (e.position));
+        }
 
         void mouseDrag (const juce::MouseEvent& e) override
         {
-            if (getLocalBounds().toFloat().contains (e.position))
+            if (! e.mods.isPopupMenu() && getLocalBounds().toFloat().contains (e.position))
                 d.press (d.noteAt (e.position));
         }
 
@@ -74,6 +79,9 @@ struct KeyboardGuide::Impl : private juce::Timer
     {
         keys.setTooltip ("Harmonic guide. Dots mark the scale (green dot = tonic), coloured keys show the current chord "
                          "and glowing keys are sounding. Click a key to hear it.");
+        keys.setTitle ("Keyboard guide");
+        keys.setDescription ("Shows the scale, the current chord and the sounding notes. Click a key to hear it.");
+        owner.setTitle ("Harmonic guide");
         owner.addAndMakeVisible (keys);
         key = processor.getKey();
         voicing = processor.getVoicingSettings();
@@ -127,6 +135,20 @@ struct KeyboardGuide::Impl : private juce::Timer
                 chordMask[(size_t) cb::pc (p)] = true;
 
         chordColour = chord.has_value() ? cb::ui::functionColour (cb::harmonicFunction (*chord, key)) : Col::tonic;
+
+        // Accessible summary of what the guide shows.
+        {
+            juce::StringArray noteNames;
+
+            if (chord.has_value())
+                for (const auto& toneName : cb::chordToneNames (*chord, key))   // B12: D7 = D F# A C, not D Gb A C
+                    noteNames.add (juce::String (toneName));
+
+            keys.setHelpText (chord.has_value() ? "Chord " + juce::String (chord->name (key)) + " ("
+                                                      + juce::String (cb::romanNumeral (*chord, key)) + "): "
+                                                      + noteNames.joinIntoString (" ")
+                                                : "Key " + juce::String (key.name()));
+        }
 
         updateRange();
         owner.repaint();
@@ -460,20 +482,23 @@ struct KeyboardGuide::Impl : private juce::Timer
         // Chord (or key) summary (left)
         juce::String name, detail;
         juce::Colour nameColour = Col::text;
-        std::vector<int> pcs;
+        juce::StringArray noteNames;
 
         if (chord.has_value())
         {
             name = chord->name (key);
             detail = cb::romanNumeral (*chord, key);
             nameColour = chordColour;
-            pcs = chord->pitchClasses();
+
+            for (const auto& toneName : cb::chordToneNames (*chord, key))   // B12: chord-relative spelling
+                noteNames.add (juce::String (toneName));
         }
         else
         {
             name = key.name();
-            const auto scalePcs = key.pitchClasses();
-            pcs.assign (scalePcs.begin(), scalePcs.end());
+
+            for (int p : key.pitchClasses())
+                noteNames.add (juce::String (key.spell (cb::pc (p))));
         }
 
         auto a = area.toFloat();
@@ -493,11 +518,6 @@ struct KeyboardGuide::Impl : private juce::Timer
             g.setColour (Col::textDim);
             g.drawText (detail, a.removeFromLeft (w), juce::Justification::centredLeft, true);
         }
-
-        juce::StringArray noteNames;
-
-        for (int p : pcs)
-            noteNames.add (juce::String (key.spell (cb::pc (p))));
 
         const auto notes = noteNames.joinIntoString (juce::String (juce::CharPointer_UTF8 ("  \xc2\xb7  ")));
         const float notesW = cb::ui::textWidth (smallFont, notes);
