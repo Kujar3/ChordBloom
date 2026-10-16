@@ -1,0 +1,30 @@
+CHORDBLOOM - QUICK START
+========================
+
+Chordbloom is installed. In FL Studio:
+
+1. Options > Manage plugins > "Find installed plugins" (or "Start scan").
+2. Channel Rack "+" > Chordbloom (pick the VST3 version).
+3. Click a chord pad - you'll hear Chordbloom's built-in sound.
+
+BUILD A PROGRESSION
+- Double-click pads (or drag them) into the Progression lane, then press Play.
+- No idea where to start? Click "Spark" for a fresh progression, or "Presets".
+- Glowing pads = chords that sound good next. Right-click a chord in the lane
+  for more options (change chord, length, inversion, delete...).
+
+PLAY IT ON YOUR OWN SYNTH (e.g. Omnisphere)
+- Chordbloom wrapper: gear icon > MIDI > Output port = 1
+- Your synth's wrapper: MIDI > Input port = 1
+- Click the speaker icon in Chordbloom's top bar to mute its built-in sound,
+  otherwise you hear both.
+
+GET THE MIDI INTO YOUR PROJECT
+- Drag the "Chords", "Bass" or "Both" chips (bottom right) onto the playlist
+  or piano roll - or drag a single pad / chord straight out of the plugin.
+- Then switch off "Play with FL" so the chords don't play twice.
+
+The "?" button in the top-right corner of the plugin shows all of this again.
+
+Also installed: a Standalone Chordbloom app (Start menu) for playing around
+without FL.
