@@ -37,6 +37,7 @@ namespace cb::ParamIDs
     inline constexpr const char* scaleLock       = "scaleLock";       // bool: snap incoming MIDI notes to the scale  default false
     inline constexpr const char* chordTrigger    = "chordTrigger";    // bool: incoming white keys C..B play degree chords 1..7  default false
     inline constexpr const char* triggerSevenths = "triggerSevenths"; // bool: chord trigger uses seventh chords   default false
+    inline constexpr const char* midiOutPart     = "midiOutPart";     // choice: "Chords + Bass", "Chords only", "Bass only" (filters playback MIDI out; previews/live input count as chords)  default Chords + Bass
 }
 
 //==============================================================================
@@ -154,6 +155,18 @@ public:
     // "Chordbloom - C Major - Chords.mid". Returns the file, or File() when the progression is empty / on failure.
     juce::File writeMidiToTempFile (ExportPart) const;
     bool saveMidiFile (const juce::File& destination, ExportPart) const;
+
+    // Single-chord drags (pad or lane block dragged straight out of the plugin into FL). Writes one chord as a short
+    // clip into <temp>/Chordbloom/ using the current voicing/render settings; returns File() on failure.
+    juce::File writeChordMidiToTempFile (const cb::Chord&) const;   // one 4-beat chord, voiced like a pad preview
+    juce::File writeSlotMidiToTempFile (int slotIndex) const;        // that slot's events (its voicing), shifted to beat 0
+
+    //==============================================================================
+    // Transpose every slot's root by `semitones` (undoable, sendChangeMessage). Used by the lane's "Move chords to key"
+    // pill and its Transpose menu. bestTranspositionForKey() = the shift in -5..+6 that makes the most slots diatonic
+    // in the current key (0 when the current placement is already best or the progression is empty).
+    void transposeProgression (int semitones);
+    int bestTranspositionForKey() const;
 
     //==============================================================================
     // Editor size persistence (stored in the plugin state)

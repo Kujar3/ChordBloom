@@ -163,6 +163,11 @@ const char* qualitySuffix (ChordQuality q)
         case ChordQuality::Major9:          return "maj9";
         case ChordQuality::Minor9:          return "m9";
         case ChordQuality::Dominant9:       return "9";
+        case ChordQuality::Minor11:         return "m11";
+        case ChordQuality::Major69:         return "6/9";
+        case ChordQuality::Dominant13:      return "13";
+        case ChordQuality::Major7Sharp11:   return "maj7#11";
+        case ChordQuality::Dominant7Flat9:  return "7b9";
         case ChordQuality::NumQualities:    break;
     }
     return "";
@@ -191,7 +196,13 @@ const std::vector<int>& qualityIntervals (ChordQuality q)
         { 0, 4, 7, 11, 14 },  // Major9
         { 0, 3, 7, 10, 14 },  // Minor9
         { 0, 4, 7, 10, 14 },  // Dominant9
+        { 0, 3, 7, 10, 14, 17 },  // Minor11
+        { 0, 4, 7, 9, 14 },       // Major69
+        { 0, 4, 7, 10, 14, 21 },  // Dominant13
+        { 0, 4, 7, 11, 18 },      // Major7Sharp11
+        { 0, 4, 7, 10, 13 },      // Dominant7Flat9
     };
+    static_assert (sizeof (table) / sizeof (table[0]) == (size_t) numChordQualities, "qualityIntervals table out of sync");
 
     const int index = std::clamp ((int) q, 0, numChordQualities - 1);
     return table[index];

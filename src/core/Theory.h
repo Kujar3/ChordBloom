@@ -98,6 +98,12 @@ enum class ChordQuality
     Major9,           // 0 4 7 11 14    "maj9"
     Minor9,           // 0 3 7 10 14    "m9"
     Dominant9,        // 0 4 7 10 14    "9"
+    // Extended colours (appended in round 2; enum values are stored in plugin state, so only ever append)
+    Minor11,          // 0 3 7 10 14 17 "m11"
+    Major69,          // 0 4 7 9 14     "6/9"
+    Dominant13,       // 0 4 7 10 14 21 "13"
+    Major7Sharp11,    // 0 4 7 11 18    "maj7#11"
+    Dominant7Flat9,   // 0 4 7 10 13    "7b9"
     NumQualities
 };
 

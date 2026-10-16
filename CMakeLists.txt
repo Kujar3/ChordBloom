@@ -22,7 +22,8 @@ set(CB_CORE_SOURCES
     src/core/Suggest.cpp
     src/core/Voicing.cpp
     src/core/Pattern.cpp
-    src/core/Progression.cpp)
+    src/core/Progression.cpp
+    src/core/Generate.cpp)
 
 set(CB_PLUGIN_SOURCES
     src/plugin/PluginProcessor.cpp
@@ -95,6 +96,7 @@ add_executable(CoreTests
     tests/CoreTestsMain.cpp
     tests/TheoryTests.cpp
     tests/VoicingPatternTests.cpp
+    tests/GenerateTests.cpp
     ${CB_CORE_SOURCES})
 target_include_directories(CoreTests PRIVATE src tests)
 if(MSVC)

@@ -72,6 +72,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
     layout.add (std::make_unique<AudioParameterBool> (pid (id::scaleLock), "Scale Lock", false));
     layout.add (std::make_unique<AudioParameterBool> (pid (id::chordTrigger), "Chord Trigger", false));
     layout.add (std::make_unique<AudioParameterBool> (pid (id::triggerSevenths), "Trigger Sevenths", false));
+    layout.add (std::make_unique<AudioParameterChoice> (pid (id::midiOutPart), "MIDI Out Part",
+        StringArray { "Chords + Bass", "Chords only", "Bass only" }, 0));
     return layout;
 }
 
@@ -2095,6 +2097,12 @@ void ChordbloomProcessor::setSavedEditorSize (juce::Point<int> size)
     impl->editorW.store (size.x);
     impl->editorH.store (size.y);
 }
+
+// STUBS (round 2) - to be implemented by the processor agent
+juce::File ChordbloomProcessor::writeChordMidiToTempFile (const cb::Chord&) const { return {}; }
+juce::File ChordbloomProcessor::writeSlotMidiToTempFile (int) const { return {}; }
+void ChordbloomProcessor::transposeProgression (int) {}
+int ChordbloomProcessor::bestTranspositionForKey() const { return 0; }
 
 #if ! CHORDBLOOM_DEV_TOOL
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter() { return new ChordbloomProcessor(); }
