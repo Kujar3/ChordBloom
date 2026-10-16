@@ -7,7 +7,7 @@ result into FL Studio as MIDI.
 
 VST3 + CLAP + Standalone, Windows, built with JUCE 8.
 
-![Chordbloom](out/snapshots-final/03b_f_minor_extended.png)
+![Chordbloom](docs/screenshot.png)
 
 ## Install
 
