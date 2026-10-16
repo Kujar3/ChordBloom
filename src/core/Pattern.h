@@ -1,0 +1,86 @@
+#pragma once
+
+// Rhythm patterns: rendering a voiced progression into timed note events (in beats). Pure C++17, no JUCE.
+
+#include "Progression.h"
+
+namespace cb
+{
+
+enum class RhythmPattern
+{
+    Block = 0,   // whole chord held for the slot (gate applies to the slot length)
+    Strum,       // like Block, notes staggered upward by 0.03 beats each
+    Pulse,       // whole chord retriggered every rate step
+    Offbeat,     // whole chord on the off-beat half of every beat (the "&"), length = gate * half a beat
+    ArpUp,       // one note per rate step, low -> high, repeating
+    ArpDown,     // high -> low
+    ArpUpDown,   // low -> high -> low without repeating the turnaround notes (1 2 3 4 3 2 | 1 2 ...)
+    Broken,      // lowest note on each beat, remaining notes together on the following rate step(s) within the beat
+    NumPatterns
+};
+
+constexpr int numRhythmPatterns = (int) RhythmPattern::NumPatterns;
+const char* rhythmPatternName (RhythmPattern);   // "Block", "Strum", "Pulse", "Offbeat", "Arp Up", "Arp Down", "Arp Up/Down", "Broken"
+
+enum class BassMode
+{
+    Off = 0,     // no bass events
+    Root,        // chord root held for the slot
+    RootFifth,   // root and fifth (above the root) alternating every beat, starting with the root
+    Octaves,     // root alternating low/high octave every rate step
+    Pulse,       // root retriggered every rate step
+    NumModes
+};
+
+constexpr int numBassModes = (int) BassMode::NumModes;
+const char* bassModeName (BassMode);   // "Off", "Root", "Root + 5th", "Octaves", "Pulse"
+
+enum class RateDivision
+{
+    Quarter = 0,    // 1 beat
+    Eighth,         // 1/2 beat
+    Sixteenth,      // 1/4 beat
+    EighthTriplet,  // 1/3 beat
+    NumRates
+};
+
+constexpr int numRateDivisions = (int) RateDivision::NumRates;
+const char* rateDivisionName (RateDivision);   // "1/4", "1/8", "1/16", "1/8T"
+double rateInBeats (RateDivision);
+
+struct RenderSettings
+{
+    RhythmPattern pattern = RhythmPattern::Block;
+    RateDivision rate = RateDivision::Eighth;
+    BassMode bass = BassMode::Root;
+    float velocity = 0.75f;   // 0..1, base velocity for chord notes (bass uses the same)
+    float gate = 0.9f;        // 0.05..1, fraction of each step (or of the slot for Block/Strum) a note sounds
+    float swing = 0.0f;       // 0..1, delays every second rate step by swing * stepLength / 3 (1.0 = triplet shuffle)
+    float humanize = 0.0f;    // 0..1, deterministic jitter (hash of slot/step/note, never std::rand):
+                              //   timing up to +-0.015 * humanize beats (never before 0, never across the slot end),
+                              //   velocity up to +-0.12 * humanize
+};
+
+struct NoteEvent
+{
+    int note = 60;              // MIDI note 0..127
+    float velocity = 0.75f;     // 0..1 (never 0)
+    double startBeat = 0.0;     // from the start of the progression
+    double lengthBeats = 1.0;   // > 0
+    int channel = 1;            // 1 = chords, 2 = bass (MIDI channels)
+
+    bool operator== (const NoteEvent& o) const
+    {
+        return note == o.note && velocity == o.velocity && startBeat == o.startBeat
+            && lengthBeats == o.lengthBeats && channel == o.channel;
+    }
+};
+
+// Renders one loop of the progression. voicings[i] are the notes for progression.slots[i] (as from voiceProgression).
+// Bass notes: the chord root placed in the octave whose note is in [lowest voicing note - 12, lowest voicing note - 1],
+// then clamped into [28, 55] by octaves. No event extends past its slot's end. Result sorted by (startBeat, channel, note).
+std::vector<NoteEvent> renderProgression (const Progression&, const std::vector<std::vector<int>>& voicings,
+                                          const RenderSettings&);
+
+} // namespace cb

@@ -1,0 +1,7 @@
+build*/
+third_party/
+tools/pluginval/
+out/
+*.user
+.vs/
+build_log.txt
