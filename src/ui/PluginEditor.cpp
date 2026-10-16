@@ -133,6 +133,10 @@ ChordbloomEditor::~ChordbloomEditor()
 {
     stopTimer();
     processor.removeChangeListener (this);
+
+    // Every audition (pad, lane block, keyboard key, timed "Change to" preview) is started from this window: closing
+    // it must never leave preview notes held on the built-in synth or the routed instrument (F1).
+    processor.stopPreview();
     juce::PopupMenu::dismissAllActiveMenus();
 
     tooltipWindow.reset();
@@ -232,7 +236,7 @@ void ChordbloomEditor::timerCallback()
     if (externalDropPending && ! juce::ModifierKeys::getCurrentModifiersRealtime().isAnyMouseButtonDown())
     {
         externalDropPending = false;
-        exportPanel->showPlaysAlongHint();
+        exportPanel->notifyExternalDragFinished();   // no hint when the drag ended back inside the plug-in window (F12)
     }
 
     // Once a second: make sure no widget created since (inline buttons, pills) can take keyboard focus.

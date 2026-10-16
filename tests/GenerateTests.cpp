@@ -696,3 +696,54 @@ TEST_CASE ("spark: moods have their character")
     auto emoMinor = run (a, Mood::Emotional, anyChord, any, offsetIn (a, { 0, 8 }));
     CHECK (emoMinor.openers * 10 >= emoMinor.progs * 8);
 }
+
+TEST_CASE ("spark: Locrian uses its own diminished tonic")
+{
+    int progs = 0, withHome = 0, openOnHome = 0;
+    for (int t = 0; t < 12; ++t)
+    {
+        const Key k { t, ScaleType::Locrian };
+        const auto p = cb::buildPalette (k);
+        for (int m = 0; m < cb::numMoods; ++m)
+            for (std::uint32_t seed = 1; seed <= 40; ++seed)
+            {
+                const auto prog = cb::sparkProgression (k, p, seed, spark ((Mood) m));
+                REQUIRE (! prog.empty());
+                ++progs;
+                bool home = false;
+                for (auto& slot : prog.slots)
+                    home = home || (offsetOf (slot.chord, k) == 0 && cb::isDiatonic (slot.chord, k));
+                withHome += home ? 1 : 0;
+                openOnHome += offsetOf (prog.slots.front().chord, k) == 0 && cb::isDiatonic (prog.slots.front().chord, k) ? 1 : 0;
+            }
+    }
+    // Before the fix: the diatonic i° / iø7 opened 0 of 200 progressions and appeared in at most 8%.
+    CHECK (withHome * 10 >= progs * 4);
+    CHECK (openOnHome * 10 >= progs * 2);
+}
+
+TEST_CASE ("presets: Locrian presets mostly sit on the diminished home")
+{
+    for (int t = 0; t < 12; ++t)
+    {
+        const Key k { t, ScaleType::Locrian };
+        const auto presets = cb::presetsFor (k);
+        CHECK (presets.size() >= 12 && presets.size() <= 20);
+        size_t onHome = 0, borrowedTonic = 0;
+        for (auto& p : presets)
+        {
+            bool home = false, borrowed = false;
+            for (auto& slot : p.progression.slots)
+            {
+                home = home || (offsetOf (slot.chord, k) == 0 && cb::isDiatonic (slot.chord, k));
+                borrowed = borrowed || (offsetOf (slot.chord, k) == 0 && ! cb::isDiatonic (slot.chord, k));
+            }
+            onHome += home ? 1 : 0;
+            borrowedTonic += borrowed ? 1 : 0;
+            if (borrowed)
+                CHECK (p.description.find ("(borrowed minor i)") != std::string::npos);
+        }
+        CHECK (onHome * 2 > presets.size());          // was 5 of 20
+        CHECK (borrowedTonic <= 6);
+    }
+}

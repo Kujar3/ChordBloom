@@ -5,6 +5,7 @@
 #include "core/Theory.h"
 
 #include <algorithm>
+#include <map>
 #include <set>
 
 // Tests for Theory / Palette / Suggest (owner: core-theory agent)
@@ -643,6 +644,26 @@ TEST_CASE ("palette: colour pads are diatonic, new, and in degree order")
 }
 
 // Round 2 (B13, intentional change): minor-family scales other than Natural Minor also borrow from the natural minor.
+TEST_CASE ("palette: the colour row spreads over its roots")
+{
+    for (auto& k : allKeys())
+    {
+        const auto pal = cb::buildPalette (k);
+        const auto& colour = pal[(size_t) cb::PaletteSectionId::Color].chords;
+        std::map<int, int> perRoot;
+        for (auto& pad : colour)
+            ++perRoot[cb::pc (pad.chord.root)];
+        for (auto& kv : perRoot)
+            CHECK (kv.second <= 4);   // Lydian's curated tonic colours (maj7#11 add9 6/9 maj9) are the most on one root
+        if (k.scale == ScaleType::Locrian)
+        {
+            CHECK (colour.size() >= 6);
+            for (auto& kv : perRoot)
+                CHECK (kv.second <= 2);   // B Locrian used to show five F chords
+        }
+    }
+}
+
 TEST_CASE ("palette: borrowed pads come from the parallel key or, in altered minor scales, the natural minor")
 {
     for (auto& k : allKeys())
@@ -1186,6 +1207,51 @@ TEST_CASE ("b12: palette chords spell as stacked letters with single accidentals
                     for (size_t i = 0; i < pcs.size(); ++i)
                         CHECK_EQ (tones[i], k.spell (pcs[i]));
             }
+    }
+}
+
+TEST_CASE ("spelling: the raised leading tone of a minor key keeps its 7th-degree letter")
+{
+    using V = std::vector<std::string>;
+    const auto cSharpMinor = key (Cs, ScaleType::NaturalMinor);
+    CHECK_EQ (ch (C, Q::Diminished).name (cSharpMinor), std::string ("B#dim"));   // was "Cdim" = C Eb Gb
+    CHECK_EQ (cb::chordToneNames (ch (C, Q::Diminished), cSharpMinor), (V { "B#", "D#", "F#" }));
+    CHECK_EQ (cb::chordToneNames (ch (F_, Q::Diminished), key (Fs, ScaleType::NaturalMinor)), (V { "E#", "G#", "B" }));
+    CHECK_EQ (cb::chordToneNames (ch (Gs, Q::Dominant7), cSharpMinor), (V { "G#", "B#", "D#", "F#" }));
+    CHECK_EQ (ch (C, Q::Diminished7).name (key (Cs, ScaleType::HarmonicMinor)), std::string ("B#dim7"));
+    // Single out-of-key notes still avoid E# / B# (the keyboard guide's note names), and so do chords that would need
+    // a double accidental on the leading-tone letter (E# major = E# G## B#).
+    CHECK_EQ (cSharpMinor.spell (C), std::string ("C"));
+    CHECK_EQ (ch (F_, Q::Major).name (key (Fs, ScaleType::NaturalMinor)), std::string ("F"));
+    CHECK_EQ (ch (C, Q::Major).name (cSharpMinor), std::string ("C"));
+    CHECK_EQ (ch (C, Q::Minor7).name (cSharpMinor), std::string ("Cm7"));
+    CHECK_EQ (ch (F_, Q::HalfDiminished7).name (key (Fs, ScaleType::NaturalMinor)), std::string ("E#m7b5"));
+    // Flat minor keys are unchanged.
+    CHECK_EQ (ch (D, Q::Diminished).name (key (Eb, ScaleType::NaturalMinor)), std::string ("Ddim"));
+    CHECK_EQ (ch (E, Q::Diminished).name (key (F_, ScaleType::NaturalMinor)), std::string ("Edim"));
+
+    // Every minor-family key: the vii° chord on the raised leading tone spells the same in natural and harmonic minor
+    // whenever its letter needs only a single accidental, and then its tones stack on letters a third apart.
+    static const char letters[] = { 'C', 'D', 'E', 'F', 'G', 'A', 'B' };
+    for (int t = 0; t < 12; ++t)
+    {
+        const auto nat = key (t, ScaleType::NaturalMinor);
+        const auto harm = key (t, ScaleType::HarmonicMinor);
+        const Chord vii = ch (t + 11, Q::Diminished);
+        const char tonicLetter = nat.tonicName()[0];
+        int li = 0;
+        while (letters[li] != tonicLetter)
+            ++li;
+        const char expected = letters[(li + 6) % 7];
+        const auto harmName = vii.name (harm);
+        if (harmName[0] != expected)
+            continue;   // would need a double accidental (G# minor's F##)
+        CHECK_EQ (vii.name (nat), harmName);
+        const auto tones = cb::chordToneNames (vii, nat);
+        REQUIRE (tones.size() == 3);
+        CHECK_EQ (tones[0][0], expected);
+        CHECK_EQ (tones[1][0], letters[(li + 6 + 2) % 7]);
+        CHECK_EQ (tones[2][0], letters[(li + 6 + 4) % 7]);
     }
 }
 

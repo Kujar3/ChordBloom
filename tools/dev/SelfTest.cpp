@@ -175,6 +175,7 @@ struct Rig
         else
             p.processBlock (buffer, midi);
 
+        lastOut = midi;
         auto out = record (midi);
 
         for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
@@ -219,6 +220,10 @@ struct Rig
             {
                 ++numOtherEvents;
                 lastOthers.push_back (msg);
+                if (msg.isController() && msg.getControllerNumber() == 64)
+                    pedal[msg.getChannel()] = msg.getControllerValue() >= 64;
+                else if (msg.isController() && msg.getControllerNumber() == 121)
+                    pedal[msg.getChannel()] = false;
                 continue;
             }
 
@@ -276,6 +281,14 @@ struct Rig
         return n;
     }
 
+    int pedalsDown() const
+    {
+        int n = 0;
+        for (auto& kv : pedal)
+            n += kv.second ? 1 : 0;
+        return n;
+    }
+
     std::set<int> openNotes (int channel) const
     {
         std::set<int> s;
@@ -295,6 +308,8 @@ struct Rig
     std::map<int, int> open;
     int doubleOns = 0, strayOffs = 0, numOtherEvents = 0;
     std::vector<juce::MidiMessage> lastOthers;   // non-note messages of the last block
+    juce::MidiBuffer lastOut;                     // everything the last processBlock put out, in order
+    std::map<int, bool> pedal;                    // sustain pedal state downstream, per channel
     bool audioFinite = true;
     float peak = 0.0f;
     bool bypassed = false;   // drive processBlockBypassed instead of processBlock
@@ -2501,6 +2516,304 @@ void testWarmPadFiniteSustain()
 }
 
 //==============================================================================
+// F5: MIDI that passes through a host bypass is tracked. A key pressed during the bypass and held across its end is
+// released exactly once afterwards and is never double-struck by playback; with MIDI Out off or Bass only it is closed
+// (and a pedal pressed during the bypass released) when the bypass ends. No hanging notes or pedals in any mode.
+void testBypassPassThrough()
+{
+    namespace id = cb::ParamIDs;
+    auto cc = [] (int controller, int value, int channel, int sample = 0)
+    {
+        juce::MidiBuffer b;
+        b.addEvent (juce::MidiMessage::controllerEvent (channel, controller, value), sample);
+        return b;
+    };
+
+    for (int midiOut = 1; midiOut >= 0; --midiOut)
+        for (int part = 0; part < 3; ++part)
+        {
+            const std::string label = str ("bypass pass-through (MIDI Out ", midiOut ? "on" : "off", ", part ", part, "): ");
+            ChordbloomProcessor p;
+            p.setProgression (makeProgression ({ C_ }));
+            setParam (p, id::midiOut, (float) midiOut);
+            setParam (p, id::midiOutPart, (float) part);
+            const auto voicings = p.getProgressionVoicings();
+            const int key = voicings.empty() || voicings[0].size() < 2 ? 64 : voicings[0][1];   // a note of the C chord
+
+            Rig rig (p);
+            p.setLocalPlayback (true);
+            rig.run (4);
+
+            rig.bypassed = true;
+            juce::MidiBuffer in;
+            in.addEvent (juce::MidiMessage::noteOn (1, key, (juce::uint8) 100), 5);
+            in.addEvent (juce::MidiMessage::noteOn (2, 50, (juce::uint8) 100), 6);
+            in.addEvent (juce::MidiMessage::controllerEvent (1, 64, 127), 7);
+            rig.processBlock (in);
+            rig.run (6);
+            rig.bypassed = false;
+
+            rig.run (300);   // playback strikes the held key's pitch again and again (~3 s, 4-beat slot at 120 bpm)
+            check (rig.doubleOns == 0, label + "playback never double-strikes a key held across the bypass",
+                   str (rig.doubleOns, " double note-ons"));
+
+            juce::MidiBuffer release;
+            release.addEvent (juce::MidiMessage::noteOff (1, key), 0);
+            release.addEvent (juce::MidiMessage::noteOff (2, 50), 0);
+            rig.processBlock (release);
+            p.setLocalPlayback (false);
+            rig.run (4);
+            rig.processBlock (cc (64, 0, 1));
+            rig.run (2);
+
+            check (rig.openCount() == 0, label + "nothing left on downstream", str (rig.openCount(), " open"));
+            check (rig.pedalsDown() == 0, label + "no pedal left down downstream", str (rig.pedalsDown(), " down"));
+            check (rig.doubleOns == 0, label + "never a double note-on", str (rig.doubleOns));
+        }
+
+    // A key pressed during the bypass and released after it: with Bass only the routed synth still gets its note-off.
+    {
+        ChordbloomProcessor p;
+        setParam (p, id::midiOutPart, 2.0f);
+        Rig rig (p);
+        rig.run (2);
+        rig.bypassed = true;
+        rig.processBlock (noteOn (70));
+        rig.bypassed = false;
+        rig.run (2);
+        rig.processBlock (noteOff (70));
+        check (rig.openCount() == 0, "bypass pass-through: Bass only closes a key pressed during the bypass");
+    }
+}
+
+// F6: live input keeps its order at one sample: a key released just before the pedal goes down is not sustained.
+void testSameSampleInputOrder()
+{
+    auto orderAt = [] (const juce::MidiBuffer& out, int sample)
+    {
+        std::string s;
+        for (const auto meta : out)
+        {
+            if (meta.samplePosition != sample)
+                continue;
+            const auto m = meta.getMessage();
+            if (m.isNoteOff() && m.getNoteNumber() == 72)
+                s += "off ";
+            else if (m.isController() && m.getControllerNumber() == 64)
+                s += m.getControllerValue() >= 64 ? "down " : "up ";
+        }
+        return s;
+    };
+
+    ChordbloomProcessor p;
+    Rig rig (p);
+    rig.processBlock (noteOn (72));
+    rig.run (20);
+    juce::MidiBuffer in;
+    in.addEvent (juce::MidiMessage::noteOff (1, 72), 10);
+    in.addEvent (juce::MidiMessage::controllerEvent (1, 64, 127), 10);
+    rig.processBlock (in);
+    check (orderAt (rig.lastOut, 10) == "off down ", "input order: note-off then pedal down at one sample stays in that order",
+           orderAt (rig.lastOut, 10));
+    rig.run (80);   // ~0.85 s
+    check (rig.blockPeak() < 5.0e-4f, "input order: a note released just before the pedal is not sustained",
+           str ("peak ", rig.blockPeak()));
+    {
+        juce::MidiBuffer up;
+        up.addEvent (juce::MidiMessage::controllerEvent (1, 64, 0), 0);
+        rig.processBlock (up);
+    }
+    rig.run (100);
+
+    rig.processBlock (noteOn (72));
+    rig.run (20);
+    juce::MidiBuffer in2;
+    in2.addEvent (juce::MidiMessage::controllerEvent (1, 64, 127), 10);
+    in2.addEvent (juce::MidiMessage::noteOff (1, 72), 10);
+    rig.processBlock (in2);
+    check (orderAt (rig.lastOut, 10) == "down off ", "input order: pedal down then note-off at one sample stays in that order",
+           orderAt (rig.lastOut, 10));
+    rig.run (60);
+    check (rig.blockPeak() > 1.0e-3f, "input order: the pedal pressed first still sustains the note", str ("peak ", rig.blockPeak()));
+    juce::MidiBuffer up;
+    up.addEvent (juce::MidiMessage::controllerEvent (1, 64, 0), 0);
+    rig.processBlock (up);
+    rig.run (2);
+    check (rig.openCount() == 0 && rig.pedalsDown() == 0, "input order: balanced afterwards");
+}
+
+// F8: the "FL loops every N bars, the progression keeps going" hint disappears once the host loop is no longer one
+// the progression continues across (the FL pattern grew to 5 bars).
+void testHostLoopHintClears()
+{
+    ChordbloomProcessor p;
+    p.setProgression (makeProgression ({ C_, Am_, F_, G_ }));   // 16 beats
+    Rig rig (p, 48000.0, 441);
+    rig.hostLoopLen = 4.0;
+    rig.head.playing = true;
+    const double spb = rig.samplesPerBeat();
+    rig.run ((int) std::ceil (9.0 * spb / rig.blockSize));
+    check (std::abs (p.getHostLoopBeats() - 4.0) < 1e-6, "host loop hint: a 1-bar FL pattern is reported", str (p.getHostLoopBeats()));
+
+    rig.hostLoopLen = 20.0;   // the user draws a note in bar 5: every wrap is now a relocation
+    rig.run ((int) std::ceil (22.0 * spb / rig.blockSize));
+    check (p.getHostLoopBeats() == 0.0, "host loop hint: cleared once the host loop is not continued any more",
+           str (p.getHostLoopBeats()));
+
+    rig.hostLoopLen = 8.0;    // back to a 2-bar pattern: reported again at its next wrap
+    rig.head.ppq = 0.0;
+    rig.run ((int) std::ceil (17.0 * spb / rig.blockSize));
+    check (std::abs (p.getHostLoopBeats() - 8.0) < 1e-6, "host loop hint: a continued loop is reported again", str (p.getHostLoopBeats()));
+    rig.head.playing = false;
+    rig.run (2);
+    check (rig.openCount() == 0 && rig.doubleOns == 0, "host loop hint: balanced afterwards");
+}
+
+// F1 + F4: timed slot auditions belong to the editor (closing it stops them; their stop never cuts a newer audition),
+// and scroll-to-resize steps one beat per notch-worth of travel with one undo step per gesture.
+void testEditorAuditionsAndWheel()
+{
+    const auto left = juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier);
+    const auto none = juce::ModifierKeys();
+
+    ChordbloomProcessor p;
+    p.setProgression (makeProgression ({ C_, G_ }));
+
+    auto findProxy = [] (juce::Component& laneSurface, const juce::String& prefix) -> juce::Component*
+    {
+        for (auto* c : laneSurface.getChildren())
+            if (c->getTitle().startsWith (prefix) && dynamic_cast<juce::Button*> (c) == nullptr)
+                return c;
+        return nullptr;
+    };
+    auto press = [] (juce::Component* proxy)
+    {
+        if (proxy == nullptr)
+            return false;
+        auto handler = proxy->createAccessibilityHandler();
+        return handler != nullptr && handler->getActions().invoke (juce::AccessibilityActionType::press);
+    };
+
+    // (a) Closing the editor right after a timed audition releases it.
+    {
+        std::unique_ptr<juce::AudioProcessorEditor> holder (p.createEditor());
+        auto* ed = dynamic_cast<ChordbloomEditor*> (holder.get());
+        if (ed == nullptr)
+        {
+            check (false, "audition: editor");
+            return;
+        }
+        pumpMessages (50);
+        ed->updateChordDisplays();
+        auto* proxy = findProxy (*ed->getProgressionLane().getChildComponent (0), "C (");
+        check (press (proxy) && ! p.getPreviewNotes().empty(), "audition: the block's accessibility press plays it");
+        holder.reset();
+        check (p.getPreviewNotes().empty() && ! p.getPreviewChord().has_value(),
+               "audition: closing the editor stops a timed audition at once (F1)");
+        pumpMessages (900);   // the orphaned stop timer fires into nothing
+        Rig rig (p);
+        rig.run (4);
+        check (rig.openCount() == 0 && p.getSoundingNotes().none(), "audition: nothing left sounding after the editor closed",
+               str (rig.openCount(), " open"));
+    }
+
+    std::unique_ptr<juce::AudioProcessorEditor> holder (p.createEditor());
+    auto* ed = dynamic_cast<ChordbloomEditor*> (holder.get());
+    if (ed == nullptr)
+        return;
+    pumpMessages (50);
+    ed->updateChordDisplays();
+    auto* laneSurface = ed->getProgressionLane().getChildComponent (0);
+
+    // (b) A timed audition stops by itself, but never cuts a pad held after it.
+    {
+        check (press (findProxy (*laneSurface, "C (")), "audition: press");
+        pumpMessages (950);
+        check (p.getPreviewNotes().empty(), "audition: a timed audition stops by itself after ~0.7 s");
+
+        auto* padSurface = ed->getPaletteView().getChildComponent (0);
+        juce::Point<float> padPos;
+        for (float x = 20.0f; x < (float) padSurface->getWidth() && padPos.isOrigin(); x += 4.0f)
+        {
+            const juce::Point<float> pos (x, 30.0f);
+            padSurface->mouseDown (mouseEventFor (*padSurface, pos, left));
+            if (p.getPreviewChord().has_value())
+                padPos = pos;
+            padSurface->mouseUp (mouseEventFor (*padSurface, pos, none));
+        }
+
+        check (press (findProxy (*laneSurface, "G (")), "audition: press G");
+        padSurface->mouseDown (mouseEventFor (*padSurface, padPos, left));   // hold a pad within the 0.7 s
+        const auto held = p.getPreviewChord();
+        pumpMessages (950);
+        check (held.has_value() && p.getPreviewChord() == held && ! p.getPreviewNotes().empty(),
+               "audition: the timed stop does not cut a pad held after it (F1)");
+        padSurface->mouseUp (mouseEventFor (*padSurface, padPos, none));
+        check (p.getPreviewNotes().empty(), "audition: releasing the pad stops it");
+    }
+
+    // (c) Scroll-to-resize.
+    {
+        juce::Point<float> blockPos;
+        for (float y = (float) laneSurface->getHeight() - 12.0f; y > 30.0f && blockPos.isOrigin(); y -= 6.0f)
+        {
+            const juce::Point<float> pos (40.0f, y);
+            laneSurface->mouseDown (mouseEventFor (*laneSurface, pos, left));
+            if (p.getPreviewChord().has_value())
+                blockPos = pos;
+            laneSurface->mouseUp (mouseEventFor (*laneSurface, pos, none));
+        }
+        check (! blockPos.isOrigin(), "wheel: found the first block");
+
+        auto wheel = [&] (float dy)
+        {
+            juce::MouseWheelDetails w;
+            w.deltaX = 0.0f;
+            w.deltaY = dy;
+            w.isReversed = false;
+            w.isSmooth = true;
+            w.isInertial = false;
+            laneSurface->mouseWheelMove (mouseEventFor (*laneSurface, blockPos, none), w);
+        };
+        auto length0 = [&p] { return p.getProgression().slots.empty() ? -1 : p.getProgression().slots[0].lengthBeats; };
+
+        const int before = length0();
+        for (int i = 0; i < 25; ++i)
+            wheel (0.03f);   // a touchpad: 25 small deltas, about three notches of travel
+        check (length0() == before, "wheel: the gesture is previewed, not committed per step");
+        pumpMessages (600);
+        check (length0() == before + 3, "wheel: three notches of touchpad travel = three beats (was eight)",
+               str (before, " -> ", length0()));
+        p.undo();
+        check (length0() == before, "wheel: the whole gesture is one undo step", str (length0()));
+        pumpMessages (50);
+
+        wheel (0.234f);   // one classic notch
+        pumpMessages (600);
+        check (length0() == before + 1, "wheel: one notch = one beat", str (length0()));
+        p.undo();
+        pumpMessages (50);
+
+        wheel (0.15f);   // direction change: leftovers never carry over
+        wheel (-0.15f);
+        wheel (0.15f);
+        pumpMessages (600);
+        check (length0() == before, "wheel: back-and-forth jitter does not resize", str (length0()));
+
+        wheel (0.15f);   // a pause restarts the accumulation
+        pumpMessages (500);
+        wheel (0.15f);
+        pumpMessages (600);
+        check (length0() == before, "wheel: leftovers do not carry into the next gesture", str (length0()));
+    }
+
+    holder.reset();
+    Rig rig (p);
+    rig.run (4);
+    check (rig.openCount() == 0 && p.getSoundingNotes().none(), "audition/wheel: nothing left sounding", str (rig.openCount(), " open"));
+}
+
+//==============================================================================
 // Random host behaviour, random edits and random live input; afterwards everything must be silent.
 void testFuzz()
 {
@@ -2508,26 +2821,27 @@ void testFuzz()
     p.setProgression (makeProgression ({ C_, Am_, F_, G_ }, 2));
     Rig rig (p, 44100.0, 256);
     juce::Random rng (20261016);
-    std::set<int> heldInput;
+    std::set<std::pair<int, int>> heldInput;   // (channel, note)
     namespace id = cb::ParamIDs;
 
-    for (int b = 0; b < 4000; ++b)
+    for (int b = 0; b < 6000; ++b)
     {
         juce::MidiBuffer in;
         const int r = rng.nextInt (100);
 
         if (r < 20)
         {
+            const int channel = rng.nextInt (4) == 0 ? 2 : 1;   // channel 2 = the bass channel's input
             const int note = 36 + rng.nextInt (48);
-            if (heldInput.count (note) == 0)
+            if (heldInput.count ({ channel, note }) == 0)
             {
-                in.addEvent (juce::MidiMessage::noteOn (1, note, (juce::uint8) (1 + rng.nextInt (127))), rng.nextInt (256));
-                heldInput.insert (note);
+                in.addEvent (juce::MidiMessage::noteOn (channel, note, (juce::uint8) (1 + rng.nextInt (127))), rng.nextInt (256));
+                heldInput.insert ({ channel, note });
             }
             else
             {
-                in.addEvent (juce::MidiMessage::noteOff (1, note), rng.nextInt (256));
-                heldInput.erase (note);
+                in.addEvent (juce::MidiMessage::noteOff (channel, note), rng.nextInt (256));
+                heldInput.erase ({ channel, note });
             }
         }
         else if (r < 23) setParam (p, id::scaleLock, (float) rng.nextInt (2));
@@ -2567,20 +2881,24 @@ void testFuzz()
         else if (r < 64) rig.hostLoopLen = (double) (rng.nextInt (4) * 4);
         else if (r < 65) rig.head.reportLoop = rng.nextBool();
         else if (r < 66) setParam (p, id::previewTone, (float) rng.nextInt (3));
+        else if (r < 67) in.addEvent (juce::MidiMessage::controllerEvent (2, 64, rng.nextBool() ? 127 : 0), rng.nextInt (256));
+        else if (r < 69) rig.bypassed = ! rig.bypassed;   // host bypass on / off (F5)
 
         rig.head.loopStart = rig.hostLoopStart;
         rig.head.loopEnd = rig.hostLoopStart + juce::jmax (1.0, rig.hostLoopLen);
-        if (r >= 66 && r < 68)
+        if (r >= 69 && r < 71 && ! rig.bypassed)
             rig.processZero (in);   // VST3-style 0-sample flush calls in between
         else
             rig.processBlock (in);
     }
 
     pumpMessages (0);
+    rig.bypassed = false;
     juce::MidiBuffer releaseAll;
-    for (int n : heldInput)
-        releaseAll.addEvent (juce::MidiMessage::noteOff (1, n), 0);
+    for (auto& held : heldInput)
+        releaseAll.addEvent (juce::MidiMessage::noteOff (held.first, held.second), 0);
     releaseAll.addEvent (juce::MidiMessage::controllerEvent (1, 64, 0), 0);
+    releaseAll.addEvent (juce::MidiMessage::controllerEvent (2, 64, 0), 0);
     setParam (p, id::midiOut, 1.0f);
     setParam (p, id::midiOutPart, 0.0f);
     p.stopPreview();
@@ -2589,7 +2907,8 @@ void testFuzz()
     rig.processBlock (releaseAll);
     rig.run (2);
 
-    check (rig.openCount() == 0, "fuzz: no hanging notes after random host/edit/input activity", str (rig.openCount(), " open"));
+    check (rig.openCount() == 0, "fuzz: no hanging notes after random host/edit/input/bypass activity", str (rig.openCount(), " open"));
+    check (rig.pedalsDown() == 0, "fuzz: no sustain pedal left down downstream", str (rig.pedalsDown(), " down"));
     check (p.getSoundingNotes().none(), "fuzz: getSoundingNotes empty at the end", str (p.getSoundingNotes().count()));
     check (rig.doubleOns == 0, "fuzz: never a double note-on", str (rig.doubleOns));
     check (rig.audioFinite && rig.peak < 4.0f, "fuzz: audio finite and bounded", str ("peak ", rig.peak));
@@ -2633,6 +2952,10 @@ int runSelfTest()
     testUserDefaults();
     testSoftKeysAliasing();
     testWarmPadFiniteSustain();
+    testBypassPassThrough();
+    testSameSampleInputOrder();
+    testHostLoopHintClears();
+    testEditorAuditionsAndWheel();
     testFuzz();
 
     std::cout << "\nselftest: " << numPassed << " passed, " << numFailed << " failed\n";

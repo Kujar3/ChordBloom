@@ -12,7 +12,8 @@
 //    swing * step / 3; each step's "span" runs to the next step's (swung) start or the slot end, and a note lasts
 //    gate * span, so swung notes never overlap the next step. Triplet rate (1/8T) is already a shuffle and is not
 //    swung (swinging every second triplet would push every other downbeat late).
-//  - Block/Strum: release at slotLength - (1-gate)*min(slotLength,1); strum onsets stagger by 0.03 beats.
+//  - Block/Strum: release at slotLength - (1-gate)*min(slotLength,1); strum onsets stagger by 0.03 beats, shrunk to
+//    held / (2 * (notes - 1)) when the held length is shorter than that, so every note sounds for at least half of it.
 //  - Pulse: whole chord on every step. Arp Up / Down / Up-Down: one note per step (Up-Down: 1 2 3 4 3 2 | 1 2 ...).
 //  - Offbeat: whole chord on the "&" of every beat, gate * half a beat long. The "&" is swung like an odd step when
 //    it is one (1/8 rate); at other rates it is not on an odd step and stays straight.
@@ -20,11 +21,14 @@
 //    every beat the lowest note, on the following steps of the beat the remaining notes together.
 //  - Humanize: deterministic hash of (slot, step, voice, channel); timing +-0.015 * humanize beats (clamped to the
 //    slot), velocity +-0.12 * humanize. Velocities always stay in [1/127, 1].
-//  - Bass (channel 2): explicit inversion bass, otherwise root. Choose the octave in [28,55]
-//    nearest the previous bass note (initially 40), at least 5 below the chord when possible.
-//    Root uses the held release above; Pulse uses rate steps. Root+5th alternates with the
-//    chord's fifth (b5/#5 of dim/aug), or the chord root for slash chords, voice-leading each beat. Octaves alternates with an upper/lower octave
-//    in range; the last played bass note carries into the next slot.
+//  - Bass (channel 2): explicit inversion bass, otherwise root. Octave choice in [28,55]: first by separation from
+//    the lowest chord note (at least 5 below > below > unison > above), then by |movement from the previous bass
+//    note (initially 40)| + 0.5 * |note - 41|, so lines stay voice-led but are pulled back to the middle of the range
+//    instead of drifting down (C G Am F -> C2 G2 A2 F2); ties go lower, above the chord the lowest note wins. When no
+//    note in [28,55] is below the chord, C1..D#1 (24..27) may be used.
+//    Root uses the held release above; Pulse uses rate steps. Root+5th alternates the slot's bass note with the
+//    chord's fifth (b5/#5 of dim/aug), or the chord root for slash chords, chosen by the same rule from that note.
+//    Octaves alternates with an upper/lower octave in range; the last played bass note carries into the next slot.
 //  - Safety: a note never overlaps another instance of the same note on the same channel (an earlier one is
 //    shortened), so hosts never see a second note-on before the note-off.
 // Output is sorted by (startBeat, channel, note).
@@ -73,6 +77,8 @@ constexpr float kMinVelocity = 1.0f / 127.0f;
 constexpr double kMinLength = 1.0e-4;
 constexpr int kBassLow = 28;
 constexpr int kBassHigh = 55;
+constexpr int kBassCentre = 41;   // F2: the bass line's centre of gravity
+constexpr int kBassFloor = 24;    // C1: only when no note in [kBassLow, kBassHigh] fits below the chord
 constexpr int kChordChannel = 1;
 constexpr int kBassChannel = 2;
 
@@ -160,20 +166,32 @@ struct SlotRenderer
     }
 };
 
-// Prefer clear separation whenever any octave can provide it; ties choose the lower note.
+// Separation from the chord first (tier 0: at least 5 below its lowest note, 1: below, 2: unison, 3: above), then
+// cost = |movement| + 0.5 * |distance from kBassCentre| (kept in integers as twice that); ties choose the lower note.
+// Above the chord the lowest candidate wins. A unison / above-chord result falls back to C1..D#1 when that is below.
 int bassRootNote (int bassPc, int lowestVoicingNote, int previous)
 {
+    auto tier = [lowestVoicingNote] (int n)
+    {
+        return n <= lowestVoicingNote - 5 ? 0 : (n < lowestVoicingNote ? 1 : (n == lowestVoicingNote ? 2 : 3));
+    };
+    auto cost = [previous] (int n) { return 2 * std::abs (n - previous) + std::abs (n - kBassCentre); };
+
     int best = -1;
     for (int n = kBassLow; n <= kBassHigh; ++n)
     {
         if (pc (n) != bassPc)
             continue;
-        const bool clear = n <= lowestVoicingNote - 5;
-        const bool bestClear = best >= 0 && best <= lowestVoicingNote - 5;
-        if (best < 0 || (clear && ! bestClear)
-            || (clear == bestClear && std::abs (n - previous) < std::abs (best - previous)))
-            best = n;
+
+        if (best < 0 || tier (n) < tier (best) || (tier (n) == tier (best) && tier (n) < 3 && cost (n) < cost (best)))
+            best = n;   // ascending scan: equal costs (and the above-chord tier) keep the lower note
     }
+
+    if (best >= 0 && tier (best) >= 2)
+        for (int n = kBassFloor; n < kBassLow; ++n)
+            if (pc (n) == bassPc && n < lowestVoicingNote)
+                return n;
+
     return best;
 }
 
@@ -196,9 +214,14 @@ void renderChords (const SlotRenderer& r, const std::vector<int>& notes, const R
     switch (s.pattern)
     {
         case RhythmPattern::Strum:
+        {
+            // The stagger shrinks to fit short held lengths (1-beat slots, low gate): every note keeps at least half.
+            const double held = heldLength (slotLength, gate);
+            const double offset = n > 1 ? std::min (kStrumOffset, 0.5 * held / (n - 1)) : 0.0;
             for (int i = 0; i < n; ++i)
-                r.emit (notes[(size_t) i], kStrumOffset * i, heldLength (slotLength, gate) - kStrumOffset * i, kChordChannel, 0, i);
+                r.emit (notes[(size_t) i], offset * i, held - offset * i, kChordChannel, 0, i);
             break;
+        }
 
         case RhythmPattern::Pulse:
             for (auto& st : stepGrid (slotLength, rate, swingDelay))
@@ -283,15 +306,16 @@ void renderBass (const SlotRenderer& r, int rootPc, int bassPc, int fifthPc, int
 
         case BassMode::RootFifth:
         {
+            // The slot's bass note on even beats, the other note (chosen from it by the same rule) on odd beats.
+            // Re-choosing the bass note every beat would let the centre pull flip it by an octave (C2 G2 C3 G2).
             const int otherPc = bassPc == rootPc ? fifthPc : rootPc;
-            int lastNote = root;
+            const int other = bassRootNote (otherPc, lowestVoicingNote, root);
             const int beats = (int) std::ceil (slotLength - 1.0e-6);
             for (int b = 0; b < beats; ++b)
             {
                 const double span = std::min (1.0, slotLength - b);
-                lastNote = b == 0 ? root : bassRootNote ((b & 1) == 0 ? bassPc : otherPc, lowestVoicingNote, lastNote);
-                r.emit (lastNote, (double) b, gate * span, kBassChannel, b, b & 1);
-                last = lastNote;
+                last = (b & 1) == 0 ? root : other;
+                r.emit (last, (double) b, gate * span, kBassChannel, b, b & 1);
             }
             break;
         }

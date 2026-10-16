@@ -473,7 +473,8 @@ struct ControlsPanel::Impl
         pattern.setTooltip ("Rhythm pattern for playback and MIDI export: held chords, strums, pulses, arpeggios or broken chords");
         style.setTooltip ("Voicing: Close keeps the notes compact, Open spreads them (drop-2), Spread gives wide pad-like chords");
         bass.setTooltip ("Bass line, sent on MIDI channel 2");
-        octave.setTooltip ("Octave of the chords (the bass follows). Scroll or click - / +, double-click to reset");
+        octave.setTooltip ("Octave of the chords (the bass stays in its own low range, below the chords). "
+                           "Scroll or click - / +, double-click to reset");
         voiceLeading.setTooltip ("Voice leading: picks inversions automatically so each chord moves smoothly to the next");
         scaleLock.setTooltip ("Scale lock: notes you play on your MIDI keyboard snap to the nearest note of the key");
         chordTrigger.setTooltip ("Chord trigger: white keys C to B on your MIDI keyboard play the key's chords I to VII "

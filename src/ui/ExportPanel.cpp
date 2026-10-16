@@ -734,3 +734,4 @@ void ExportPanel::resized() { impl->setBounds (getLocalBounds()); }
 void ExportPanel::refresh() { impl->updateEnablement(); }
 
 void ExportPanel::showPlaysAlongHint() { impl->showPlaysAlongHint(); }
+void ExportPanel::notifyExternalDragFinished() { impl->externalDragFinished(); }

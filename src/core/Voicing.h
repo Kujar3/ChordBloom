@@ -33,7 +33,8 @@ struct VoicingSettings
 // (all intervals >= 12) stay above the core in interval order, unless explicitly requested
 // in the bass. All chord tones are retained, including the fifth of six-note chords.
 // Auto voice leading considers core inversions within +-7 semitones of centerNote,
-// minimising movement plus 4 for a sixth/seventh bass and 8 for a bottom interval <=2.
+// minimising movement plus 4 for a sixth/seventh bass and 8 for a bottom interval <=2. For 6, m6 and
+// 6/9 chords it skips shapes with the 6th lowest or a whole step or less above the bass (they read as the relative m7).
 // Explicit inversions bypass these penalties. Range limits take priority over octaveShift.
 // Result: ascending, unique, every note in [21, 108].
 std::vector<int> voiceChord (const Chord&, const VoicingSettings&, int inversion, int octaveShift,

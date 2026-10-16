@@ -565,7 +565,8 @@ struct ChordPaletteView::Impl : public juce::Component,
 
         const bool opening = ! context.has_value();
         const juce::String glowText = opening ? "glow = good first chord" : "glow = good next chord";
-        juce::String dotText = "dot = top 3 picks";
+        // "top pick", never a count: often fewer than three dots are shown, and the legend must always be true.
+        juce::String dotText = "dot = top pick";
 
         if (context.has_value())
             dotText << " after " << toJuce (context->name (key));
@@ -591,7 +592,7 @@ struct ChordPaletteView::Impl : public juce::Component,
         if (twoLines)
         {
             if (widthOf (f, dotText) + swatchW + gap > area.getWidth())
-                dotText = "dot = top 3 picks";
+                dotText = "dot = top pick";
 
             const float lineH = 16.0f;
             const float textW = std::max (widthOf (f, glowText), widthOf (f, dotText));
@@ -615,7 +616,7 @@ struct ChordPaletteView::Impl : public juce::Component,
             return;
         }
 
-        const juce::String shortDot ("dot = top picks");
+        const juce::String shortDot ("dot = top pick");
         const float w1 = widthOf (f, glowText), w2 = widthOf (f, shortDot);
         const float blockW = swatchW + gap + w1 + 14.0f + 10.0f + gap + w2;
 

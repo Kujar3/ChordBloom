@@ -440,6 +440,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
 
         combined.ensureSize (32768);
         outBuffer.ensureSize (32768);
+        forcedOut.ensureSize (32768);   // room for every (channel, note) off plus the controller resets
 
         paletteKey = keyFromParams();
         palette = safeBuildPalette (paletteKey);
@@ -935,6 +936,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
             pushPreview (false, n, 0);
         previewNotes.clear();
         previewChord.reset();
+        ++previewSerial;   // every audition starts with a stop, so each one (and each stop) gets a fresh serial
     }
 
     void startPreviewNotes (const std::vector<int>& notes)
@@ -1173,6 +1175,9 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         uint8_t velocity = 0;
         uint8_t part = kPartChords;
         uint8_t passthroughOnly = 0;   // unmatched live note-off: forwarded only when nothing else holds the note
+        uint8_t raw = 0;               // live non-note message (CC, bend, program change, SysEx ...) passed through
+        int rawSize = 0;
+        const uint8_t* rawData = nullptr;   // points into the block's input MidiBuffer (unchanged until the flush)
     };
 
     struct InputEntry
@@ -1199,6 +1204,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         bool forcePanic = false;
         bool prevMidiOut = true;
         bool prevPreviewOn = true;
+        bool wasBypassed = false;         // the previous block was processBlockBypassed (hostOn etc. = what passed through)
         int outPart = 0;                  // midiOutPart: 0 = chords + bass, 1 = chords only, 2 = bass only
 
         // timing of the current block (for beat -> sample conversion)
@@ -1263,6 +1269,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         e.velocity = (uint8_t) juce::jlimit (1, 127, velocity);
         e.part = part;
         e.passthroughOnly = 0;
+        e.raw = 0;
         return true;
     }
 
@@ -1286,6 +1293,37 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         e.velocity = 0;
         e.part = part;
         e.passthroughOnly = (uint8_t) (passthroughOnly ? 1 : 0);
+        e.raw = 0;
+    }
+
+    // F6: a live non-note message takes its place in the (sample, seq) order with the block's note events, so
+    // "note-off, then pedal down" at one sample stays in that order. Never refused: when the event list is full it is
+    // written straight away (its order relative to same-sample notes is then the old one, but it is never dropped).
+    void emitRaw (const uint8_t* data, int size, int sample) noexcept
+    {
+        if (data == nullptr || size <= 0)
+            return;
+
+        if (au.numEvents >= kMaxBlockEvents - kOffReserve)
+        {
+            combined.addEvent (data, size, sample);
+            if (partAllowed (kPartChords))
+                outBuffer.addEvent (data, size, sample);
+            return;
+        }
+
+        auto& e = au.events[(size_t) au.numEvents++];
+        e.sample = sample;
+        e.seq = au.seq++;
+        e.on = 0;
+        e.channel = 1;
+        e.note = 0;
+        e.velocity = 0;
+        e.part = kPartChords;
+        e.passthroughOnly = 0;
+        e.raw = 1;
+        e.rawSize = size;
+        e.rawData = data;
     }
 
     static void addRaw (juce::MidiBuffer& dest, uint8_t status, uint8_t d1, uint8_t d2, int sample) noexcept
@@ -1317,6 +1355,16 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         for (int i = 0; i < au.numEvents; ++i)
         {
             const auto& e = au.events[(size_t) i];
+
+            if (e.raw != 0)
+            {
+                // Live input other than notes: passes through untouched (counts as "chords" for midiOutPart).
+                combined.addEvent (e.rawData, e.rawSize, e.sample);
+                if (partAllowed (kPartChords))
+                    outBuffer.addEvent (e.rawData, e.rawSize, e.sample);
+                continue;
+            }
+
             const int chIndex = juce::jlimit (0, 15, (int) e.channel - 1);
             auto& r = au.ref[(size_t) chIndex][e.note];
             const auto onStatus = (uint8_t) (0x90 | chIndex);
@@ -1674,8 +1722,6 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
     void handleInput (const juce::MidiBuffer& midi, const EngineData* d, bool scaleLockOn, bool chordTriggerOn,
                       bool seventhsOn) noexcept
     {
-        const bool forwardOthers = partAllowed (kPartChords);   // live input counts as "chords" for midiOutPart
-
         for (const auto meta : midi)
         {
             const auto* raw = meta.data;
@@ -1702,11 +1748,9 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
             }
 
             if (size >= 3 && type == 0xb0 && status < 0xf0 && (raw[1] == 120 || raw[1] == 123))
-                releaseInputChannel (channel, sample);   // all sound off / all notes off
+                releaseInputChannel (channel, sample);   // all sound off / all notes off (their offs come first)
 
-            combined.addEvent (raw, size, sample);       // everything else passes through untouched
-            if (forwardOthers)
-                outBuffer.addEvent (raw, size, sample);
+            emitRaw (raw, size, sample);   // everything else passes through untouched, in input order (F6)
         }
     }
 
@@ -2108,6 +2152,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
                     // "still covered" (hosts that do not split the block at their loop end), older ones stop now.
                     releaseVoicesStartedBefore (au.expectedT - tol);
                     au.hostOffset = 0.0;
+                    hostLoopBeats.store (0.0);   // the progression restarts with the host: no continued host loop now
                     t0 = ppq;
                     restart = true;
                 }
@@ -2191,6 +2236,48 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
     }
 
     //------------------------------------------------------------------------------
+    // F5: first block after a host bypass. hostOn / the pedal state now describe what the host received during the
+    // bypass (input passed through untouched). Keys still held are adopted as live input, so their release sends
+    // exactly one note-off and playback of the same pitch retriggers instead of double-striking. When live input is
+    // not forwarded now (MIDI Out off, or Bass only), they are closed instead and a pedal / bend that passed through
+    // is released - like switching MIDI Out off (B8) or to Bass only.
+    void endBypass (bool midiOutNow) noexcept
+    {
+        au.wasBypassed = false;
+        const bool forwardLive = midiOutNow && partAllowed (kPartChords);
+
+        for (int ch = 0; ch < 16; ++ch)
+        {
+            for (int n = 0; n < 128; ++n)
+            {
+                if (! au.hostOn[(size_t) ch][(size_t) n])
+                    continue;
+
+                if (forwardLive)
+                {
+                    auto& entry = au.input[(size_t) (ch * 128 + n)];
+                    if (entry.count > 0 || entry.degree >= 0)
+                        continue;
+                    entry.count = 1;
+                    entry.outChannel = (uint8_t) (ch + 1);
+                    entry.degree = -1;
+                    entry.notes[0] = (uint8_t) n;
+                    // The built-in synth never heard it (ref stays 0); the MIDI out holds it once, as chords.
+                    au.partHeld[0][(size_t) ch][(size_t) n] = 1;
+                    au.outCounted[0][(size_t) ch][(size_t) n] = 1;
+                }
+                else
+                {
+                    addRaw (forcedOut, (uint8_t) (0x80 | ch), (uint8_t) n, 0, 0);
+                    au.hostOn[(size_t) ch][(size_t) n] = false;
+                }
+            }
+        }
+
+        if (! forwardLive)
+            resetForwardedControllers (forcedOut);
+    }
+
     void process (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi) noexcept
     {
         const int numSamples = juce::jmax (0, buffer.getNumSamples());
@@ -2201,6 +2288,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
 
         combined.clear();
         outBuffer.clear();
+        forcedOut.clear();
         au.numEvents = 0;
         au.seq = 0;
         au.numSamples = numSamples;
@@ -2222,6 +2310,8 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         }
 
         applyOutPart (outPartNow);
+        if (au.wasBypassed)
+            endBypass (midiOutNow);
         drainPreview();
         handleInput (midi, d, scaleLockOn, chordTriggerOn, seventhsOn);
 
@@ -2268,6 +2358,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
 
         // MIDI output
         midi.clear();
+        midi.addEvents (forcedOut, 0, -1, 0);   // F5: closes what passed through a bypass, even with MIDI Out off
         if (midiOutNow)
         {
             midi.addEvents (outBuffer, 0, -1, 0);
@@ -2309,8 +2400,10 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
     }
 
     // Host bypass. JUCE stops calling processBlock while bypassed, so everything Chordbloom holds is closed here:
-    // note-offs for every note the host was sent, all internal note state reset (playback chases again afterwards),
-    // previews queued meanwhile are dropped. Input MIDI passes through untouched (JUCE's default bypass behaviour).
+    // note-offs for every note the host was sent (on the first bypassed block), all internal note state reset
+    // (playback chases again afterwards), previews queued meanwhile are dropped. Input MIDI passes through untouched
+    // (JUCE's default bypass behaviour) and is tracked like any forwarded MIDI (F5), so the first block after the
+    // bypass knows which keys and pedals the host still holds (endBypass).
     // The preview synth keeps rendering so its release / reverb tails fade instead of clicking off.
     void processBypassed (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi) noexcept
     {
@@ -2355,16 +2448,20 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
             }
         }
 
-        // Note-offs for every note the host was sent, placed before this block's input: a new input note-on at
-        // sample 0 for the same pitch is not cancelled by its own cleanup (B17).
-        for (int ch = 0; ch < 16; ++ch)
+        // First bypassed block: note-offs for every note the host was sent, placed before this block's input, so a
+        // new input note-on at sample 0 for the same pitch is not cancelled by its own cleanup (B17). Later bypassed
+        // blocks: hostOn only holds what passed through, which the host closes itself.
+        if (! au.wasBypassed)
         {
-            for (int n = 0; n < 128; ++n)
+            for (int ch = 0; ch < 16; ++ch)
             {
-                if (au.hostOn[(size_t) ch][(size_t) n])
+                for (int n = 0; n < 128; ++n)
                 {
-                    addRaw (combined, (uint8_t) (0x80 | ch), (uint8_t) n, 0, 0);
-                    au.hostOn[(size_t) ch][(size_t) n] = false;
+                    if (au.hostOn[(size_t) ch][(size_t) n])
+                    {
+                        addRaw (combined, (uint8_t) (0x80 | ch), (uint8_t) n, 0, 0);
+                        au.hostOn[(size_t) ch][(size_t) n] = false;
+                    }
                 }
             }
         }
@@ -2376,6 +2473,9 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
             midi.addEvents (combined, 0, -1, 0);
             combined.clear();
         }
+
+        trackForwarded (midi);   // F5: what passes through while bypassed is what the host holds afterwards
+        au.wasBypassed = true;
 
         publishSoundingNotes();
     }
@@ -2403,6 +2503,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
     std::optional<cb::Chord> lastPreviewVoicingChord;     // chord + settings lastPreviewVoicing was voiced for
     cb::VoicingSettings lastPreviewVoicingSettings;
     std::optional<cb::Chord> previewChord;
+    uint32_t previewSerial = 0;   // message thread: changes with every preview start / stop (getPreviewSerial)
     uint64_t structuralSerial = 0;
 
     // User defaults
@@ -2447,6 +2548,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
     PreviewSynth synth;
     juce::MidiBuffer combined;    // everything generated this block -> built-in synth
     juce::MidiBuffer outBuffer;   // what midiOutPart lets through -> MIDI out
+    juce::MidiBuffer forcedOut;   // F5: always sent (closes keys / pedals that passed through a bypass)
     juce::MidiBuffer emptyMidi;
     double sampleRate = 44100.0;
 };
@@ -2467,6 +2569,7 @@ void ChordbloomProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     impl->synth.reset();
     impl->combined.ensureSize ((size_t) juce::jmax (32768, samplesPerBlock * 16));
     impl->outBuffer.ensureSize ((size_t) juce::jmax (32768, samplesPerBlock * 16));
+    impl->forcedOut.ensureSize (32768);
     impl->panicRequested.store (true);   // close anything still open from before (sent in the next block)
 }
 
@@ -2690,6 +2793,7 @@ void ChordbloomProcessor::startPreviewNote (int midiNote)
 void ChordbloomProcessor::stopPreview() { impl->stopPreviewNotes(); }
 
 std::optional<cb::Chord> ChordbloomProcessor::getPreviewChord() const { return impl->previewChord; }
+uint32_t ChordbloomProcessor::getPreviewSerial() const { return impl->previewSerial; }
 std::vector<int> ChordbloomProcessor::getPreviewNotes() const { return impl->previewNotes; }
 
 //==============================================================================

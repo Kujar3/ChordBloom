@@ -88,6 +88,36 @@ int clarityCost (const std::vector<int>& v, const Chord& c)
     return (bass >= 9 && bass <= 11 ? 4 : 0) + (v.size() >= 2 && v[1] - v[0] <= 2 ? 8 : 0);
 }
 
+// 6 / m6 / 6/9 shapes auto voice leading never picks: the 6th lowest, or a whole step or less above the bass.
+bool sixthHidesChord (const std::vector<int>& v, const Chord& c)
+{
+    if (c.quality != ChordQuality::Major6 && c.quality != ChordQuality::Minor6 && c.quality != ChordQuality::Major69)
+        return false;
+    const int sixth = pc (c.root + 9);
+    return pc (v.front()) == sixth || (v.size() >= 2 && pc (v[1]) == sixth && v[1] - v[0] <= 2);
+}
+
+// Reference model of the bass octave rule (Pattern.h): separation tier, then |movement| + 0.5 * |n - 41|, ties lower,
+// above the chord the lowest; C1..D#1 only when nothing in [28,55] is below the chord.
+int expectedBass (int bassPc, int lowest, int previous)
+{
+    auto tier = [lowest] (int n) { return n <= lowest - 5 ? 0 : (n < lowest ? 1 : (n == lowest ? 2 : 3)); };
+    auto cost = [previous] (int n) { return 2.0 * std::abs (n - previous) + std::abs (n - 41); };
+    int best = -1;
+    for (int n = 28; n <= 55; ++n)
+    {
+        if (pc (n) != bassPc)
+            continue;
+        if (best < 0 || tier (n) < tier (best) || (tier (n) == tier (best) && tier (n) < 3 && cost (n) < cost (best)))
+            best = n;
+    }
+    if (tier (best) >= 2)
+        for (int n = 24; n < 28; ++n)
+            if (pc (n) == bassPc && n < lowest)
+                return n;
+    return best;
+}
+
 std::vector<int> relative (const std::vector<int>& v)
 {
     std::vector<int> r;
@@ -557,6 +587,7 @@ TEST_CASE ("voicing: voice leading picks the least movement among in-window cand
                     const Chord c = ch (rng.next (12), sevenths ? fours[rng.next (4)] : triads[rng.next (4)]);
                     const auto res = voiceChord (c, s, -1, 0, prev);
                     CHECK (std::abs (mean (res) - centre) <= 7.0 + kTol);
+                    CHECK (! sixthHidesChord (res, c));
                     const int cost = movement (res, prev) + clarityCost (res, c);
 
                     for (int inv = 0; inv < c.numTones(); ++inv)
@@ -565,7 +596,7 @@ TEST_CASE ("voicing: voice leading picks the least movement among in-window cand
                         for (int o = -3; o <= 3; ++o)
                         {
                             const auto cand = shifted (base, 12 * o);
-                            if (! inMidiRange (cand) || std::abs (mean (cand) - centre) > 7.0 + kTol)
+                            if (! inMidiRange (cand) || std::abs (mean (cand) - centre) > 7.0 + kTol || sixthHidesChord (cand, c))
                                 continue;
                             CHECK (cost <= movement (cand, prev) + clarityCost (cand, c));
                         }
@@ -573,6 +604,45 @@ TEST_CASE ("voicing: voice leading picks the least movement among in-window cand
                     prev = res;
                 }
             }
+}
+
+TEST_CASE ("voicing: auto voice leading never hides a 6 / m6 / 6/9 chord as the relative m7")
+{
+    // Am -> C6 must not become A C E G (= Am7); Em -> G6 not E G B D; Dm -> F6 not D F A C.
+    struct Move { Chord from; Chord to; };
+    const Move moves[] = {
+        { ch (9, ChordQuality::Minor), ch (0, ChordQuality::Major6) },
+        { ch (4, ChordQuality::Minor), ch (7, ChordQuality::Major6) },
+        { ch (2, ChordQuality::Minor), ch (5, ChordQuality::Major6) },
+        { ch (4, ChordQuality::Minor), ch (9, ChordQuality::Minor6) },
+        { ch (9, ChordQuality::Minor), ch (0, ChordQuality::Major69) },
+        { ch (7, ChordQuality::Dominant7), ch (0, ChordQuality::Major6) },
+    };
+    for (auto style : kStyles)
+        for (int centre : kCentres)
+        {
+            for (auto& m : moves)
+            {
+                const auto prev = voiceChord (m.from, vset (style, centre), -1, 0, {});
+                const auto v = voiceChord (m.to, vset (style, centre), -1, 0, prev);
+                CHECK (! sixthHidesChord (v, m.to));
+                CHECK (pcSet (v) == chordPcSet (m.to));
+            }
+
+            // Random walks through the whole quality list.
+            Lcg rng;
+            std::vector<int> prev;
+            for (int i = 0; i < 200; ++i)
+            {
+                const Chord c = ch (rng.next (12), (ChordQuality) rng.next (numChordQualities));
+                prev = voiceChord (c, vset (style, centre), -1, 0, prev);
+                CHECK (! sixthHidesChord (prev, c));
+            }
+
+            // An explicit inversion still puts the 6th in the bass.
+            const auto explicitSixth = voiceChord (ch (0, ChordQuality::Major6), vset (style, centre), 3, 0, {});
+            CHECK_EQ (pc (explicitSixth.front()), 9);
+        }
 }
 
 TEST_CASE ("voicing: voice leading never drifts over 64 chords")
@@ -1119,14 +1189,15 @@ TEST_CASE ("pattern: velocities stay in (0, 1]")
         CHECK_EQ (e.velocity, 0.6f);   // bass uses the same base velocity
 }
 
-TEST_CASE ("pattern: bass root sits below the voicing and inside 28..55")
+TEST_CASE ("pattern: bass root sits below the voicing, inside 28..55 (C1..D#1 only when nothing else is below)")
 {
     struct Case { int root; std::vector<int> voicing; int expected; };
     const Case cases[] = {
         { 0, { 60, 64, 67 }, 36 }, { 9, { 57, 60, 64 }, 45 },
         { 5, { 65, 69, 72 }, 41 }, { 7, { 67, 71, 74 }, 43 },
-        { 9, { 69, 72, 76 }, 45 }, { 0, { 36, 40, 43 }, 36 },
+        { 9, { 69, 72, 76 }, 45 }, { 0, { 36, 40, 43 }, 24 },   // C over C2 E2 G2: C1, not a unison
         { 0, { 84, 88, 91 }, 36 }, { 2, { 62, 65, 69, 72 }, 38 },
+        { 9, { 33, 40, 48, 57 }, 33 },                            // A over A1: the unison beats an A2 above the chord
     };
     for (auto& c : cases)
     {
@@ -1135,6 +1206,82 @@ TEST_CASE ("pattern: bass root sits below the voicing and inside 28..55")
         REQUIRE (ev.size() == 1);
         CHECK_EQ (ev[0].note, c.expected);
     }
+
+    // F over A1 F2 C3 A3 after an A2 bass: F1 below the chord, not F2 inside it.
+    const auto p = makeProgression ({ ch (9, ChordQuality::Minor), ch (5, ChordQuality::Major) });
+    const auto two = channel (renderProgression (p, { { 57, 60, 64 }, { 33, 41, 48, 57 } },
+                                                 rset (RhythmPattern::Block, RateDivision::Eighth, BassMode::Root)), 2);
+    REQUIRE (two.size() == 2);
+    CHECK_EQ (two[0].note, 45);
+    CHECK_EQ (two[1].note, 29);
+}
+
+TEST_CASE ("pattern: the bass line stays around the middle of its range")
+{
+    // C G Am F with the default voicing: C2 G2 A2 F2, not the old drift down to C2 G1 A1 F1.
+    const auto p = makeProgression ({ ch (0, ChordQuality::Major), ch (7, ChordQuality::Major), ch (9, ChordQuality::Minor),
+                                      ch (5, ChordQuality::Major) });
+    const auto bass = channel (renderProgression (p, voiceProgression (p, VoicingSettings {}), RenderSettings {}), 2);
+    REQUIRE (bass.size() == 4);
+    CHECK_EQ (bass[0].note, 36);
+    CHECK_EQ (bass[1].note, 43);
+    CHECK_EQ (bass[2].note, 45);
+    CHECK_EQ (bass[3].note, 41);
+
+    // Long loops in every style and register: the line keeps its centre (no slow drift to either end). Low chords
+    // (Octave -1) push the bass down, since it stays below them.
+    const ChordQuality qs[] = { ChordQuality::Major, ChordQuality::Minor7, ChordQuality::Dominant7, ChordQuality::Minor };
+    for (auto style : kStyles)
+        for (int centre : { 48, 60, 72 })
+            for (int step : { 5, 7, 2, 10 })
+            {
+                Progression loop;
+                for (int i = 0; i < 32; ++i)
+                {
+                    ProgressionSlot slot;
+                    slot.chord = ch ((i * step) % 12, qs[i % 4]);
+                    loop.slots.push_back (slot);
+                }
+                const auto ev = channel (renderProgression (loop, voiceProgression (loop, vset (style, centre)),
+                                                            rset (RhythmPattern::Block, RateDivision::Eighth, BassMode::Root)), 2);
+                REQUIRE (ev.size() == loop.slots.size());
+                double sum = 0.0;
+                for (auto& e : ev)
+                    sum += e.note;
+                const double m = sum / (double) ev.size();
+                CHECK (m >= (centre >= 60 ? 32.0 : 27.0) && m <= 48.0);
+                for (auto& e : ev)
+                    CHECK (e.note >= 24 && e.note <= 55);
+                double lateSum = 0.0;
+                for (size_t i = 16; i < ev.size(); ++i)
+                    lateSum += ev[i].note;
+                CHECK (std::abs (lateSum / 16.0 - m) <= 4.0);
+            }
+}
+
+TEST_CASE ("pattern: the bass never doubles or sits above the chord when an octave below it exists")
+{
+    int checked = 0;
+    for (auto style : kStyles)
+        for (int centre : { 36, 48, 60 })
+            for (int q = 0; q < numChordQualities; ++q)
+                for (int root = 0; root < 12; ++root)
+                {
+                    const Chord c = ch (root, (ChordQuality) q);
+                    const auto v = voiceChord (c, vset (style, centre), -1, 0, {});
+                    for (int mode = 1; mode < numBassModes; ++mode)
+                    {
+                        const auto ev = channel (renderOne (rset (RhythmPattern::Block, RateDivision::Eighth, (BassMode) mode), v, 4, c), 2);
+                        REQUIRE (! ev.empty());
+                        bool canGoBelow = false;
+                        for (int n = 24; n <= 55; ++n)
+                            canGoBelow = canGoBelow || (pc (n) == pc (root) && n < v.front());
+                        CHECK (! canGoBelow || ev.front().note < v.front());
+                        CHECK (ev.front().note >= 24 && ev.front().note <= 55);
+                        ++checked;
+                    }
+                }
+    CHECK_EQ (checked, 3 * 3 * numChordQualities * 12 * (numBassModes - 1));
 }
 
 TEST_CASE ("pattern: bass Root holds the root with a fixed release tail on channel 2")
@@ -1145,7 +1292,7 @@ TEST_CASE ("pattern: bass Root holds the root with a fixed release tail on chann
     CHECK_EQ (ev[0].note, 36);
     CHECK_EQ (ev[0].startBeat, 0.0);
     CHECK (near (ev[0].lengthBeats, 3.9, 1e-6));
-    CHECK_EQ (ev[1].note, 31);   // nearest G to the previous C2
+    CHECK_EQ (ev[1].note, 43);   // G2: the G nearest the previous C2 once the pull to the bass centre is counted
     CHECK_EQ (ev[1].startBeat, 4.0);
     CHECK (near (ev[1].lengthBeats, 1.9, 1e-6));
 }
@@ -1157,7 +1304,7 @@ TEST_CASE ("pattern: bass Root + 5th alternates every beat starting with the roo
     for (int b = 0; b < 4; ++b)
     {
         CHECK (near (ev[(size_t) b].startBeat, (double) b));
-        CHECK_EQ (ev[(size_t) b].note, b % 2 == 0 ? 36 : 31);
+        CHECK_EQ (ev[(size_t) b].note, b % 2 == 0 ? 36 : 43);   // C2 G2 C2 G2 (always back to the slot's own C2)
         CHECK (near (ev[(size_t) b].lengthBeats, 0.9, 1e-6));
     }
 
@@ -1211,7 +1358,7 @@ TEST_CASE ("pattern: bass notes stay in 28..55 for every mode, chord and registe
                     REQUIRE (! ev.empty());
                     for (auto& e : ev)
                     {
-                        CHECK (e.note >= 28);
+                        CHECK (e.note >= 28 || (e.note >= 24 && e.note < v.front()));   // C1..D#1 only below the chord
                         CHECK (e.note <= 55);
                         CHECK_EQ (e.channel, 2);
                         CHECK (pc (e.note) == root || pc (e.note) == pc (root + 7));
@@ -1324,10 +1471,10 @@ TEST_CASE ("pattern: end to end I-vi-IV-V with default settings")
     const auto ev = renderProgression (p, voicings, RenderSettings {});
     CHECK_EQ (ev.size(), (size_t) 16);   // Block: 3 chord notes + 1 bass note per slot
     CHECK_EQ (channel (ev, 2).size(), (size_t) 4);
-    CHECK_EQ (channel (ev, 2)[0].note, 36);
-    CHECK_EQ (channel (ev, 2)[1].note, 33);
-    CHECK_EQ (channel (ev, 2)[2].note, 29);
-    CHECK_EQ (channel (ev, 2)[3].note, 31);
+    CHECK_EQ (channel (ev, 2)[0].note, 36);   // C2
+    CHECK_EQ (channel (ev, 2)[1].note, 33);   // A1
+    CHECK_EQ (channel (ev, 2)[2].note, 41);   // F2 (was F1: the line used to drift down)
+    CHECK_EQ (channel (ev, 2)[3].note, 43);   // G2
     for (auto& e : ev)
         CHECK (e.startBeat + e.lengthBeats <= p.slotStartBeat (p.slotAtBeat (e.startBeat) + 1) + kTol);
 }
@@ -1387,37 +1534,37 @@ TEST_CASE ("pattern: slash bass follows explicit voicing in every bass mode")
     CHECK_EQ (pc (channel (renderProgression (p, { {64,67,72} }, s), 2)[0].note), 0);
 }
 
-TEST_CASE ("pattern: bass minimises movement subject to range and available separation")
+TEST_CASE ("pattern: bass picks separation first, then movement plus the pull to the centre")
 {
-    for (int lowest : { 21, 33, 40, 48, 60, 84 })
-    {
-        Progression p;
-        std::vector<std::vector<int>> voicings;
-        for (int i = 0; i < 24; ++i)
+    for (int lowest : { 21, 30, 33, 36, 40, 48, 60, 84 })
+        for (int step : { 7, 5, 1 })
         {
-            ProgressionSlot slot;
-            slot.chord = ch ((i * 7) % 12, ChordQuality::Major);
-            p.slots.push_back (slot);
-            voicings.push_back ({ lowest });
+            Progression p;
+            std::vector<std::vector<int>> voicings;
+            for (int i = 0; i < 24; ++i)
+            {
+                ProgressionSlot slot;
+                slot.chord = ch ((i * step) % 12, ChordQuality::Major);
+                p.slots.push_back (slot);
+                voicings.push_back ({ lowest });
+            }
+            const auto bass = channel (renderProgression (p, voicings, rset (RhythmPattern::Block, RateDivision::Eighth, BassMode::Root)), 2);
+            REQUIRE (bass.size() == p.slots.size());
+            int previous = 40;
+            for (size_t i = 0; i < bass.size(); ++i)
+            {
+                const int note = bass[i].note;
+                const int root = pc (p.slots[i].chord.root);
+                bool canSeparate = false;
+                for (int n = 28; n <= 55; ++n)
+                    if (pc (n) == root && n <= lowest - 5) canSeparate = true;
+                CHECK (note <= 55 && (note >= 28 || note >= 24));
+                CHECK_EQ (pc (note), root);
+                CHECK (! canSeparate || note <= lowest - 5);
+                CHECK_EQ (note, expectedBass (root, lowest, previous));
+                previous = note;
+            }
         }
-        const auto bass = channel (renderProgression (p, voicings, rset (RhythmPattern::Block, RateDivision::Eighth, BassMode::Root)), 2);
-        REQUIRE (bass.size() == p.slots.size());
-        int previous = 40;
-        for (size_t i = 0; i < bass.size(); ++i)
-        {
-            const int note = bass[i].note;
-            bool canSeparate = false;
-            for (int n = 28; n <= 55; ++n)
-                if (pc (n) == p.slots[i].chord.root && n <= lowest - 5) canSeparate = true;
-            CHECK (note >= 28 && note <= 55);
-            CHECK_EQ (pc (note), p.slots[i].chord.root);
-            CHECK (! canSeparate || note <= lowest - 5);
-            for (int n = 28; n <= 55; ++n)
-                if (pc (n) == pc (note) && (! canSeparate || n <= lowest - 5))
-                    CHECK (std::abs (note - previous) <= std::abs (n - previous));
-            previous = note;
-        }
-    }
 }
 
 TEST_CASE ("pattern: held releases have a fixed tail for every slot length and gate")
@@ -1433,7 +1580,30 @@ TEST_CASE ("pattern: held releases have a fixed tail for every slot length and g
             }
 }
 
-TEST_CASE ("pattern: every bass mode enters each slot nearest the last bass note")
+TEST_CASE ("pattern: Strum keeps every chord note on short slots and low gates")
+{
+    const std::vector<std::vector<int>> voicings { { 60, 64, 67 }, { 60, 64, 67, 71 }, { 55, 59, 62, 65, 69, 76 } };
+    for (int length = 1; length <= 4; ++length)
+        for (float gate : { 0.05f, 0.1f, 0.15f, 0.5f, 1.0f })
+            for (const auto& v : voicings)
+            {
+                auto s = rset (RhythmPattern::Strum, RateDivision::Eighth, BassMode::Off);
+                s.gate = gate;
+                const auto ev = channel (renderOne (s, v, length), 1);
+                REQUIRE (ev.size() == v.size());
+                const double held = length - (1.0 - gate) * std::min (length, 1);
+                for (size_t i = 0; i < ev.size(); ++i)
+                {
+                    CHECK (ev[i].lengthBeats >= held * 0.5 - 1e-6);
+                    CHECK (near (ev[i].startBeat + ev[i].lengthBeats, held, 1e-6));
+                    CHECK (i == 0 || ev[i].startBeat > ev[i - 1].startBeat);   // still a strum, low to high
+                }
+                if (held >= 0.03 * (double) (v.size() - 1) * 2.0)
+                    CHECK (near (ev.back().startBeat, 0.03 * (double) (v.size() - 1), 1e-9));   // normal stagger when it fits
+            }
+}
+
+TEST_CASE ("pattern: every bass mode enters each slot by movement plus the pull to the centre")
 {
     const auto p = makeProgression ({ ch (9, ChordQuality::Minor), ch (11, ChordQuality::Major),
                                       ch (0, ChordQuality::Major), ch (7, ChordQuality::Major) });
@@ -1446,9 +1616,7 @@ TEST_CASE ("pattern: every bass mode enters each slot nearest the last bass note
         {
             const int slot = p.slotAtBeat (event.startBeat);
             if (near (event.startBeat, p.slotStartBeat (slot)))
-                for (int candidate = 28; candidate <= 55; ++candidate)
-                    if (pc (candidate) == p.slots[(size_t) slot].chord.root)
-                        CHECK (std::abs (event.note - previous) <= std::abs (candidate - previous));
+                CHECK_EQ (event.note, expectedBass (p.slots[(size_t) slot].chord.root, 72, previous));
             previous = event.note;
         }
     }

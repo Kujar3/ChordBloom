@@ -15,6 +15,8 @@
 //   Order: the scale's own presets first (harmonic / melodic minor and the modes), then the family list,
 //   which leads with what out/midi_stats.md says producers use most (minor: i-VI-III-VII, i-VII-VI-VII, VI-VII-i-i,
 //   i-iv-VI-v, i-VI-iv-V; major: I-V-vi-IV, vi-IV-I-V, borrowed bVI / bVII / iv). Capped at 20.
+//   Locrian has 12 presets of its own (most on the diminished home i° / iø7) and takes at most 6 family presets, which
+//   are marked "(borrowed minor i)" when they lean on the borrowed minor tonic.
 //   With round 2's palette every scale gets 12-20 (Lydian 12, Mixolydian 13, the rest 18-20). If a palette ever lacks
 //   a family's staple chords, that scale simply gets fewer presets rather than presets with chords it does not show.
 //
@@ -22,7 +24,8 @@
 //   1. Candidates: every distinct palette chord, each with a mood weight = quality weight (per mood and chord quality:
 //      e.g. Lo-fi m7 1.3 vs triad 0.12, Dreamy maj7 1.4, Uplifting triad 1.0 vs add9 0.5) x role weight (per mood, by
 //      the chord's root offset and third, e.g. Dark minor: i 1.4, bII 1.4, VI 1.3, iv 1.1) x section weight
-//      (secondary dominants 0.15-0.6, borrowed chords 0.7-1.0) x 1.4-1.5 for the mode's signature chord.
+//      (secondary dominants 0.15-0.6, borrowed chords 0.7-1.0) x 1.4-1.5 for the mode's signature chord. Locrian's
+//      diatonic tonic (i° / iø7) plays the minor 'i' role with the quality weight of m / m7.
 //   2. Opener: weighted pick over mood weight x mood-typical opener weight x (0.15 + openingScore)^2.
 //   3. Each next chord: weighted pick among the 6 best of
 //        transitionScore(prev, c)^3 x mood weight x mood pattern boost x novelty,
@@ -347,6 +350,20 @@ namespace
               { s (0, { Q::Diminished }), s (10, { Q::Minor }), s (8, { Q::Major }), s (1, { Q::Major }) } },
             { "Locrian drift", "bII and biii rock gently over the unstable home.", Mood::Dreamy,
               { s (1, { Q::Major7, Q::Major }), s (3, { Q::Minor7, Q::Minor }) } },
+            // Built on the diminished home itself, so Locrian keys do not lean on borrowed natural-minor loops.
+            { "Locrian sigh", "i° - bVI - bvii - i°: sinks and climbs back to the unstable home.", Mood::Emotional,
+              { s (0, { Q::Diminished }), s (8, { Q::Major }), s (10, { Q::Minor }), s (0, { Q::Diminished }) } },
+            { "Locrian lounge", "Half-diminished home through bIImaj7 and the minor sevenths above.", Mood::LoFi,
+              { s (0, { Q::HalfDiminished7, Q::Diminished }), s (1, { Q::Major7, Q::Major }), s (3, { Q::Minor7, Q::Minor }),
+                s (5, { Q::Minor7, Q::Minor }) } },
+            { "Locrian hover", "The bright bVmaj7 floating over the half-diminished home.", Mood::Dreamy,
+              { s (6, { Q::Major7, Q::Major }), s (0, { Q::HalfDiminished7, Q::Diminished }) } },
+            { "Locrian lament", "i° - iv - bII - i°: a sorrowful turn that never resolves.", Mood::Emotional,
+              { s (0, { Q::Diminished }), s (5, { Q::Minor }), s (1, { Q::Major }), s (0, { Q::Diminished }) } },
+            { "Tritone shadow", "The home and its tritone bV, rocking against bVI.", Mood::Dark,
+              { s (0, { Q::Diminished }), s (6, { Q::Major }), s (8, { Q::Major }), s (6, { Q::Major }) } },
+            { "Locrian storm", "i° - bVI - bII - bvii: big chords around a home that will not settle.", Mood::Epic,
+              { s (0, { Q::Diminished }), s (8, { Q::Major }), s (1, { Q::Major }), s (10, { Q::Minor }) } },
         };
 
         switch (scale)
@@ -674,15 +691,24 @@ std::vector<Preset> presetsFor (const Key& key)
     std::vector<const PresetDef*> defs;
     for (auto& d : modePresets (k.scale))
         defs.push_back (&d);
+    const size_t numModeDefs = defs.size();
     for (auto& d : isMinorKey (k) ? minorPresets() : majorPresets())
         defs.push_back (&d);
 
     constexpr size_t kMaxPresets = 20;
+    // Locrian's family top-up (natural-minor loops on the borrowed minor i) stays a minority next to its own presets.
+    const size_t maxFamily = k.scale == ScaleType::Locrian ? 6 : kMaxPresets;
+    size_t numFamily = 0;
     std::vector<Preset> out;
 
-    for (auto* def : defs)
+    for (size_t defIndex = 0; defIndex < defs.size(); ++defIndex)
     {
+        const auto* def = defs[defIndex];
         if (out.size() >= kMaxPresets)
+            break;
+
+        const bool family = defIndex >= numModeDefs;
+        if (family && numFamily >= maxFamily)
             break;
 
         Progression p;
@@ -701,8 +727,19 @@ std::vector<Preset> presetsFor (const Key& key)
         preset.description = def->description;
         preset.romanSummary = romanSummaryOf (p, k);
         preset.mood = def->mood;
+
+        if (family && k.scale == ScaleType::Locrian)
+        {
+            bool borrowedTonic = false;
+            for (auto& slot : p.slots)
+                borrowedTonic = borrowedTonic || (pc (slot.chord.root) == k.tonic && ! isDiatonic (slot.chord, k));
+            if (borrowedTonic)
+                preset.description += " (borrowed minor i)";
+        }
+
         preset.progression = std::move (p);
         out.push_back (std::move (preset));
+        numFamily += family ? 1 : 0;
     }
     return out;
 }
@@ -732,7 +769,17 @@ Progression sparkProgression (const Key& keyIn, const std::vector<PaletteSection
         cand.third = thirdOf (c.quality);
         if (cand.third == 0 && isSusQuality (c.quality) && key.contains (c.root))   // Asus2 in A minor plays the i role
             cand.third = thirdOf (diatonicChord (key, key.degreeOf (c.root), false).quality);
-        const int qi = std::clamp ((int) c.quality, 0, numChordQualities - 1);
+
+        // Locrian's own tonic (i° / iø7) plays the 'i' role and is weighted like the minor chord of the same shape,
+        // so Spark uses the diminished home instead of always falling back to the borrowed minor i.
+        ChordQuality weightQuality = c.quality;
+        if (cand.third == 0 && cand.offset == 0 && isDiminishedQuality (c.quality) && isDiatonic (c, key))
+        {
+            cand.third = -1;
+            weightQuality = c.quality == Q::HalfDiminished7 ? Q::Minor7 : Q::Minor;
+        }
+
+        const int qi = std::clamp ((int) weightQuality, 0, numChordQualities - 1);
         cand.mood = kQualityWeights[moodIndex][qi]
                   * roleWeight (mood, minorKey, cand.offset, cand.third)
                   * sectionWeight (mood, c, key)

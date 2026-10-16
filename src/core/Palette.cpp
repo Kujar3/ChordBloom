@@ -376,9 +376,14 @@ namespace
             ChordQuality::Major6, ChordQuality::Minor6, ChordQuality::Major69, ChordQuality::Minor11
         };
 
-        for (int degree : fallbackDegrees)
-            for (auto q : fallbackQualities)
-                tryAdd (degree, q);
+        // Round-robin over the degrees, one chord per degree per round (the first quality that works), two rounds: the
+        // top-up spreads over the roots instead of piling every variant onto the first productive one (B Locrian used
+        // to get five F chords). The tonic still gets the first chance in each round.
+        for (int round = 0; round < 2; ++round)
+            for (int degree : fallbackDegrees)
+                for (auto q : fallbackQualities)
+                    if (tryAdd (degree, q))
+                        break;
 
         std::stable_sort (picks.begin(), picks.end(), [] (const Pick& a, const Pick& b) { return a.degree < b.degree; });
 

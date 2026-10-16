@@ -133,6 +133,10 @@ public:
     void stopPreview();                          // note-offs for whatever preview is sounding
     std::optional<cb::Chord> getPreviewChord() const;   // chord currently being previewed (chord/slot previews), if any
     std::vector<int> getPreviewNotes() const;           // MIDI notes of the preview currently held (empty when none). Added by the integrator.
+    // (Added in round 3.) Changes with every preview start and stop. A timed audition (e.g. "play the new chord for
+    // 0.6 s") reads it right after starting and stops the preview later only if it is still unchanged, so it never cuts
+    // a newer audition.
+    uint32_t getPreviewSerial() const;
 
     //==============================================================================
     // Transport
@@ -146,7 +150,8 @@ public:
     // Any thread (added in round 2). While the host plays, a backward host jump onto the loop start / a bar line by a
     // whole number of bars shorter than the progression (e.g. FL Studio's pattern mode with a 1-bar pattern under a
     // 4-bar progression) is treated as a host loop: the progression keeps running across it instead of restarting.
-    // Returns that host loop length in beats while such loops are being seen (0 = none since the transport started).
+    // Returns that host loop length in beats while such loops are being seen (0 = none since the transport started,
+    // or since the last relocation: a backward jump the progression does not continue across clears it).
     // The lane can show "FL pattern is N bars, progression is M bars".
     double getHostLoopBeats() const noexcept;
 

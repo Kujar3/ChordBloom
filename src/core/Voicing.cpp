@@ -11,7 +11,8 @@
 // Core tones have intervals below 12; all remaining tones are extensions, in interval order
 // (9/b9, 11/#11, 13). Every tone is retained. Extensions sit above the entire core,
 // except an explicitly requested extension bass. Inversion indices always refer to the
-// original interval list. Auto voice leading never chooses an extension bass.
+// original interval list. Auto voice leading never chooses an extension bass, and for 6, m6 and 6/9
+// chords never the 6th in the bass or a whole step above it (that would sound as the relative m7).
 // Close rotates the core; Open uses drop-2 on the core; Spread interleaves core tones
 // and doubles triad basses. Spread clears intervals below a fourth under MIDI 52.
 // Close placement and its voice-leading window use the core mean so upper extensions
@@ -421,6 +422,10 @@ std::vector<int> voiceChord (const Chord& chord, const VoicingSettings& settings
         int bestCost = 0;
         double bestDist = 0.0;
 
+        const bool sixFamily = chord.quality == ChordQuality::Major6 || chord.quality == ChordQuality::Minor6
+                            || chord.quality == ChordQuality::Major69;
+        const int sixthPc = pc (chord.root + 9);
+
         for (int inv = 0; inv < n; ++inv)
         {
             if (std::find (tones.extensions.begin(), tones.extensions.end(), inv) != tones.extensions.end())
@@ -430,6 +435,12 @@ std::vector<int> voiceChord (const Chord& chord, const VoicingSettings& settings
             {
                 const double dist = std::abs (c.mean - center);
                 if (dist > kVoiceLeadingWindow + kEps)
+                    continue;
+
+                // 6 / m6 / 6/9: the 6th lowest, or clustered a step above the bass, reads as the relative m7
+                // (C6 as A C E G = Am7). Only an explicit inversion puts it there.
+                if (sixFamily && (pc (c.notes.front()) == sixthPc
+                                  || (c.notes.size() >= 2 && pc (c.notes[1]) == sixthPc && c.notes[1] - c.notes[0] <= 2)))
                     continue;
 
                 int cost = movementCost (c.notes, prev);

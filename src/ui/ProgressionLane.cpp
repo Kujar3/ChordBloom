@@ -34,6 +34,7 @@ enum MenuIds
     idSuggestBase = 500,      // + index into the captured suggestion list
     idTransposeUp = 600, idTransposeDown = 601, idMoveToKey = 602,
     idSpark = 700,
+    idStopHost = 701,         // "Stop playing along with FL" (lane menu while following the host)
     idMoodBase = 800,         // + Mood
     idChordsBase = 810,       // + number of chords
     idBeatsBase = 820,        // + beats per chord
@@ -296,8 +297,15 @@ public:
 
     void clicked (const juce::ModifierKeys& mods) override
     {
-        const bool menuZone = mods.isPopupMenu() || (chevron && ! splitChevron)
-                              || (splitChevron && lastDownX >= (float) getWidth() - kChevronZone);
+        // A right-click opens the menu (when there is one) and never acts like a left click (Theme.h rule).
+        if (mods.isPopupMenu())
+        {
+            if (onMenu != nullptr)
+                onMenu();
+            return;
+        }
+
+        const bool menuZone = (chevron && ! splitChevron) || (splitChevron && lastDownX >= (float) getWidth() - kChevronZone);
 
         if (menuZone && onMenu != nullptr)
             onMenu();
@@ -498,6 +506,22 @@ public:
         setMouseCursor (juce::MouseCursor::PointingHandCursor);
     }
 
+    std::function<void()> onMenu;   // right-click: never a click (it opens the lane menu instead)
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu())
+        {
+            if (onMenu != nullptr)
+                onMenu();
+            return;
+        }
+        juce::Button::mouseDown (e);
+    }
+
+    void mouseDrag (const juce::MouseEvent& e) override { if (! e.mods.isPopupMenu()) juce::Button::mouseDrag (e); }
+    void mouseUp (const juce::MouseEvent& e) override   { if (! e.mods.isPopupMenu()) juce::Button::mouseUp (e); }
+
     void paintButton (juce::Graphics& g, bool over, bool down) override
     {
         auto r = getLocalBounds().toFloat();
@@ -553,6 +577,22 @@ public:
         setTitle ("Clear the progression");
         setMouseCursor (juce::MouseCursor::PointingHandCursor);
     }
+
+    std::function<void()> onMenu;   // right-click: never a click (it opens the lane menu instead)
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu())
+        {
+            if (onMenu != nullptr)
+                onMenu();
+            return;
+        }
+        juce::Button::mouseDown (e);
+    }
+
+    void mouseDrag (const juce::MouseEvent& e) override { if (! e.mods.isPopupMenu()) juce::Button::mouseDrag (e); }
+    void mouseUp (const juce::MouseEvent& e) override   { if (! e.mods.isPopupMenu()) juce::Button::mouseUp (e); }
 
     void paintButton (juce::Graphics& g, bool over, bool down) override
     {
@@ -754,6 +794,10 @@ struct ProgressionLane::Impl : public juce::Component,
 
         clearButton.onClick = [this] { clearAll(); };
 
+        // Right-clicks on the header buttons open the progression menu (FL users right-click near the header for it).
+        playButton.onMenu = [this] { showLaneMenu (&playButton); };
+        clearButton.onMenu = [this] { showLaneMenu (&clearButton); };
+
         // Spark: click = new progression, chevron / right-click = settings
         sparkButton.text = "Spark";
         sparkButton.chevron = true;
@@ -771,7 +815,7 @@ struct ProgressionLane::Impl : public juce::Component,
 
         hostButton.text = "Playing with FL";
         hostButton.onPrimary = [this] { stopPlayingWithHost(); };
-        hostButton.onMenu = hostButton.onPrimary;
+        hostButton.onMenu = [this] { showLaneMenu (&hostButton); };   // the menu offers "Stop playing along with FL"
         hostButton.setTooltip ("Chordbloom is looping the progression along with FL's transport (Play with FL is on).\n"
                                "Already dropped the clip into FL? Click to stop Chordbloom playing along, so you don't hear it twice.");
 
@@ -786,6 +830,8 @@ struct ProgressionLane::Impl : public juce::Component,
         emptyPresetsButton.onMenu = [this] { showPresetsMenu (emptyPresetsButton); };
         emptyPresetsButton.setTooltip (presetsButton.getTooltip());
 
+        wheelCommitTimer.onFire = [this] { commitWheelResize (true); };
+
         updateSparkLabels();
         sync();
         startTimerHz (idleHz);
@@ -794,9 +840,27 @@ struct ProgressionLane::Impl : public juce::Component,
     ~Impl() override
     {
         stopTimer();
+        commitWheelResize (false);
 
-        if (previewing)
+        // A held press, or a timed audition ("Change to" pick, accessibility press) whose stop has not run yet.
+        if (previewing || (timedPreviewSerial != 0 && processor.getPreviewSerial() == timedPreviewSerial))
             processor.stopPreview();
+    }
+
+    // Plays a slot for `ms` milliseconds. The stop only fires if no other audition (a lane press, a pad, a keyboard
+    // key, another pick) has started or stopped since - the processor's preview serial is still the one read here.
+    void startTimedSlotPreview (int slot, int ms)
+    {
+        processor.startPreviewSlot (slot);
+        const auto serial = processor.getPreviewSerial();
+        timedPreviewSerial = serial;
+
+        juce::Component::SafePointer<Impl> safe (this);
+        juce::Timer::callAfterDelay (ms, [safe, serial]
+        {
+            if (safe != nullptr && ! safe->previewing && safe->processor.getPreviewSerial() == serial)
+                safe->processor.stopPreview();
+        });
     }
 
     //==============================================================================
@@ -837,6 +901,8 @@ struct ProgressionLane::Impl : public juce::Component,
             // Any pending press refers to the old progression (a host state load, undo, a second touch...):
             // cancel it so a later drag can never index past the new blocks or grab a different chord.
             cancelPress();
+            wheelPendingSlot = -1;   // same for an uncommitted scroll-resize
+            wheelCommitTimer.stopTimer();
 
             if (resizeSlot >= n)
                 resizeSlot = -1;
@@ -1167,6 +1233,9 @@ struct ProgressionLane::Impl : public juce::Component,
         if (index == resizeSlot)
             return resizeLength;
 
+        if (index == wheelPendingSlot)
+            return wheelPendingLength;
+
         return cached.slots[(size_t) index].lengthBeats;
     }
 
@@ -1300,12 +1369,7 @@ struct ProgressionLane::Impl : public juce::Component,
                 if (safe == nullptr || i >= (int) safe->processor.getProgression().slots.size())
                     return;
 
-                safe->processor.startPreviewSlot (i);
-                juce::Timer::callAfterDelay (700, [safe]
-                {
-                    if (safe != nullptr && ! safe->previewing)
-                        safe->processor.stopPreview();
-                });
+                safe->startTimedSlotPreview (i, 700);
             };
             proxy.onMenu = [safe, i]
             {
@@ -1920,6 +1984,10 @@ struct ProgressionLane::Impl : public juce::Component,
     void mouseEnter (const juce::MouseEvent& e) override { updateHover (e.position, true); }
     void mouseExit (const juce::MouseEvent& e) override
     {
+        commitWheelResize (true);
+        wheelAccum = 0.0f;
+        wheelSlot = -1;
+
         if (resizeSlot < 0)
             updateHover (e.position, false);
     }
@@ -1929,9 +1997,11 @@ struct ProgressionLane::Impl : public juce::Component,
         if (outOfDate())
             sync();
 
+        commitWheelResize (true);   // a click ends a scroll gesture (and sees its committed length)
         dragStarted = false;
         pressedSlot = -1;
         wheelAccum = 0.0f;
+        wheelSlot = -1;
         const auto hit = hitTest (e.position);
 
         if (hit.slot < 0)
@@ -2077,14 +2147,26 @@ struct ProgressionLane::Impl : public juce::Component,
         // (JUCE also reports clicks 3 and 4 as double-clicks). Remove with the hover "x" or right-click > Delete.
     }
 
+    // Scroll over a block to change its length. Accumulated like the octave stepper (ControlsPanel): a classic wheel
+    // notch (~0.234) is one beat, touchpads and smooth / hi-res wheels need a notch's worth of travel per beat, and a
+    // pause or a change of direction restarts the count. One gesture is previewed like an edge drag and committed as a
+    // single undo step once the wheel rests (~0.35 s), or on mouse-exit / a click / scrolling another block.
     void mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override
     {
         if (outOfDate())
             sync();
 
         const auto hit = hitTest (e.position);
+        const auto now = juce::Time::getMillisecondCounter();
+        const bool gestureOn = wheelSlot >= 0 && now - lastWheelMs <= kWheelGestureMs;
 
-        if (hit.slot < 0 || resizeSlot >= 0)
+        // Keep a running gesture on its block while the layout moves under a still pointer (the scale can change
+        // as the block grows); a moved pointer or a pause starts over on whatever block is under it.
+        int slot = hit.slot;
+        if (gestureOn && slot != wheelSlot && e.position.getDistanceFrom (lastWheelPos) < 4.0f)
+            slot = wheelSlot;
+
+        if (slot < 0 || resizeSlot >= 0)
         {
             juce::Component::mouseWheelMove (e, wheel);
             return;
@@ -2098,15 +2180,28 @@ struct ProgressionLane::Impl : public juce::Component,
         if (wheel.isReversed)
             delta = -delta;
 
-        if (hit.slot != wheelSlot)
+        if (delta == 0.0f)
+            return;
+
+        if (slot != wheelSlot)
         {
-            wheelSlot = hit.slot;
+            commitWheelResize (true);   // a different block: the previous gesture is one undo step of its own
+            wheelSlot = slot;
             wheelAccum = 0.0f;
         }
+        else if ((delta > 0.0f) != (wheelAccum > 0.0f) || ! gestureOn)
+        {
+            wheelAccum = 0.0f;          // direction change or a pause: leftovers never carry over
+        }
 
+        lastWheelMs = now;
+        lastWheelPos = e.position;
         wheelAccum += delta;
 
-        if (std::abs (wheelAccum) < 0.08f)
+        if (wheelPendingSlot >= 0)
+            wheelCommitTimer.startTimer (kWheelCommitMs);   // still scrolling: keep the gesture open
+
+        if (std::abs (wheelAccum) < kWheelStep)
             return;
 
         const int step = wheelAccum > 0.0f ? 1 : -1;
@@ -2114,18 +2209,51 @@ struct ProgressionLane::Impl : public juce::Component,
 
         const auto& prog = processor.getProgression();
 
-        if (hit.slot >= (int) prog.slots.size())
+        if (slot >= (int) prog.slots.size())
             return;
 
-        auto s = prog.slots[(size_t) hit.slot];
-        const int newLength = juce::jlimit (cb::kMinSlotBeats, cb::kMaxSlotBeats, s.lengthBeats + step);
+        const int current = wheelPendingSlot == slot ? wheelPendingLength : prog.slots[(size_t) slot].lengthBeats;
+        const int newLength = juce::jlimit (cb::kMinSlotBeats, cb::kMaxSlotBeats, current + step);
 
-        if (newLength != s.lengthBeats)
+        if (newLength != current)
         {
-            s.lengthBeats = newLength;
-            processor.updateSlot (hit.slot, s);
-            sync();
+            wheelPendingSlot = slot;
+            wheelPendingLength = newLength;
+            wheelCommitTimer.startTimer (kWheelCommitMs);
+            layoutBlocks();
+            layoutHeader();   // the length readout changes width
+            repaint();
         }
+    }
+
+    // Writes the pending scroll length (one updateSlot = one undo step). `relayout` = false from the destructor.
+    void commitWheelResize (bool relayout)
+    {
+        wheelCommitTimer.stopTimer();
+        const int slot = wheelPendingSlot;
+        const int length = wheelPendingLength;
+        wheelPendingSlot = -1;
+
+        if (slot < 0)
+            return;
+
+        const auto& prog = processor.getProgression();
+
+        if (prog == synced && slot < (int) prog.slots.size() && prog.slots[(size_t) slot].lengthBeats != length)
+        {
+            auto s = prog.slots[(size_t) slot];
+            s.lengthBeats = length;
+            processor.updateSlot (slot, s);
+        }
+
+        if (! relayout)
+            return;
+
+        sync();
+        layoutBlocks();
+        layoutHeader();
+        syncProxies();
+        repaint();
     }
 
     juce::ScaledImage makeDragImage (int index, juce::Point<int>& offset) const
@@ -2526,6 +2654,13 @@ struct ProgressionLane::Impl : public juce::Component,
         menu.addSeparator();
         menu.addItem (idSpark, "Spark a new progression");
         menu.addSubMenu ("Presets", buildPresetsMenu (presets));
+
+        if (hostButton.isVisible())
+        {
+            menu.addSeparator();
+            menu.addItem (idStopHost, "Stop playing along with FL");
+        }
+
         menu.addSeparator();
         menu.addItem (idClear, "Clear", any);
         return menu;
@@ -2631,6 +2766,7 @@ struct ProgressionLane::Impl : public juce::Component,
         else if (result == idMoveToKey)     transposeBy (processor.bestTranspositionForKey());
         else if (result == idSpark)         spark();
         else if (result == idClear)         clearAll();
+        else if (result == idStopHost)      stopPlayingWithHost();
         else if (result >= idPresetBase && result - idPresetBase < (int) presets.size())
         {
             // Presets are spelled for the key the menu was opened in; ignore a stale pick after a key change.
@@ -2709,13 +2845,7 @@ struct ProgressionLane::Impl : public juce::Component,
             {
                 blocks[(size_t) index].flash = 1.0f;
                 speedUp();
-                processor.startPreviewSlot (index);   // let the user hear the new chord in place
-                juce::Component::SafePointer<Impl> safe (this);
-                juce::Timer::callAfterDelay (600, [safe]
-                {
-                    if (safe != nullptr && ! safe->previewing)
-                        safe->processor.stopPreview();
-                });
+                startTimedSlotPreview (index, 600);   // let the user hear the new chord in place
             }
         }
     }
@@ -3065,6 +3195,28 @@ struct ProgressionLane::Impl : public juce::Component,
 
     int wheelSlot = -1;
     float wheelAccum = 0.0f;
+    juce::uint32 lastWheelMs = 0;
+    juce::Point<float> lastWheelPos;
+    int wheelPendingSlot = -1;     // scroll-resize being previewed (committed by commitWheelResize)
+    int wheelPendingLength = 4;
+    static constexpr float kWheelStep = 0.2f;          // a classic notch (0.234) is still exactly one beat
+    static constexpr juce::uint32 kWheelGestureMs = 400;
+    static constexpr int kWheelCommitMs = 350;
+
+    struct WheelCommitTimer final : juce::Timer
+    {
+        std::function<void()> onFire;
+        void timerCallback() override
+        {
+            stopTimer();
+            if (onFire != nullptr)
+                onFire();
+        }
+    };
+    WheelCommitTimer wheelCommitTimer;
+
+    // F1: preview serial of the last timed audition (0 = none), so the destructor can stop it if it is still sounding.
+    uint32_t timedPreviewSerial = 0;
 
     bool dropActive = false;
     int dropIndex = -1;

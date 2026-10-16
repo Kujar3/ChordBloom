@@ -28,6 +28,11 @@ public:
     // block was dragged out of the plugin as a MIDI file (shouldDropFilesWhenDraggedExternally returned true).
     void showPlaysAlongHint();
 
+    // (Added in round 3, F12.) A pad / block drag that may have left the window as a MIDI file just ended (mouse
+    // released): shows the hint above only when the release happened outside the plug-in window, like the chips do.
+    // (A drag cancelled with Escape outside the window still counts as a drop: JUCE does not report the OS result.)
+    void notifyExternalDragFinished();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

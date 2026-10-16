@@ -475,7 +475,23 @@ namespace
     }
 
     //==========================================================================
+    int letterStepForInterval (int interval, ChordQuality quality);
+
+    // True when every tone of `chord` spells with a single accidental on stacked letters from a root on `rootLetter`.
+    bool stacksWithSingleAccidentals (const Chord& chord, int rootLetter)
+    {
+        for (int interval : qualityIntervals (chord.quality))
+        {
+            const int step = letterStepForInterval (interval, chord.quality);
+            if (step < 0 || letterWithAccidental (rootLetter + step, chord.root + interval).empty())
+                return false;
+        }
+        return true;
+    }
+
     // Root spelling shared by Chord::name and chordToneNames, so a chord's name, its tones and its numeral agree.
+    //  - the raised leading tone of a minor-family key: the 7th-degree letter when the chord stacks on it with
+    //    single accidentals (C# minor: B#dim, F# minor: E#dim; but F# minor's F major stays F)
     //  - roots in the key or its parallel key: Key::spell (C major: Ab, Bb, Eb; A minor: C#, F#, G#)
     //  - natural-minor roots of the other minor-family scales: natural-minor letters (A Harmonic Minor: G)
     //  - anything else follows the numeral's degree letter and accidental (C major F#dim = #iv°, A minor Bb = bII,
@@ -483,10 +499,20 @@ namespace
     std::string spellRoot (const Chord& chord, const Key& key)
     {
         const int r = pc (chord.root);
+        const int tonicLetter = letterIndexOf (key.tonicName()[0]);
+
+        // The raised leading tone of a minor-family key keeps its 7th-degree letter, so its chords stack on the right
+        // letters (C# minor: B#dim = B# D# F#, not Cdim = C Eb Gb) - unless the root or any chord tone would then need
+        // a double accidental (F major in F# minor stays "F", not E# G## B#).
+        if (scaleInfo (key.scale).isMinorFamily && r == pc (key.tonic + 11))
+        {
+            const auto leadingTone = letterWithAccidental (tonicLetter + 6, r);
+            if (! leadingTone.empty() && stacksWithSingleAccidentals (chord, tonicLetter + 6))
+                return leadingTone;
+        }
+
         if (key.contains (r) || key.parallel().contains (r))
             return key.spell (r);
-
-        const int tonicLetter = letterIndexOf (key.tonicName()[0]);
 
         if (borrowsFromNaturalMinor (key))
         {
