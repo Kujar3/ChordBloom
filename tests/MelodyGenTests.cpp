@@ -4,6 +4,7 @@
 #include "core/Voicing.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -267,6 +268,65 @@ int medianPitch (std::vector<int> v)
     return v[v.size() / 2];
 }
 
+// R6's true clash with a chord: a b9 above its bass pitch class (unless the chord itself has that tone as an extension,
+// such as a root-position 7b9), or a non-chord tone a semitone from one of its tones.
+bool isTrueClash (const Chord& chord, int bassPc, int npc)
+{
+    int interval = -1;
+    for (int iv : chord.intervals())
+        if (pc (chord.root + iv) == pc (npc))
+            interval = iv;
+    if (pc (npc) == pc (bassPc + 1) && interval < 12)
+        return true;
+    if (interval >= 0)
+        return false;
+    for (int t : chord.pitchClasses())
+        if (pc (t) == pc (npc + 1) || pc (t) == pc (npc - 1))
+            return true;
+    return false;
+}
+
+Progression heldIntoInversions()
+{
+    // C -> Cmaj7/B (3rd inversion: a held C is a b9 above the bass) -> F -> Fmaj7/E (a held F is a b9 above E)
+    return prog ({ { 0, Q::Major, 4 }, { 0, Q::Major7, 4, 3 }, { 5, Q::Major, 4 }, { 5, Q::Major7, 4, 3 } });
+}
+
+bool isChordTone (const Progression& p, const MelodyNote& n)
+{
+    const auto chord = chordAtBeat (p, n.startBeat);
+    if (! chord)
+        return false;
+    for (int t : chord->pitchClasses())
+        if (pc (t) == pc (n.note))
+            return true;
+    return false;
+}
+
+// Onsets and pitches of one 4-beat bar: (16th step in the bar, pitch).
+using BarNotes = std::vector<std::pair<int, int>>;
+std::vector<BarNotes> barsOf (const Melody& m, int numBars)
+{
+    std::vector<BarNotes> bars ((size_t) numBars);
+    for (const auto& n : m.notes)
+    {
+        const int step = (int) std::lround (n.startBeat * 4.0);
+        if (step / 16 < numBars)
+            bars[(size_t) (step / 16)].push_back ({ step % 16, n.note });
+    }
+    return bars;
+}
+
+bool sameRhythm (const BarNotes& a, const BarNotes& b)
+{
+    if (a.size() != b.size())
+        return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].first != b[i].first)
+            return false;
+    return true;
+}
+
 MelodyNote mn (int note, double start, double length)
 {
     MelodyNote n;
@@ -444,8 +504,8 @@ TEST_CASE ("melody gen: plan signature format")
     int pedal = 0;
     for (std::uint32_t seed = 1; seed <= 100; ++seed)
         pedal += melodyPlanSignature (popAxis(), kAMinor, seed, settingsFor (MelodyStyle::Driving)).back() == '1' ? 1 : 0;
-    CHECK (pedal > 20);   // p 0.4 per melody
-    CHECK (pedal < 60);
+    CHECK (pedal >= 30);   // p 0.5 per melody (final-spec 5.4.3 / 5.4.4)
+    CHECK (pedal < 70);
 }
 
 TEST_CASE ("melody gen: hard statistic bands (seeds 1..200 x 4 styles x 3 progressions)")
@@ -505,8 +565,11 @@ TEST_CASE ("melody gen: soft statistics (printed for the listening pass)")
 TEST_CASE ("melody gen: R1 chord-scale adaptation over secondary and borrowed chords")
 {
     const auto p = secondaryBorrowed();
-    // The key tones each chord replaces: D7 F -> F#, E7 G -> G#, Fm A -> Ab, Bb B -> Bb.
+    // The key tones each chord replaces: D7 F -> F#, E7 G -> G#, Fm A -> Ab, Bb B -> Bb. The borrowed Fm and Bb take
+    // their chord-scale from the parallel minor (C D Eb F G Ab Bb), so E, A and B never sound over them.
     const int replaced[] = { -1, 5, -1, 7, -1, 9, -1, 11 };
+    const Key cMinor { 0, ScaleType::NaturalMinor };
+    int borrowedKeyTones = 0;
     const std::vector<std::vector<int>> chordPcs = { { 0, 4, 7 }, { 2, 6, 9, 0 }, { 7, 11, 2 }, { 4, 8, 11, 2 },
                                                      { 9, 0, 4 }, { 5, 8, 0 }, { 0, 4, 7 }, { 10, 2, 5 } };
     const auto ctx = contextFor (p);
@@ -527,13 +590,17 @@ TEST_CASE ("melody gen: R1 chord-scale adaptation over secondary and borrowed ch
                 if ((step == 0 || step == 8) && npc == replaced[slot] && ! ct)
                     ++strongOut;
                 // Every note is a chord tone or a tone of the local chord-scale.
-                const bool keyTone = kCMajor.contains (npc) && npc != replaced[slot];
+                const bool borrowedSlot = slot == 5 || slot == 7;
+                const bool keyTone = borrowedSlot ? cMinor.contains (npc) : kCMajor.contains (npc) && npc != replaced[slot];
                 if (! ct && ! keyTone)
                     ++outsideScale;
+                if (borrowedSlot && ! ct && (npc == 4 || npc == 9 || npc == 11))
+                    ++borrowedKeyTones;
             }
         }
     CHECK_EQ (strongOut, 0);
     CHECK_EQ (outsideScale, 0);
+    CHECK_EQ (borrowedKeyTones, 0);
     CHECK (pool.outScaleShare() <= 0.02);
     std::printf ("    R1 out-of-chord-scale share %.4f\n", pool.outScaleShare());
 }
@@ -571,7 +638,8 @@ TEST_CASE ("melody gen: resolveEnding, loop seam (R7) and cadences")
 TEST_CASE ("melody gen: R6 a note held into a clashing chord is cut (suspensions only in Lyrical / Sparse)")
 {
     const Progression progressions[] = { secondaryBorrowed(), twoBeat(), slashAndShort(), mixedLengths(),
-                                         prog ({ { 0, Q::Major, 4 }, { 4, Q::Minor, 4 }, { 5, Q::Major7, 4 }, { 11, Q::Diminished, 4 } }) };
+                                         prog ({ { 0, Q::Major, 4 }, { 4, Q::Minor, 4 }, { 5, Q::Major7, 4 }, { 11, Q::Diminished, 4 } }),
+                                         heldIntoInversions() };
     int crossings = 0, suspensions = 0, bad = 0;
     for (const auto& p : progressions)
     {
@@ -590,11 +658,9 @@ TEST_CASE ("melody gen: R6 a note held into a clashing chord is cut (suspensions
                             break;
                         ++crossings;
                         const auto& chord = p.slots[(size_t) sl].chord;
-                        const auto tones = chord.pitchClasses();
                         const int npc = pc (n.note);
-                        auto isTone = [&] (int x) { return std::find (tones.begin(), tones.end(), pc (x)) != tones.end(); };
                         const int bass = slotBassPitchClass (p.slots[(size_t) sl], ctx.voicings[(size_t) sl]);
-                        const bool clash = ! isTone (npc) && (isTone (npc + 1) || isTone (npc - 1) || npc == pc (bass + 1));
+                        const bool clash = isTrueClash (chord, bass, npc);
                         if (! clash)
                             continue;
                         const bool susStyle = style == MelodyStyle::Lyrical || style == MelodyStyle::Sparse;
@@ -706,7 +772,10 @@ TEST_CASE ("melody gen: register window")
 
     MelodyGenContext v;
     v.voicings = { { 60, 64, 67 }, { 59, 62, 67 }, { 57, 60, 64 }, { 57, 60, 65 } };   // tops 67 67 64 65 -> median 65
-    CHECK (melodyRegisterWindow (p, v, settingsFor (MelodyStyle::Uplifting)) == std::make_pair (60, 72));
+    // Uplifting and Driving anchor at a voicing top of at least 67 (the lead sits over the pad); Lyrical does not.
+    CHECK (melodyRegisterWindow (p, v, settingsFor (MelodyStyle::Uplifting)) == std::make_pair (62, 74));
+    CHECK (melodyRegisterWindow (p, v, settingsFor (MelodyStyle::Driving)) == std::make_pair (53, 74));
+    CHECK (melodyRegisterWindow (p, v, settingsFor (MelodyStyle::Lyrical)) == std::make_pair (60, 73));
 
     MelodyGenContext high;
     high.voicings = { { 100, 104, 107 } };
@@ -833,6 +902,275 @@ TEST_CASE ("melody gen: phrasing - repeated letters really repeat and phrase end
     }
     std::printf ("    lag-4 rhythm repeats: loop-like %.2f, varied %.2f\n", lagLoop / 100.0, lagVaried / 100.0);
     CHECK (lagLoop > lagVaried);
+
+    // Repetition is audible: the share of bars that exactly repeat an earlier bar (onsets and pitches) rises with it,
+    // and Loop-like restates at least 40% of the bars of an 8-bar Uplifting or Driving loop.
+    for (auto style : kAllStyles)
+    {
+        double shares[3] = {};
+        int idx = 0;
+        for (float r : { 0.15f, 0.5f, 0.85f })
+        {
+            int repeatedBars = 0, total = 0;
+            for (std::uint32_t seed = 1; seed <= 200; ++seed)
+            {
+                const auto bars = barsOf (generateMelody (p, kCMajor, ctx, seed, settingsFor (style, 0.5f, 0, MelodyContour::Auto, r)), 8);
+                for (int b = 1; b < 8; ++b)
+                {
+                    ++total;
+                    for (int e = 0; e < b; ++e)
+                        if (! bars[(size_t) b].empty() && bars[(size_t) b] == bars[(size_t) e])
+                        {
+                            ++repeatedBars;
+                            break;
+                        }
+                }
+            }
+            shares[idx++] = repeatedBars / (double) total;
+        }
+        std::printf ("    %-10s bars that restate an earlier bar: varied %.2f, balanced %.2f, loop-like %.2f\n",
+                     melodyStyleShortName (style), shares[0], shares[1], shares[2]);
+        CHECK (shares[0] < shares[1]);
+        CHECK (shares[1] < shares[2]);
+        if (style == MelodyStyle::Uplifting || style == MelodyStyle::Driving)
+            CHECK (shares[2] >= 0.4);
+    }
+}
+
+TEST_CASE ("melody gen: repeated units restate their motif (exact pitches among lag-4 rhythm copies)")
+{
+    // GP 1.5.4 over the same chords: exact .53 (Uplifting, Lyrical) / .37 (Driving), plus fit-transposes by 0.
+    struct Case { Progression p; Key key; };
+    const Case cases[] = { { repeated (popAxis(), 2), kCMajor }, { repeated (epicMinor(), 2), kAMinor } };
+    const double floors[] = { 0.35, 0.35, 0.25, 0.0 };   // Sparse: printed only
+    for (int si = 0; si < 4; ++si)
+    {
+        int pairs = 0, exact = 0;
+        for (const auto& c : cases)
+        {
+            const auto ctx = contextFor (c.p);
+            for (std::uint32_t seed = 1; seed <= 200; ++seed)
+            {
+                const auto bars = barsOf (generateMelody (c.p, c.key, ctx, seed, settingsFor (kAllStyles[si])), 8);
+                for (int b = 4; b < 8; ++b)
+                    if (! bars[(size_t) b].empty() && sameRhythm (bars[(size_t) b], bars[(size_t) b - 4]))
+                    {
+                        ++pairs;
+                        exact += bars[(size_t) b] == bars[(size_t) b - 4] ? 1 : 0;
+                    }
+            }
+        }
+        const double share = exact / (double) std::max (1, pairs);
+        std::printf ("    %-10s exact pitches in %.2f of %d lag-4 rhythm copies\n", melodyStyleShortName (kAllStyles[si]), share, pairs);
+        CHECK (pairs > 200);
+        CHECK (share >= floors[si]);
+    }
+}
+
+TEST_CASE ("melody gen: Driving pedal mode keeps one pedal register per chord and repeats with its riff")
+{
+    const auto p = repeated (popAxis(), 2);
+    const auto ctx = contextFor (p);
+    const auto set = settingsFor (MelodyStyle::Driving);
+    int pedalMelodies = 0, pairs = 0, exact = 0, pedalNotes = 0, onRootOrFifth = 0, registerJumps = 0, fifthBelow = 0;
+    for (std::uint32_t seed = 1; seed <= 300; ++seed)
+    {
+        if (melodyPlanSignature (p, kCMajor, seed, set).back() != '1')
+            continue;
+        ++pedalMelodies;
+        const auto m = generateMelody (p, kCMajor, ctx, seed, set);
+        const auto bars = barsOf (m, 8);
+        std::array<int, 12> rootPitch;
+        rootPitch.fill (-1);
+        for (int b = 0; b < 8; ++b)
+        {
+            if (b >= 4 && ! bars[(size_t) b].empty() && sameRhythm (bars[(size_t) b], bars[(size_t) b - 4]))
+            {
+                ++pairs;
+                exact += bars[(size_t) b] == bars[(size_t) b - 4] ? 1 : 0;
+            }
+            // The 2nd, 4th, ... onset of each bar is a pedal note (the loop's last note is the ending instead).
+            for (size_t j = 1; j < bars[(size_t) b].size(); j += 2)
+            {
+                const double beat = b * 4.0 + bars[(size_t) b][j].first / 4.0;
+                if (std::abs (beat - m.notes.back().startBeat) < 1e-9)
+                    continue;
+                const int note = bars[(size_t) b][j].second;
+                const int root = pc (chordAtBeat (p, beat)->root);
+                ++pedalNotes;
+                if (pc (note) == root)
+                {
+                    ++onRootOrFifth;
+                    if (rootPitch[(size_t) root] < 0)
+                        rootPitch[(size_t) root] = note;
+                    registerJumps += rootPitch[(size_t) root] != note ? 1 : 0;
+                }
+                else if (pc (note) == pc (root + 7))
+                {
+                    ++onRootOrFifth;
+                    // The 5th sits a fifth above this chord's pedal root (never a fourth below it inside the window).
+                    if (rootPitch[(size_t) root] >= 0 && note < rootPitch[(size_t) root])
+                        ++fifthBelow;
+                }
+            }
+        }
+    }
+    const double share = exact / (double) std::max (1, pairs);
+    std::printf ("    %d pedal melodies: %d pedal notes, root / 5th %.3f, exact pitches in %.2f of %d lag-4 rhythm copies\n",
+                 pedalMelodies, pedalNotes, onRootOrFifth / (double) std::max (1, pedalNotes), share, pairs);
+    CHECK (pedalMelodies >= 100);
+    CHECK (onRootOrFifth >= 0.97 * pedalNotes);
+    CHECK_EQ (registerJumps, 0);
+    CHECK_EQ (fifthBelow, 0);
+    CHECK (share >= 0.25);
+}
+
+TEST_CASE ("melody gen: the loop's last note does not clash with its chord")
+{
+    // popAxis ends on IV (E over F was the classic clash), C - Am - F - G on V (C over G).
+    const Progression progressions[] = { popAxis(), prog ({ { 0, Q::Major, 4 }, { 9, Q::Minor, 4 }, { 5, Q::Major, 4 }, { 7, Q::Major, 4 } }) };
+    for (const auto& p : progressions)
+    {
+        const auto ctx = contextFor (p);
+        int runs = 0, clashes = 0, onLastChord = 0;
+        for (auto style : kAllStyles)
+            for (std::uint32_t seed = 1; seed <= 200; ++seed)
+            {
+                const auto m = generateMelody (p, kCMajor, ctx, seed, settingsFor (style));
+                const auto& n = m.notes.back();
+                const int slot = p.slotAtBeat (n.startBeat);   // a loop may end with a rest after an earlier chord
+                const int bass = slotBassPitchClass (p.slots[(size_t) slot], ctx.voicings[(size_t) slot]);
+                ++runs;
+                onLastChord += slot == (int) p.slots.size() - 1 ? 1 : 0;
+                clashes += isTrueClash (p.slots[(size_t) slot].chord, bass, n.note) ? 1 : 0;
+            }
+        std::printf ("    last note clashes with its chord in %.3f of loops (%.2f end over the last chord)\n", clashes / (double) runs,
+                     onLastChord / (double) runs);
+        CHECK (clashes <= 0.05 * runs);
+    }
+}
+
+TEST_CASE ("melody gen: non-chord tones do not pile up and avoid notes stay off the strong beats")
+{
+    struct Case { Progression p; Key key; };
+    const Case cases[] = { { popAxis(), kCMajor }, { epicMinor(), kAMinor }, { secondaryBorrowed(), kCMajor } };
+    for (auto style : kAllStyles)
+    {
+        long notes = 0, inRun3 = 0, sameRun3 = 0, strong = 0, strongAvoid = 0;
+        for (const auto& c : cases)
+        {
+            const auto ctx = contextFor (c.p);
+            for (std::uint32_t seed = 1; seed <= 200; ++seed)
+            {
+                const auto m = generateMelody (c.p, c.key, ctx, seed, settingsFor (style));
+                const size_t n = m.notes.size();
+                std::vector<char> nct (n);
+                for (size_t i = 0; i < n; ++i)
+                    nct[i] = isChordTone (c.p, m.notes[i]) ? 0 : 1;
+                notes += (long) n;
+                for (size_t i = 0; i < n;)
+                {
+                    size_t j = i;
+                    while (j < n && nct[j])
+                        ++j;
+                    inRun3 += j - i >= 3 ? (long) (j - i) : 0;
+                    i = j == i ? i + 1 : j;
+                }
+                for (size_t i = 0; i < n;)
+                {
+                    size_t j = i + 1;
+                    while (j < n && nct[i] && nct[j] && m.notes[j].note == m.notes[i].note)
+                        ++j;
+                    sameRun3 += nct[i] && j - i >= 3 ? (long) (j - i) : 0;
+                    i = j;
+                }
+                if (&c == &cases[2])
+                    continue;   // R2 is measured over the diatonic loops
+                for (size_t i = 0; i < n; ++i)
+                {
+                    const int step = (int) std::lround (m.notes[i].startBeat * 4.0) % 16;
+                    if (step != 0 && step != 8)
+                        continue;
+                    ++strong;
+                    MelodyNote below = m.notes[i];
+                    below.note -= 1;
+                    strongAvoid += nct[i] && isChordTone (c.p, below) ? 1 : 0;
+                }
+            }
+        }
+        std::printf ("    %-10s notes in runs of >= 3 non-chord tones %.3f (same pitch %.3f), strong-beat avoid notes %.3f\n",
+                     melodyStyleShortName (style), inRun3 / (double) notes, sameRun3 / (double) notes, strongAvoid / (double) strong);
+        CHECK (inRun3 <= 0.05 * notes);
+        CHECK (sameRun3 <= 0.02 * notes);
+        CHECK (strongAvoid <= 0.04 * strong);
+    }
+}
+
+TEST_CASE ("melody gen: a forced contour is audible")
+{
+    struct Case { Progression p; Key key; };
+    const Case cases[] = { { popAxis(), kCMajor }, { epicMinor(), kAMinor } };
+    for (auto style : kAllStyles)
+        for (const auto& c : cases)
+        {
+            const auto ctx = contextFor (c.p);
+            int rising = 0, falling = 0, runs = 0;
+            for (std::uint32_t seed = 1; seed <= 200; ++seed)
+            {
+                double d[2] = { 0.0, 0.0 };
+                for (int k = 0; k < 2; ++k)
+                {
+                    const auto m = generateMelody (c.p, c.key, ctx, seed,
+                                                   settingsFor (style, 0.5f, 0, k == 0 ? MelodyContour::Rising : MelodyContour::Falling));
+                    double sum[4] = {}, cnt[4] = {};
+                    for (const auto& n : m.notes)
+                    {
+                        const int bar = std::min (3, (int) (n.startBeat / 4.0));
+                        sum[bar] += n.note;
+                        cnt[bar] += 1.0;
+                    }
+                    int first = -1, last = -1;
+                    for (int b = 0; b < 4; ++b)
+                        if (cnt[b] > 0)
+                        {
+                            first = first < 0 ? b : first;
+                            last = b;
+                        }
+                    d[k] = sum[last] / cnt[last] - sum[first] / cnt[first];
+                }
+                ++runs;
+                rising += d[0] >= 3.0 ? 1 : 0;
+                falling += d[1] <= -3.0 ? 1 : 0;
+            }
+            std::printf ("    %-10s last bar - first bar >= +3 with Rising %.2f, <= -3 with Falling %.2f\n", melodyStyleShortName (style),
+                         rising / (double) runs, falling / (double) runs);
+            CHECK (rising >= 0.7 * runs);
+            CHECK (falling >= 0.6 * runs);
+        }
+}
+
+TEST_CASE ("melody gen: R6 cuts a chord tone held into a b9 over the new bass")
+{
+    // C held from C into Cmaj7/B, F held from F into Fmaj7/E: both are chord tones of the new chord, a b9 over its bass.
+    const auto p = heldIntoInversions();
+    const auto ctx = contextFor (p);
+    CHECK_EQ (slotBassPitchClass (p.slots[1], ctx.voicings[1]), 11);
+    CHECK_EQ (slotBassPitchClass (p.slots[3], ctx.voicings[3]), 4);
+    int crossings = 0, b9 = 0;
+    for (auto style : { MelodyStyle::Uplifting, MelodyStyle::Driving })
+        for (std::uint32_t seed = 1; seed <= 200; ++seed)
+            for (const auto& n : generateMelody (p, kCMajor, ctx, seed, settingsFor (style, 0.3f)).notes)
+                for (int sl : { 1, 3 })
+                {
+                    const double boundary = p.slotStartBeat (sl);
+                    if (n.startBeat >= boundary || n.startBeat + n.lengthBeats <= boundary + 1e-9)
+                        continue;
+                    ++crossings;
+                    b9 += pc (n.note) == (sl == 1 ? 0 : 5) ? 1 : 0;
+                }
+    std::printf ("    %d notes ring into the inverted chords, %d of them a b9 over the bass\n", crossings, b9);
+    CHECK (crossings > 20);
+    CHECK_EQ (b9, 0);
 }
 
 TEST_CASE ("melody gen: budget (64 bars, mean of 20 runs per style)")

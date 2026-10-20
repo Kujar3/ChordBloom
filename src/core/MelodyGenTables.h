@@ -100,13 +100,13 @@ constexpr StyleParams kStyleParams[kStyles] = {
       { .77f, .65f, .63f, .66f, .59f, .64f },
       { .251f, .106f, .055f, .032f, .019f, .007f, .012f, .007f }, { .263f, .127f, .059f, .032f, .016f, .006f, .004f, .004f },
       2.5f, 3.5f, 0.35f, 0.2f, 1.5f, 14,
-      0.5f, 0.52f, 1, -5, 8, 7.0f, 10.0f, { .13f, .32f, .10f, .45f }, 0.0f, 0.37f, 0.5f, false, 4.5f, 0.12f, 0.5f, 0.04f },
+      0.5f, 0.52f, 1, -5, 8, 7.0f, 10.0f, { .13f, .32f, .10f, .45f }, 0.0f, 0.37f, 0.5f, false, 4.5f, 0.12f, 0.5f, 0.06f },
     // Driving riff (ext fast)
     { 8.0f, 10.9f, 16.0f, 1.0f, true, 0.34f, 0.46f, 3.0f, 0.45f,
       { .81f, .83f, .75f, .77f, .77f, .75f },
       { .096f, .055f, .038f, .062f, .023f, .016f, .064f, .170f }, { .078f, .051f, .033f, .040f, .021f, .016f, .052f, .184f },
       2.5f, 3.5f, 0.6f, 0.45f, 1.0f, 24,
-      0.2f, 0.92f, -2, -14, 7, 12.5f, 15.0f, { .10f, .33f, .18f, .39f }, 0.4f, 0.77f, 0.0f, false, 6.0f, 0.12f, 1.0f, 0.04f },
+      0.2f, 0.92f, -2, -14, 7, 12.5f, 15.0f, { .10f, .33f, .18f, .39f }, 0.5f, 0.77f, 0.0f, false, 6.0f, 0.12f, 1.0f, 0.04f },
     // Sparse ([X-tail] rhythm, [D] pitch / register / gate)
     { 1.0f, 1.5f, 2.5f, 0.1f, false, 0.65f, 0.05f, 0.5f, 0.22f,
       { .85f, .80f, .70f, .65f, .60f, .60f },
@@ -114,6 +114,11 @@ constexpr StyleParams kStyleParams[kStyles] = {
       2.5f, 3.5f, 0.35f, 0.2f, 1.5f, 12,
       0.7f, 0.20f, 3, -4, 9, 7.0f, 10.0f, { .05f, .15f, .10f, .70f }, 0.0f, 0.37f, 0.5f, true, 2.0f, 0.08f, 1.0f, 0.02f },
 };
+
+// [D] Register anchor floor: the window sits over max (median voicing top, this). Chordbloom's default voicings in
+// minor keys top out at 62-65, which put the Uplifting lead at B3-B4 inside the pad; the corpus lead median is 70.
+// 0 = no floor (Lyrical and Sparse already sit above the voicing top).
+constexpr int kMinVoicingTop[kStyles] = { 67, 0, 67, 0 };
 
 //==============================================================================
 // Whole-bar templates (GP 1.3.2; every mask occurs in >= 20 distinct files). The pickup masks are not listed: the
@@ -265,6 +270,10 @@ enum Relation { kRelExact = 0, kRelTransposed, kRelEnding, kRelVaried, kNumRelat
 constexpr float kRelations[kStyles][kNumRelations] = {
     { .25f, .05f, .11f, .58f }, { .30f, .11f, .09f, .50f }, { .21f, .13f, .07f, .59f }, { .30f, .11f, .09f, .50f },
 };
+// [D] tuned: P(a "varied" copy really changes 1-2 onsets of its last bar), else it keeps the rhythm and its pitches
+// take the GP 1.5.4 treatment like any rhythm copy. GP 1.5.2's own lag-4 targets (.80 / .73 / .90 exact bar-rhythm
+// repeats) leave room for only about this many changed bars next to its .50-.59 "varied" share.
+constexpr float kVariedRhythmChange[kStyles] = { 0.35f, 0.35f, 0.25f, 0.35f };
 
 // Pitch treatment of a rhythm-copied unit (GP 1.5.4; Sparse = Lyrical): exact, fit-transpose, ending change, re-pick.
 // [style][0] = the chords under the copy changed, [style][1] = the same chords.
@@ -275,7 +284,19 @@ constexpr float kTreatments[kStyles][2][kNumTreatments] = {
     { { .08f, .19f, .05f, .69f }, { .37f, .04f, .10f, .49f } },
     { { .26f, .37f, .02f, .34f }, { .53f, .33f, .01f, .13f } },
 };
-constexpr float kExactAcceptChordToneShare = 0.5f;   // GP 1.5.4
+// GP 1.5.4: an exact copy over changed chords is kept only when this share of its down / beat3 notes stays chord
+// tones (a strong-position R2 avoid tone counts -1); otherwise it becomes a fit-transpose.
+constexpr float kExactAcceptChordToneShare = 0.5f;
+// [D] Repetition (r) also tilts the copies (final-spec 5.4.2 amendment, review: Loop-like must be audible): the relation
+// of a repeated letter (exact / transposed x exp (k (r - 0.5)), varied x exp (-k (r - 0.5))) and the GP 1.5.4 pitch
+// treatment (exact x exp (k (r - 0.5)), re-pick x exp (-k (r - 0.5))). r = 0.5 keeps the corpus weights. Both draws
+// come from the rhythm / pitch streams, so the plan signature is unaffected.
+constexpr float kRelationTilt = 4.0f;
+constexpr float kTreatmentTilt = 4.0f;
+// [D] With a user-forced contour an exact copy whose place on the contour path lies this many semitones away from its
+// prototype's becomes a fit-transpose, scored with kFitContourCost per semitone of missed path movement.
+constexpr double kForcedExactMaxDrift = 1.0;
+constexpr double kFitContourCost = 1.0;
 constexpr int kFitShiftMax = 3;                      // GP 1.5.4: diatonic shifts -3..+3
 
 //==============================================================================
@@ -333,7 +354,11 @@ constexpr float kShortSlotCtBonus = 0.05f;   // GP 5.4.3: pCT + 0.05 when the sl
 constexpr float kAugSecondFactor = 0.5f;     // R1: an augmented 2nd counts as one step with x0.5
 constexpr double kContourTau = 4.0;          // Wcontour = exp (-|p - target| / tau)
 constexpr double kRepickTau = 2.5;           // [D] re-picked units follow the prototype's pitches more tightly
+constexpr double kForcedContourTau = 1.0;    // [D] tuned: a user-forced contour steers harder (Wreg also centres on it)
+constexpr double kForcedSpanScale = 1.3;     // [D] tuned: ... over a wider span than the corpus median (GP 1.4.5 p75 9-12)
 constexpr float kAvoidFactor = 0.3f;         // R2
+constexpr int kNctMaxRun = 2;                // [D] at most this many non-chord tones in a row (a held NCT and its repeat),
+                                             // then a chord tone; the note after a held pair steps to a chord tone
 
 // Contour draws per phrase (GP 1.4.5): Rising, Falling, Arch, Valley, Wave.
 enum ContourShape { kShapeRising = 0, kShapeFalling, kShapeArch, kShapeValley, kShapeWave, kNumShapes };
@@ -356,9 +381,12 @@ constexpr float kAppoggiaturaOpposite = 0.57f;
 constexpr float kAnticipationRepeat = 0.6f;
 constexpr double kNctMaxIoiBeats[kStyles] = { 2.0, 3.0, 2.0, 4.0 };   // [D] the resolving note follows within this
 
-// Driving pedal alternation (GP 1.4.8).
-constexpr float kPedalFifth = 0.3f;
+// Driving pedal alternation (GP 1.4.8). The pedal is the chord root at the window floor (+ 0..11) and, in a unit
+// that alternates, the 5th a fifth above it on every second pedal note; the choice is made once per unit (copies
+// inherit it), so a repeated bar repeats its pedal. 0.6 of the units alternate -> GP's 5th share of .3.
+constexpr float kPedalFifthPattern = 0.6f;
 constexpr int kPedalUpperGap = 7;
+constexpr double kPedalAnchor = 3.0;      // [D] a forced contour moves the pedal's anchor (floor + this) along its path
 constexpr int kDrivingLineMaxLeap = 12;   // [D] tuned: without the pedal a Driving line leaps at most an octave (the
                                           // corpus' 8+ step leaps are the pedal figure, which the pedal mode plays)
 
@@ -389,7 +417,15 @@ constexpr float kFinalMajor[7] = { .24f, .11f, .28f, .02f, .15f, .13f, .05f };
 constexpr float kFirstMinor[7] = { .46f, .04f, .17f, .06f, .18f, .04f, .04f };
 constexpr float kFirstMajor[7] = { .28f, .08f, .15f, .06f, .22f, .13f, .07f };
 constexpr float kResolveTonic = 2.0f;        // GP 1.5.6: the tonic x2 on the loop's final note
-constexpr float kResolveChordTone = 1.0f;    // [D] tuned: the final note also leans to a tone of the last chord
+constexpr float kResolveFamily = 1.5f;       // [D] tuned: ... and the tonic family (1, 3, 5) x1.5 (the clash cut costs
+                                             // the tonic over V / bVII, final-spec 9 WP1 wants >= 60% tonic family)
+constexpr float kResolveChordTone = 2.0f;    // [D] tuned: the final note also leans to a tone of the last chord
+constexpr float kResolveClash = 0.01f;       // [D] ... and avoids a non-chord tone a semitone from a tone of that chord
+                                             // (or a b9 above its bass); a pickup into the loop start also uses it
+// [D] When no tonic-family tone (1, 3, 5) is a tone of the last chord (VII in minor, V or IV in major), a chord tone
+// 1-2 semitones from the melody's first note counts as "home" (at least the tonic's row weight x2 x this): it resolves
+// through the seam. Tuned so the tonic family keeps >= 60% of loop ends (final-spec 9 WP1) without a clash.
+constexpr float kResolveHome = 0.25f;
 
 // R3 open / closed cadence factors by key degree 1..7.
 constexpr float kOpenFactor[7] = { 0.6f, 1.4f, 0.9f, 1.0f, 1.4f, 1.0f, 1.2f };
@@ -424,9 +460,9 @@ constexpr LengthWeight kFinalLenLyrical[] = {
 };
 constexpr double kSparseFinalMax = 4.0;
 constexpr double kMinRestAfterPhrase = 1.0;   // [D] a phrase-final note before a gap leaves >= 1 beat of rest
-constexpr double kNctMaxRest = 0.5;
+constexpr double kNctMaxRest = 0.5;           // [D] a non-chord tone inside a phrase leads on: at most this much rest
 constexpr double kLengthGrid = 0.125;         // [D] note lengths snap to 1/32 notes (tidy in the roll)
-constexpr double kLonePhraseHold = 2.0;       // [D] a one-note phrase holds up to this long           // [D] a non-chord tone inside a phrase leads on: at most this much rest
+constexpr double kLonePhraseHold = 2.0;       // [D] a one-note phrase holds up to this long
 
 } // namespace melodygen
 } // namespace cb

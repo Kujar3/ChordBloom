@@ -9,24 +9,33 @@
 // (frozen behaviour); the generator itself is WP1's.
 //
 // Pipeline (final-spec 5.4.3; every number lives in MelodyGenTables.h):
-//   0. Setup: per slot the local chord-scale (R1: a key tone is replaced by the same-letter out-of-key chord tone),
-//      the chord-tone kinds, the bass pitch class; the register window (GP 1.4.6 + registerShift + R8).
+//   0. Setup: per slot the local chord-scale (R1: a key tone is replaced by the same-letter out-of-key chord tone; a
+//      chord borrowed in a major key takes the parallel minor's scale and drops the tones a semitone under its root or
+//      next to its 5th), the chord-tone kinds, the bass pitch class; the register window (GP 1.4.6 over max (median
+//      voicing top, the style's floor) + registerShift + R8).
 //   1. Plan (stream `plan`): unit length (1 or 2 bars), form letters per 4-unit block (repetition tilts the weights,
 //      the pick is an inverse CDF over the forms sorted most repetitive first), the gap plan (continuous loop, or
 //      rests at unit ends with phrase-start steps and pickups), cadence tags and the Driving pedal mode. Loops longer
-//      than 8 units repeat the 8-unit plan. Cadence points: every gap, every half block (unit 2 of 4: the
-//      "question"), every block end and the loop end; block ends and the loop end are closed, the rest open (R3).
+//      than 8 units repeat the 8-unit plan. Cadence points: every gap, every block end and the loop end; block ends
+//      and the loop end are closed, the rest open (R3). Each repeated unit names its prototype: a copied second block
+//      restates the realised first block unit by unit (phrasing included); the generator prefers a same-letter
+//      prototype with the same chords under it.
 //   2. Rhythm (one stream per unit): a new letter draws whole-bar templates or density-tilted beat cells (Sparse: a
-//      k-of-16 slot draw) under the odd-16th cap; a repeated letter copies its first unit's rhythm (varied: 1-2
-//      onsets of its last bar changed); a new letter copies A's rhythm with the style's probability. Gaps, delayed
-//      phrase starts and pickups come from the plan. Above 512 onsets the target is lowered once.
+//      k-of-16 slot draw) under the odd-16th cap; a repeated letter copies its prototype's rhythm (a "varied" copy
+//      changes 1-2 onsets of its last bar with the style's probability; repetition tilts the relation); a new letter
+//      copies A's rhythm with the style's probability. Gaps, delayed phrase starts and pickups come from the plan.
+//      Above 512 onsets the target is lowered once.
 //   3. Pitch (stream `pitch`, a fixed number of draws per unit, phrase and note, so a setting that only moves the
 //      register or the contour keeps the same "idea"): new notes = repeat-or-move, chord tone or not by position,
-//      a non-chord-tone construction with one-note look-ahead, then a weighted pick Wstep x Wreg x Wcontour x Wkind
-//      x Wleap x Wnct x Wavoid over the window. Repeated units: exact (adapted to the new chord-scale) / fit-
-//      transposed / ending change / re-picked along the original pitches. Driving pedal mode alternates a low root
-//      (or fifth) with the upper line. Cadence notes are picked inline with the cadence table x approach x R3; the
-//      loop end with resolveEnding uses the key-relative row with the tonic x2; R7 measures the last note to the first.
+//      a non-chord-tone construction with one-note look-ahead (at most two non-chord tones in a row; a held one
+//      repeats once and then steps to a chord tone), then a weighted pick Wstep x Wreg x Wcontour x Wkind x Wleap x
+//      Wnct x Wavoid over the window. Repeated units: every bar whose rhythm equals its prototype's takes the GP 1.5.4
+//      treatment (exact, adapted to the new chord-scale / fit-transposed / ending change / re-picked along the
+//      prototype; repetition tilts it); a bar with a varied rhythm re-picks. A forced contour steers harder (Wreg
+//      centres on its path). Driving pedal mode alternates a low root (or, per unit, root and fifth) with the upper
+//      line. Cadence notes are picked inline with the cadence table x approach x R3 x R2; the loop end with
+//      resolveEnding uses the key-relative row with the tonic x2 and avoids a clash with its chord; R7 measures the
+//      last note to the first.
 //   4. Articulation (stream `artic`): IOI x gate class, phrase-final lengths, Lyrical / Sparse holds; R6 cuts a note
 //      held into a clashing chord at the boundary (Lyrical / Sparse keep a step-down suspension).
 // Not implemented (P2): R4 clash costs, R5 bass awareness, chromatic passing tones.
@@ -248,7 +257,7 @@ Window computeWindow (const Progression& prog, const MelodyGenContext& ctx, cons
             tops.push_back (top);
     }
 
-    const int top = tops.empty() ? kDefaultVoicingTop : medianOf (tops);
+    const int top = std::max (tops.empty() ? kDefaultVoicingTop : medianOf (tops), kMinVoicingTop[styleIndex (s.style)]);
 
     Window w;
     w.lo = top + sp.regLo + s.registerShift;
@@ -355,13 +364,19 @@ SlotInfo makeSlotInfo (const ProgressionSlot& ps, const std::vector<int>& voicin
     si.kind.fill (-1);
 
     const int tonic = pc (key.tonic);
-    const auto keyPcs = key.pitchClasses();
+
+    // R1 for borrowed chords: in a major-family key a chord borrowed from the parallel minor (iv, bVI, bVII, ...) takes
+    // its chord-scale from key.parallel() (C major Bb -> C D Eb F G Ab Bb, not Bb Lydian); the letters stay the key's.
+    const bool borrowed = harmonicFunction (si.chord, key) == HarmonicFunction::Borrowed;
+    const Key scaleKey = borrowed && ! scaleInfo (key.scale).isMinorFamily ? key.parallel() : key;
+    const auto homePcs = key.pitchClasses();
+    const auto keyPcs = scaleKey.pitchClasses();
     std::array<char, 7> letters {};
 
     for (int d = 0; d < 7; ++d)
     {
         si.offset[(size_t) d] = pc (keyPcs[(size_t) d] - tonic);
-        const auto name = key.spell (keyPcs[(size_t) d]);
+        const auto name = key.spell (homePcs[(size_t) d]);
         letters[(size_t) d] = name.empty() ? '?' : name[0];
     }
 
@@ -389,15 +404,20 @@ SlotInfo makeSlotInfo (const ProgressionSlot& ps, const std::vector<int>& voicin
         si.kind[(size_t) t] = k;
     }
 
+    // A key tone the parallel scale changes is replaced (unless the chord has it).
+    for (int d = 0; d < 7; ++d)
+        if (keyPcs[(size_t) d] != homePcs[(size_t) d] && ! si.chordTone[(size_t) homePcs[(size_t) d]])
+            si.replaced[(size_t) homePcs[(size_t) d]] = true;
+
     // R1: the scale tone with the same letter as an out-of-key chord tone is replaced by that chord tone.
     std::array<bool, 7> degreeReplaced {};
     for (int iv : ivs)
     {
         const int t = pc (si.chord.root + iv);
-        if (key.contains (t))
+        if (scaleKey.contains (t))
             continue;
 
-        const auto name = spellChordTone (si.chord, iv, key);
+        const auto name = spellChordTone (si.chord, iv, scaleKey);
         if (name.empty())
             continue;
 
@@ -422,6 +442,22 @@ SlotInfo makeSlotInfo (const ProgressionSlot& ps, const std::vector<int>& voicin
 
     for (int d = 0; d < 7; ++d)
         si.inScale[(size_t) pc (tonic + si.offset[(size_t) d])] = true;
+
+    // A borrowed chord also drops the non-chord scale tones a semitone below its root or a semitone from its 5th (the
+    // degree keeps its place for step counting, it is just never played over this chord).
+    if (borrowed)
+        for (int p = 0; p < 12; ++p)
+        {
+            if (! si.inScale[(size_t) p] || si.chordTone[(size_t) p])
+                continue;
+            const bool belowRoot = p == pc (si.chord.root - 1);
+            const bool byFifth = (si.kind[(size_t) pc (p + 1)] == 2) || (si.kind[(size_t) pc (p - 1)] == 2);
+            if (belowRoot || byFifth)
+            {
+                si.inScale[(size_t) p] = false;
+                si.replaced[(size_t) p] = true;
+            }
+        }
 
     for (int r = 0; r < 12; ++r)
     {
@@ -473,6 +509,7 @@ struct UnitPlan
     int startStep = 0;   // after the gap the next phrase starts this many 16ths into the next unit
     int pickup = 0;      // ... or with this many pickup notes at the end of this unit
     char cad = '-';      // cadence point at the end of the unit: 'o' open, 'c' closed
+    int proto = -1;      // the earlier unit this one restates (same letter; -1 = it introduces its letter)
 };
 
 struct Plan
@@ -564,6 +601,7 @@ Plan makePlan (std::uint32_t base, int style, double repetition, int totalSteps)
     const int table = plan.unitBars == 2 ? 1 : 0;
 
     std::string letters;
+    bool blockCopied = false;
     if (planUnits <= 2)
         letters = pickForm (style, table, planUnits, repetition, uForm1, true);
     else
@@ -577,7 +615,8 @@ Plan makePlan (std::uint32_t base, int style, double repetition, int totalSteps)
             const double a = std::exp (kRepetitionTilt * (repetition - 0.5));
             const double pCopy = p * a / (p * a + (1.0 - p));
 
-            if (uCopy < pCopy)
+            blockCopied = uCopy < pCopy;
+            if (blockCopied)
                 letters += letters.substr (0, (size_t) m);
             else
             {
@@ -592,9 +631,19 @@ Plan makePlan (std::uint32_t base, int style, double repetition, int totalSteps)
     std::vector<UnitPlan> pu ((size_t) planUnits);
     bool anyGap = false;
 
+    // A copied second block also restates the first block's phrasing (its gaps, phrase starts and pickups); a shorter
+    // second block keeps its own loop-end unit.
+    auto copiesPhrasing = [&] (int k) { return blockCopied && k >= 4 && (k != planUnits - 1 || planUnits == 8); };
+
     for (int k = 0; k < planUnits; ++k)
     {
         pu[(size_t) k].letter = letters[(size_t) k] - 'A';
+        if (copiesPhrasing (k))
+        {
+            pu[(size_t) k].gapBeats = pu[(size_t) k - 4].gapBeats;
+            anyGap = anyGap || pu[(size_t) k].gapBeats > 0;
+            continue;
+        }
         const int place = (k % 4 == 3 || k == planUnits - 1) ? 3 : k % 4;
         const bool phraseEnd = plan.unitBars == 2 || k % 2 == 1 || k == planUnits - 1;   // phrases of >= 2 bars
         if (! continuous && phraseEnd && draws[(size_t) k].present < kGapAtUnitEnd[place])
@@ -612,6 +661,14 @@ Plan makePlan (std::uint32_t base, int style, double repetition, int totalSteps)
         auto& u = pu[(size_t) k];
         if (u.gapBeats == 0)
             continue;
+
+        if (copiesPhrasing (k) && pu[(size_t) k - 4].gapBeats > 0)
+        {
+            u.gapBeats = pu[(size_t) k - 4].gapBeats;
+            u.startStep = pu[(size_t) k - 4].startStep;
+            u.pickup = pu[(size_t) k - 4].pickup;
+            continue;
+        }
 
         const auto& d = draws[(size_t) k];
         const auto& buckets = kGapBuckets[style];
@@ -632,9 +689,30 @@ Plan makePlan (std::uint32_t base, int style, double repetition, int totalSteps)
             u.startStep = step;
     }
 
+    // Prototypes: a copied second block restates the realised first block unit by unit (unit k + 4 -> unit k), and a
+    // repeat of the 8-unit plan restates the unit one plan earlier; otherwise the first unit with the same letter.
+    for (int k = 0; k < planUnits; ++k)
+    {
+        if (blockCopied && k >= 4)
+        {
+            pu[(size_t) k].proto = k - 4;
+            continue;
+        }
+        for (int j = 0; j < k; ++j)
+            if (pu[(size_t) j].letter == pu[(size_t) k].letter)
+            {
+                pu[(size_t) k].proto = j;
+                break;
+            }
+    }
+
     plan.units.resize ((size_t) numUnits);
     for (int k = 0; k < numUnits; ++k)
+    {
         plan.units[(size_t) k] = pu[(size_t) (k % planUnits)];
+        if (k >= planUnits)
+            plan.units[(size_t) k].proto = k - planUnits;
+    }
 
     // Clip the gaps to the real unit lengths (a unit keeps at least one beat of notes).
     for (int k = 0; k < numUnits; ++k)
@@ -644,7 +722,7 @@ Plan makePlan (std::uint32_t base, int style, double repetition, int totalSteps)
         u.gapBeats = std::min (u.gapBeats, unitBeats - 1);
         if (u.gapBeats <= 0)
         {
-            u = UnitPlan { u.letter, 0, 0, 0, '-' };
+            u = UnitPlan { u.letter, 0, 0, 0, '-', u.proto };
             continue;
         }
         while (u.pickup > 0 && u.gapBeats * 2 < u.pickup + 2)
@@ -662,11 +740,13 @@ Plan makePlan (std::uint32_t base, int style, double repetition, int totalSteps)
             u.startStep = 0;
     }
 
+    // Cadence points (final-spec 5.4.3 step 1, GP 1.5.5): the last note before each gap, the last note of each 4-unit
+    // block and the loop end; block ends and the loop end are closed, the rest open (R3).
     for (int k = 0; k < numUnits; ++k)
     {
         auto& u = plan.units[(size_t) k];
         const bool last = k == numUnits - 1;
-        const bool cadence = u.gapBeats > 0 || k % 4 == 1 || k % 4 == 3 || last;
+        const bool cadence = u.gapBeats > 0 || k % 4 == 3 || last;
         u.cad = ! cadence ? '-' : (k % 4 == 3 || last) ? 'c' : 'o';
     }
 
@@ -711,8 +791,9 @@ std::string planSignature (const Plan& plan)
 struct UnitRhythm
 {
     std::vector<int> raw;      // onset steps relative to the unit start, before the gap plan
-    int proto = -1;            // earlier unit with the same letter (-1 = this unit introduces its letter)
+    int proto = -1;            // the unit this one restates (UnitPlan::proto; -1 = this unit introduces its letter)
     int relation = kRelExact;  // GP 1.5.2 relation to proto
+    bool rhythmChanged = false;   // a "varied" copy whose onsets differ from its prototype's
 };
 
 struct Onset
@@ -743,6 +824,7 @@ struct OddState
 struct RhythmParams
 {
     int style = 0;
+    double repetition = 0.5;                    // tilts the relation of a repeated letter (kRelationTilt)
     double target = 4.0;                        // onsets per bar
     std::array<std::array<double, 8>, 4> cellW; // density-tilted cell weights per beat
 };
@@ -765,10 +847,11 @@ double expectedCellOnsets (int style, double g)
     return e;
 }
 
-RhythmParams makeRhythmParams (int style, double target)
+RhythmParams makeRhythmParams (int style, double repetition, double target)
 {
     RhythmParams rp;
     rp.style = style;
+    rp.repetition = repetition;
     rp.target = target;
 
     double lo = -kDensityTiltRange, hi = kDensityTiltRange;
@@ -896,6 +979,16 @@ std::vector<int> drawNewUnit (Rng& rng, const RhythmParams& rp, int unitLen)
     return steps;
 }
 
+// GP 1.5.2 relation of a repeated letter, tilted by repetition (kRelationTilt).
+int pickRelation (int style, double repetition, double u)
+{
+    const double up = std::exp (kRelationTilt * (repetition - 0.5));
+    std::array<double, kNumRelations> w {};
+    for (int r = 0; r < kNumRelations; ++r)
+        w[(size_t) r] = kRelations[style][r] * (r == kRelExact || r == kRelTransposed ? up : r == kRelVaried ? 1.0 / up : 1.0);
+    return std::max (0, pickIndex (w, kNumRelations, u));
+}
+
 // GP 1.5.2 "varied": 1-2 onsets of the unit's last bar added, removed or shifted by a 16th (an 8th for the styles
 // with a low odd-16th cap).
 void varyRhythm (Rng& rng, std::vector<int>& raw, int unitLen, int style)
@@ -954,26 +1047,24 @@ Rhythm buildRhythmOnce (std::uint32_t base, const Plan& plan, const RhythmParams
     for (int k = 0; k < numUnits; ++k)
     {
         Rng rng (streamSeed (base, 2, (std::uint32_t) k));
-        const double uRelation = rng.uniform(), uCopyA = rng.uniform();
+        const double uRelation = rng.uniform(), uCopyA = rng.uniform(), uVary = rng.uniform();
         const int unitLen = plan.unitEnd (k) - plan.unitStart (k);
         auto& ur = rh.units[(size_t) k];
         const int letter = plan.units[(size_t) k].letter;
-
-        for (int j = 0; j < k; ++j)
-            if (plan.units[(size_t) j].letter == letter)
-            {
-                ur.proto = j;
-                break;
-            }
+        ur.proto = plan.units[(size_t) k].proto;
 
         if (ur.proto >= 0)
         {
-            ur.relation = std::max (0, pickIndex (kRelations[rp.style], kNumRelations, uRelation));
+            ur.relation = pickRelation (rp.style, rp.repetition, uRelation);
             for (int s : rh.units[(size_t) ur.proto].raw)
                 if (s < unitLen)
                     ur.raw.push_back (s);
-            if (ur.relation == kRelVaried && plan.units[(size_t) k].cad == 'c')
-                varyRhythm (rng, ur.raw, unitLen, rp.style);   // elsewhere "varied" re-picks the pitches only
+            if (ur.relation == kRelVaried && uVary < kVariedRhythmChange[rp.style])
+            {
+                const auto copy = ur.raw;
+                varyRhythm (rng, ur.raw, unitLen, rp.style);
+                ur.rhythmChanged = ur.raw != copy;
+            }
         }
         else if (letter != 0 && uCopyA < sp.pCopyARhythm)
         {
@@ -1035,19 +1126,19 @@ Rhythm buildRhythmOnce (std::uint32_t base, const Plan& plan, const RhythmParams
     return rh;
 }
 
-Rhythm buildRhythm (std::uint32_t base, const Plan& plan, int style, double density)
+Rhythm buildRhythm (std::uint32_t base, const Plan& plan, int style, double density, double repetition)
 {
     const auto& sp = kStyleParams[style];
     const double npb = density < 0.5 ? sp.npbLo + (sp.npbDef - sp.npbLo) * 2.0 * density
                                      : sp.npbDef + (sp.npbHi - sp.npbDef) * (2.0 * density - 1.0);
     double target = npb + sp.npbCompensation;
 
-    Rhythm rh = buildRhythmOnce (base, plan, makeRhythmParams (style, target));
+    Rhythm rh = buildRhythmOnce (base, plan, makeRhythmParams (style, repetition, target));
 
     if ((int) rh.onsets.size() > kMaxMelodyNotes)
     {
         target *= (double) kMaxMelodyNotes / (double) rh.onsets.size() * 0.97;
-        rh = buildRhythmOnce (base, plan, makeRhythmParams (style, target));
+        rh = buildRhythmOnce (base, plan, makeRhythmParams (style, repetition, target));
     }
 
     if ((int) rh.onsets.size() > kMaxMelodyNotes)   // last resort: keep the even 16ths (at most 8 per bar)
@@ -1066,6 +1157,10 @@ Rhythm buildRhythm (std::uint32_t base, const Plan& plan, int style, double dens
 
 //==============================================================================
 // Pitch (stream 3) and articulation (stream 4).
+// Pending out-constraint after a held non-chord tone and its repeat: the next note steps (1-2 semitones) to a chord
+// tone (GP 1.4.7 "arrival then hold" resolves; it does not continue).
+constexpr int kPendStepToChordTone = kNumNct;
+
 struct Line
 {
     int prev = -1;          // previous pitch of the line (-1 = none yet)
@@ -1073,6 +1168,8 @@ struct Line
     int pendType = -1;      // NCT out-constraint on the line's next note
     int pendOrigin = 0;
     int pendDir = 0;
+    int nctRun = 0;         // non-chord tones in a row ending at prev (each of its own slot)
+    int repeatRun = 0;      // repeats in a row ending at prev
 };
 
 struct NoteDraws
@@ -1094,6 +1191,8 @@ public:
     {
         base = baseHash (prog, key, seed, style);
         tonic = pc (key.tonic);
+        keyPcs = key.pitchClasses();
+        forced = set.contour != MelodyContour::Auto;
         minorKey = scaleInfo (key.scale).isMinorFamily;
         totalSteps = totalStepsOf (prog);
         window = computeWindow (prog, ctx, set);
@@ -1120,8 +1219,9 @@ public:
             return out;
 
         plan = makePlan (base, style, set.repetition, totalSteps);
+        preferSameChordProtos();
         maxLeap = style == kDriving && ! plan.pedal ? kDrivingLineMaxLeap : sp.maxLeap;
-        rhythm = buildRhythm (base, plan, style, set.density);
+        rhythm = buildRhythm (base, plan, style, set.density, set.repetition);
         markOnsets();
         pickPitches();
         articulate (out);
@@ -1137,7 +1237,10 @@ private:
     const StyleParams& sp;
     std::uint32_t base = 0;
     int tonic = 0;
+    std::array<int, 7> keyPcs {};
     bool minorKey = false;
+    bool forced = false;       // a user-forced contour (not Auto)
+    double regCentre = 72.0;   // Wreg centre for the note being picked (the contour target when forced)
     int totalSteps = 0;
     Window window;
     std::vector<SlotInfo> slots;
@@ -1148,6 +1251,41 @@ private:
     int maxLeap = 12;
 
     std::vector<Onset>& on() { return rhythm.onsets; }
+
+    // The chords under a unit, step by step (-1 past the loop end), for matching restatements.
+    bool sameChordsUnder (int a, int b) const
+    {
+        const int len = plan.unitSteps;
+        for (int st = 0; st < len; ++st)
+        {
+            const int x = plan.unitStart (a) + st, y = plan.unitStart (b) + st;
+            const bool inA = x < totalSteps, inB = y < totalSteps;
+            if (inA != inB)
+                return false;
+            if (inA && ! (slots[(size_t) slotOfStep[(size_t) x]].chord == slots[(size_t) slotOfStep[(size_t) y]].chord))
+                return false;
+        }
+        return true;
+    }
+
+    // A repeated letter restates its plan prototype when the chords under both match; otherwise the latest earlier unit
+    // with the same letter and the same chords, if any (AAAA over a 2-unit chord cycle: unit 3 restates unit 1). The
+    // plan stays the plan stream's; this only picks which realised unit a copy reads.
+    void preferSameChordProtos()
+    {
+        for (int k = 0; k < plan.numUnits(); ++k)
+        {
+            auto& u = plan.units[(size_t) k];
+            if (u.proto < 0 || sameChordsUnder (u.proto, k))
+                continue;
+            for (int j = k - 1; j >= 0; --j)
+                if (plan.units[(size_t) j].letter == u.letter && sameChordsUnder (j, k))
+                {
+                    u.proto = j;
+                    break;
+                }
+        }
+    }
     const SlotInfo& slotAt (int i) const { return slots[(size_t) rhythm.onsets[(size_t) i].slot]; }
 
     //==========================================================================
@@ -1252,19 +1390,28 @@ private:
     double wReg (int p) const
     {
         const double sigma = std::max (1.0, (window.hi - window.lo) / 3.0);
-        const double z = (p - window.centre) / sigma;
+        const double z = (p - regCentre) / sigma;
         double w = std::exp (-0.5 * z * z);
         if (window.arpFloor >= 0 && p < window.arpFloor)
             w *= kBelowArpFactor;
         return w;
     }
 
-    static double wContour (int p, double target) { return std::exp (-std::abs (p - target) / kContourTau); }
+    static double wContour (int p, double target, double tau) { return std::exp (-std::abs (p - target) / tau); }
 
-    double wContourAt (int i, int p, double target) const
+    // Contour tau of onset i: a forced contour steers hardest, a re-pick follows its prototype more tightly.
+    double tauAt (int i) const
     {
-        const double tau = protoTarget[(size_t) i] >= 0 ? kRepickTau : kContourTau;
-        return std::exp (-std::abs (p - target) / tau);
+        return forced ? kForcedContourTau : protoRef[(size_t) i] >= 0 ? kRepickTau : kContourTau;
+    }
+
+    // Wstep for the cadence-type picks: a repeat weighs like the mean 1-step move (wStep returns 1 for a repeat,
+    // because GP's step table is moving-only), so a repeat does not beat every step by 2-7x.
+    double wStepEven (const SlotInfo& s, int from, int to) const
+    {
+        if (from >= 0 && from == to)
+            return 0.5 * (sp.stepUp[0] + sp.stepDown[0]) * sp.stepBias;
+        return wStep (s, from, to);
     }
 
     double wLeap (const Line& line, int p) const
@@ -1322,19 +1469,28 @@ private:
     //==========================================================================
     // Contour
     std::vector<int> segShape;   // per segment
-    std::vector<int> protoTarget;  // per onset: re-pick target pitch (-1 = the contour path)
+    std::vector<int> protoRef;   // per onset: the prototype onset a re-pick follows (-1 = the contour path)
 
+    // A re-pick follows its prototype's pitch, moved along the phrase path when both lie in one contour segment or the
+    // contour is forced (so a restated motif rises with a Rising phrase); otherwise it restates at the same pitch.
     double contourTarget (int i) const
     {
+        const int r = protoRef[(size_t) i];
+        if (r < 0)
+            return pathTarget (i);
+        const bool follow = forced || rhythm.onsets[(size_t) r].segment == rhythm.onsets[(size_t) i].segment;
+        return pitch[(size_t) r] + (follow ? pathTarget (i) - pathTarget (r) : 0.0);
+    }
+
+    double pathTarget (int i) const
+    {
         const auto& o = rhythm.onsets[(size_t) i];
-        if (protoTarget[(size_t) i] >= 0)
-            return protoTarget[(size_t) i];
 
         const double bars = std::max (1.0, (o.segEnd - o.segStart) / (double) kBarSteps);
-        const double span = std::min ((double) (window.hi - window.lo - 2),
-                                      bars <= 4.0 ? sp.phraseSpan
-                                                  : bars >= 8.0 ? sp.phraseSpan8
-                                                                : sp.phraseSpan + (sp.phraseSpan8 - sp.phraseSpan) * (bars - 4.0) / 4.0);
+        const double natural = bars <= 4.0 ? sp.phraseSpan
+                             : bars >= 8.0 ? sp.phraseSpan8
+                                           : sp.phraseSpan + (sp.phraseSpan8 - sp.phraseSpan) * (bars - 4.0) / 4.0;
+        const double span = std::min ((double) (window.hi - window.lo - 2), natural * (forced ? kForcedSpanScale : 1.0));
         const double c = window.centre, x = o.segX, h = 0.5 * span;
 
         switch (segShape[(size_t) o.segment])
@@ -1373,11 +1529,32 @@ private:
         return std::clamp (p, lo, hi);
     }
 
-    void accept (Line& line, int p) const
+    static void accept (Line& line, int p, const SlotInfo& s)
     {
+        line.repeatRun = line.prev == p ? line.repeatRun + 1 : 0;
+        line.nctRun = s.chordTone[(size_t) pc (p)] ? 0 : line.nctRun + 1;
         line.prevInterval = line.prev >= 0 ? p - line.prev : 0;
         line.prev = p;
     }
+
+    // R6 / resolveEnding: a true clash with a chord - a b9 above its bass pitch class (unless the chord itself has that
+    // tone as an extension, such as a root-position 7b9), or a non-chord tone a semitone from one of its tones.
+    static bool clashesWith (const SlotInfo& s, int p)
+    {
+        const int ppc = pc (p);
+        if (ppc == pc (s.bassPc + 1) && s.kind[(size_t) ppc] != 4)
+            return true;
+        if (s.chordTone[(size_t) ppc])
+            return false;
+        return s.chordTone[(size_t) pc (p + 1)] || s.chordTone[(size_t) pc (p - 1)];
+    }
+
+    static bool isAvoidTone (const SlotInfo& s, int p)   // R2: a non-chord tone a semitone above a chord tone
+    {
+        return ! s.chordTone[(size_t) pc (p)] && s.chordTone[(size_t) pc (p - 1)];
+    }
+
+    static bool strongPos (int pos) { return pos == kDown || pos == kBeat3; }
 
     bool nextIsResolvable (int i) const
     {
@@ -1395,13 +1572,13 @@ private:
     {
         const auto& s = slotAt (i);
         const int pos = rhythm.onsets[(size_t) i].pos;
-        const double target = contourTarget (i);
+        const double target = contourTarget (i), tau = tauAt (i);
         std::vector<Cand> c;
         for (int p = lo; p <= hi; ++p)
         {
             if (! s.chordTone[(size_t) pc (p)] || p == line.prev)
                 continue;
-            double w = wStep (s, line.prev, p) * wReg (p) * wContourAt (i, p, target) * wKindChord (s, p, pos) * wLeap (line, p);
+            double w = wStep (s, line.prev, p) * wReg (p) * wContour (p, target, tau) * wKindChord (s, p, pos) * wLeap (line, p);
             if (first)
                 w *= firstRow (s, p);
             if (w > 0.0)
@@ -1418,14 +1595,14 @@ private:
     {
         const auto& s = slotAt (i);
         const int pos = rhythm.onsets[(size_t) i].pos;
-        const double target = contourTarget (i);
+        const double target = contourTarget (i), tau = tauAt (i);
         std::vector<Cand> c;
         for (int p = lo; p <= hi; ++p)
         {
             const int ppc = pc (p);
             if (! s.inScale[(size_t) ppc] || s.chordTone[(size_t) ppc] || p == line.prev)
                 continue;
-            const double w = wStep (s, line.prev, p) * wReg (p) * wContour (p, target) * wKindNct (s, p)
+            const double w = wStep (s, line.prev, p) * wReg (p) * wContour (p, target, tau) * wKindNct (s, p)
                            * wLeap (line, p) * wAvoid (s, p, pos, false);
             if (w > 0.0)
                 c.push_back ({ p, w });
@@ -1437,12 +1614,18 @@ private:
     int resolvePending (int i, Line& line, int lo, int hi, const NoteDraws& d) const
     {
         const auto& s = slotAt (i);
-        const double target = contourTarget (i);
+        const int pos = rhythm.onsets[(size_t) i].pos;
+        const double target = contourTarget (i), tau = tauAt (i);
         const int prev = line.prev;
         const int type = line.pendType;
 
         if (type == kNctHeld || (type == kNctAnticipation && d.rep < kAnticipationRepeat))
-            return s.allowed[(size_t) pc (prev)] ? prev : -1;
+        {
+            // R2: a held avoid tone is not repeated onto down / beat3.
+            if (! s.allowed[(size_t) pc (prev)] || (strongPos (pos) && isAvoidTone (s, prev)))
+                return -1;
+            return prev;
+        }
         if (type == kNctNeighbour)
             return s.allowed[(size_t) pc (line.pendOrigin)] && line.pendOrigin >= lo && line.pendOrigin <= hi ? line.pendOrigin : -1;
 
@@ -1453,7 +1636,7 @@ private:
                 continue;
             const int dd = p - prev, ad = std::abs (dd);
             bool ok = false;
-            double w = wReg (p) * wContour (p, target);
+            double w = wReg (p) * wContour (p, target, tau);
             switch (type)
             {
                 case kNctPassing:      ok = ad >= 1 && ad <= 2 && sgn (dd) == line.pendDir; break;
@@ -1462,7 +1645,8 @@ private:
                                        break;
                 case kNctEscape:
                 case kNctFree:         ok = ad >= 3 && ad <= maxLeap; w *= wStep (s, prev, p); break;
-                case kNctAnticipation: ok = ad >= 1 && ad <= 2; break;
+                case kNctAnticipation:
+                case kPendStepToChordTone: ok = ad >= 1 && ad <= 2; break;
                 default:               break;
             }
             if (ok && w > 0.0)
@@ -1481,7 +1665,7 @@ private:
         const auto& s = slotAt (i);
         const auto& ns = slotAt (i + 1);
         const int prev = line.prev;
-        const double target = contourTarget (i);
+        const double target = contourTarget (i), tau = tauAt (i);
         const bool sameSlot = rhythm.onsets[(size_t) i + 1].slot == o.slot;
         const bool anticipationSpot = (o.pos == kOff8 || o.pos == kA16) && ! sameSlot && s.endStep - o.step <= kBeatSteps;
 
@@ -1505,22 +1689,23 @@ private:
             if (prev >= 0 && ad > maxLeap)
                 continue;
 
-            const double w = wStep (s, prev, p) * wReg (p) * wContour (p, target) * wKindNct (s, p) * wLeap (line, p);
+            const double w = wStep (s, prev, p) * wReg (p) * wContour (p, target, tau) * wKindNct (s, p) * wLeap (line, p);
             if (w <= 0.0)
                 continue;
             const double avoid = wAvoid (s, p, o.pos, false);
+            const bool byStep = prev >= 0 && ad >= 1 && ad <= 2;
 
-            if (prev >= 0 && ad >= 1 && ad <= 2 && hasCt (p, 1, 2, sgn (dd)))
+            if (byStep && hasCt (p, 1, 2, sgn (dd)))
                 cands[kNctPassing].push_back ({ p, w * avoid });
-            if (prev >= 0 && ad >= 1 && ad <= 2 && s.chordTone[(size_t) pc (prev)] && ns.allowed[(size_t) pc (prev)])
+            if (byStep && s.chordTone[(size_t) pc (prev)] && ns.allowed[(size_t) pc (prev)])
                 cands[kNctNeighbour].push_back ({ p, w * avoid });
             if (prev >= 0 && ad >= 3 && hasCt (p, 1, 2, 0))
                 cands[kNctAppoggiatura].push_back ({ p, w * wAvoid (s, p, o.pos, ns.chordTone[(size_t) pc (p - 1)]) });
-            if (prev >= 0 && ad >= 1 && ad <= 2 && hasCt (p, 3, maxLeap, 0))
+            if (byStep && hasCt (p, 3, maxLeap, 0))
                 cands[kNctEscape].push_back ({ p, w * avoid });
             if (anticipationSpot && ns.chordTone[(size_t) ppc])
                 cands[kNctAnticipation].push_back ({ p, w });
-            if (sameSlot)
+            if (sameSlot && byStep)   // "arrival then hold": approached by step, repeated, then a step to a chord tone
                 cands[kNctHeld].push_back ({ p, w * avoid });
             if (prev >= 0 && ad >= 3 && hasCt (p, 3, maxLeap, 0))
                 cands[kNctFree].push_back ({ p, w * avoid });
@@ -1550,30 +1735,43 @@ private:
         const auto& o = rhythm.onsets[(size_t) i];
         const auto& s = slotAt (i);
         const bool first = line.prev < 0 && i == 0;
-        bool forceCt = false;
+        bool pendFailed = false;
 
         if (line.pendType >= 0)
         {
+            const int type = line.pendType;
             const int p = resolvePending (i, line, lo, hi, d);
             line.pendType = -1;
             if (p >= 0)
+            {
+                if (type == kNctHeld && p == line.prev && ! s.chordTone[(size_t) pc (p)])
+                {
+                    line.pendType = kPendStepToChordTone;
+                    line.pendDir = 0;
+                }
                 return p;
-            forceCt = true;
+            }
+            pendFailed = true;
         }
 
-        if (! forceCt && line.prev >= 0 && d.rep < sp.pRepeat)
+        // At most kNctMaxRun non-chord tones in a row.
+        const bool nctCapped = line.nctRun >= kNctMaxRun;
+
+        if (! pendFailed && line.prev >= 0 && d.rep < sp.pRepeat)
         {
             const int ppc = pc (line.prev);
             const bool sameChord = i > 0 && rhythm.onsets[(size_t) i - 1].slot == o.slot;
-            if (line.prev >= lo && line.prev <= hi
-                && (s.chordTone[(size_t) ppc] || (s.inScale[(size_t) ppc] && sameChord && o.pos != kDown)))
+            // A non-chord tone repeats once at most, never onto the downbeat, and an avoid tone never onto beat 3 (R2).
+            const bool nctRepeat = ! nctCapped && s.inScale[(size_t) ppc] && sameChord && o.pos != kDown
+                                && line.repeatRun == 0 && ! (strongPos (o.pos) && isAvoidTone (s, line.prev));
+            if (line.prev >= lo && line.prev <= hi && (s.chordTone[(size_t) ppc] || nctRepeat))
                 return line.prev;
         }
 
-        const bool strongPos = o.pos == kDown || o.pos == kBeat3;
+        const bool forceCt = pendFailed || nctCapped;
         const double pCt = first ? 1.0
                                  : sp.pCT[o.pos] + (s.lengthBeats <= 2 ? kShortSlotCtBonus : 0.0f)
-                                       - (strongPos ? sp.strongOffset : sp.nctBoost);
+                                       - (strongPos (o.pos) ? sp.strongOffset : sp.nctBoost);
         if (! forceCt && ! allowNct && d.ct >= pCt)
         {
             const int p = pickScaleTone (i, line, lo, hi, d.pick);   // pedal mode: an unconstrained non-chord tone
@@ -1587,11 +1785,24 @@ private:
                 return p;
         }
 
-
         return pickChordTone (i, line, lo, hi, d.pick, first);
     }
 
-    // Cadence notes (GP 1.5.5, R3, resolveEnding, R7).
+    bool isTonicFamily (int p) const
+    {
+        const int x = pc (p);
+        return x == keyPcs[0] || x == keyPcs[2] || x == keyPcs[4];
+    }
+
+    // No tonic-family tone (1, 3, 5 of the key) is a tone of this chord.
+    bool lacksTonicFamily (const SlotInfo& s) const
+    {
+        return ! s.chordTone[(size_t) keyPcs[0]] && ! s.chordTone[(size_t) keyPcs[2]] && ! s.chordTone[(size_t) keyPcs[4]];
+    }
+
+    // Cadence notes (GP 1.5.5, R3, resolveEnding, R7). kApproach carries the approach distribution (repeats
+    // included), so a repeat takes the mean 1-step Wstep instead of Wstep's 1 (wStepEven); Wreg x Wcontour keep the
+    // note on the phrase path.
     int pickCadence (int i, const Line& line, double u, int firstPitch) const
     {
         const auto& o = rhythm.onsets[(size_t) i];
@@ -1599,6 +1810,8 @@ private:
         const int lo = window.lo, hi = window.hi;
         const bool resolve = o.loopEnd && set.resolveEnding;
         const bool seam = i == (int) rhythm.onsets.size() - 1 && firstPitch >= 0;
+        const bool homeBySeam = resolve && firstPitch >= 0 && lacksTonicFamily (s);
+        const double target = contourTarget (i), tau = tauAt (i);
         std::vector<Cand> c;
 
         for (int pass = 0; pass < 2 && c.empty(); ++pass)
@@ -1613,13 +1826,19 @@ private:
                     continue;
 
                 const int deg = s.degree[(size_t) ppc];
-                double w = wReg (p) * wStep (s, line.prev, p);
+                const bool ct = s.chordTone[(size_t) ppc];
+                double w = wReg (p) * wContour (p, target, tau) * wStepEven (s, line.prev, p);
 
                 if (resolve)
-                    w *= (minorKey ? kFinalMinor[deg] : kFinalMajor[deg]) * (deg == 0 ? kResolveTonic : 1.0f)
-                       * (s.chordTone[(size_t) ppc] ? kResolveChordTone : 1.0f);
+                {
+                    const float* row = minorKey ? kFinalMinor : kFinalMajor;
+                    const bool home = homeBySeam && ct && std::abs (p - firstPitch) >= 1 && std::abs (p - firstPitch) <= 2;
+                    w *= home ? std::max (row[deg], row[0] * kResolveTonic * kResolveHome)
+                              : row[deg] * (deg == 0 ? kResolveTonic : 1.0f) * (isTonicFamily (p) ? kResolveFamily : 1.0f);
+                    w *= clashesWith (s, p) ? kResolveClash : ct ? kResolveChordTone : 1.0f;
+                }
                 else
-                    w *= kCadence[style][s.cadClass[(size_t) ppc]] * (s.chordTone[(size_t) ppc] ? kCadenceChordTone : 1.0f);
+                    w *= kCadence[style][s.cadClass[(size_t) ppc]] * (ct ? kCadenceChordTone : 1.0f) * wAvoid (s, p, o.pos, false);
 
                 if (line.prev >= 0)
                 {
@@ -1634,7 +1853,7 @@ private:
 
                 w *= o.closed ? kClosedFactor[deg] : kOpenFactor[deg];
                 if (seam)
-                    w *= std::max (0.05, wStep (s, p, firstPitch));
+                    w *= std::max (0.05, wStepEven (s, p, firstPitch));
 
                 if (w > 0.0)
                     c.push_back ({ p, w });
@@ -1646,6 +1865,7 @@ private:
 
     //==========================================================================
     std::vector<int> copyPitch;   // per onset: the pitch a repeated unit copies (-1 = picked fresh)
+    std::vector<char> pedalFifths;   // per unit: the pedal alternates root and 5th (Driving pedal mode)
 
     void pickPitches()
     {
@@ -1653,14 +1873,26 @@ private:
         const int n = (int) o.size();
         pitch.assign ((size_t) n, 0);
         copyPitch.assign ((size_t) n, -1);
-        protoTarget.assign ((size_t) n, -1);
+        protoRef.assign ((size_t) n, -1);
 
         Rng rng (streamSeed (base, 3));
         const int numUnits = plan.numUnits();
 
-        std::vector<double> uTreat ((size_t) numUnits);
-        for (auto& u : uTreat)
-            u = rng.uniform();
+        std::vector<double> uTreat ((size_t) numUnits), uPedal ((size_t) numUnits);
+        for (int k = 0; k < numUnits; ++k)
+        {
+            uTreat[(size_t) k] = rng.uniform();
+            uPedal[(size_t) k] = rng.uniform();
+        }
+
+        // The pedal pattern is chosen once per unit; a restated unit keeps its prototype's.
+        pedalFifths.assign ((size_t) numUnits, 0);
+        for (int k = 0; k < numUnits; ++k)
+        {
+            const int proto = rhythm.units[(size_t) k].proto;
+            pedalFifths[(size_t) k] = proto >= 0 && proto < k ? pedalFifths[(size_t) proto]
+                                                              : (char) (uPedal[(size_t) k] < kPedalFifthPattern ? 1 : 0);
+        }
 
         const int numSegments = n > 0 ? o.back().segment + 1 : 0;
         segShape.assign ((size_t) numSegments, kShapeWave);
@@ -1708,15 +1940,18 @@ private:
 
             const auto& d = draws[(size_t) i];
             const bool isLast = i == n - 1;
+            regCentre = forced ? std::clamp (contourTarget (i), (double) window.lo, (double) window.hi) : window.centre;
 
             // Driving pedal mode: the 2nd, 4th, ... onset of each bar plays the pedal.
             bool pedalPos = false;
+            int pedalIndex = 0;
             if (plan.pedal && ! oi.pickup)
             {
                 int j = 0;
                 for (int b = i - 1; b >= 0 && o[(size_t) b].step / kBarSteps == oi.step / kBarSteps; --b)
                     ++j;
                 pedalPos = (j % 2) == 1 && ! oi.loopEnd;
+                pedalIndex = j / 2;
             }
 
             int p = -1;
@@ -1728,12 +1963,16 @@ private:
                 const int pi = protoOf[(size_t) i];
                 const bool keepCadence = pi >= 0 && o[(size_t) pi].cadence == oi.cadence && o[(size_t) pi].closed == oi.closed
                                       && o[(size_t) pi].slot >= 0 && slots[(size_t) o[(size_t) pi].slot].chord == slotAt (i).chord;
-                if ((oi.cadence && ! keepCadence) || oi.loopEnd || isLast)
+                // A copied closed cadence over the same chord may also end the loop when it is already a good ending
+                // (tonic family with resolveEnding, R7 seam); otherwise the loop end is re-picked.
+                const bool goodEnding = oi.loopEnd && isLast && firstPitch >= 0 && std::abs (p - firstPitch) <= kMaxSeam
+                                     && (! set.resolveEnding || (isTonicFamily (p) && ! clashesWith (slotAt (i), p)));
+                if ((oi.cadence && ! keepCadence) || ((oi.loopEnd || isLast) && ! (keepCadence && goodEnding)))
                     p = -1;
             }
 
             if (p < 0 && pedalPos)
-                p = pedalPitch (i, d.aux);
+                p = pedalPitch (i, pedalIndex);
 
             if (p < 0)
             {
@@ -1747,10 +1986,7 @@ private:
 
             p = intoWindow (p, window.lo, window.hi);
             pitch[(size_t) i] = p;
-            if (pedalPos)
-                accept (pedalLine, p);
-            else
-                accept (upper, p);
+            accept (pedalPos ? pedalLine : upper, p, slotAt (i));
             if (i == 0)
                 firstPitch = p;
         }
@@ -1773,17 +2009,19 @@ private:
         if (oi.cadence)
             return pickCadence (i, line, d.pick, firstPitch);
 
-        // The last note in time is a pickup into the loop start: a free pick weighted towards the first note (R7).
+        // The last note in time is a pickup into the loop start: a free pick weighted towards the first note (R7);
+        // it is the last thing heard before the loop restarts, so a clash with its chord is avoided like the ending's.
         const auto& s = slotAt (i);
-        const double target = contourTarget (i);
+        const double target = contourTarget (i), tau = tauAt (i);
         std::vector<Cand> c;
         for (int pass = 0; pass < 2 && c.empty(); ++pass)
             for (int p = window.lo; p <= window.hi; ++p)
             {
                 if (! s.allowed[(size_t) pc (p)] || (pass == 0 && std::abs (p - firstPitch) > kMaxSeam))
                     continue;
-                const double w = wStep (s, line.prev, p) * wReg (p) * wContour (p, target)
-                               * std::max (0.05, wStep (s, p, firstPitch)) * (s.chordTone[(size_t) pc (p)] ? 1.5 : 1.0);
+                const double fit = clashesWith (s, p) ? kResolveClash : s.chordTone[(size_t) pc (p)] ? 1.5 : 1.0;
+                const double w = wStepEven (s, line.prev, p) * wReg (p) * wContour (p, target, tau)
+                               * std::max (0.05, wStepEven (s, p, firstPitch)) * fit;
                 if (w > 0.0)
                     c.push_back ({ p, w });
             }
@@ -1791,27 +2029,40 @@ private:
         return p >= 0 ? p : pickChordTone (i, line, window.lo, window.hi, d.pick, false);
     }
 
+    // Driving pedal: the chord root at the window floor (the first pitch of that class at or above it). Under a forced
+    // contour the pedal follows the phrase path by octaves (an octave up when that is nearer), so a Rising riff rises.
     int pedalFloor (int i) const
     {
         const int root = slotAt (i).chord.root;
         int p = window.lo;
         while (pc (p) != root)
             ++p;
+        if (forced)
+        {
+            const double anchor = window.lo + kPedalAnchor + (pathTarget (i) - window.centre);
+            if (p + 12 <= window.hi - kPedalUpperGap && std::abs (p + 12 - anchor) < std::abs (p - anchor))
+                p += 12;
+        }
         return p;
     }
 
-    int pedalPitch (int i, double u) const
+    // The pedal note of a bar's pedalIndex-th pedal slot: the root, or in an alternating unit the 5th on every second
+    // pedal slot, a fifth above the root (a fourth below when that leaves the window) - the same way for every chord.
+    int pedalPitch (int i, int pedalIndex) const
     {
         const auto& s = slotAt (i);
-        int target = s.chord.root;
-        if (u < kPedalFifth)
-            for (int iv : s.chord.intervals())
-                if (iv >= 6 && iv <= 8)
-                    target = pc (s.chord.root + iv);
-        int p = window.lo;
-        while (pc (p) != target)
-            ++p;
-        return p;
+        const int root = pedalFloor (i);
+        if (! pedalFifths[(size_t) rhythm.onsets[(size_t) i].unit] || pedalIndex % 2 == 0)
+            return root;
+        for (int iv : s.chord.intervals())
+            if (iv >= 6 && iv <= 8)
+            {
+                if (root + iv <= window.hi)
+                    return root + iv;
+                if (root + iv - 12 >= window.lo)
+                    return root + iv - 12;
+            }
+        return root;
     }
 
     // Decides how a unit's pitches come about (GP 1.5.2 / 1.5.4) and fills copyPitch for its copied onsets.
@@ -1819,7 +2070,7 @@ private:
     {
         const auto& ur = rhythm.units[(size_t) k];
         const auto& o = rhythm.onsets;
-        if (ur.proto < 0 || ur.proto == k)
+        if (ur.proto < 0 || ur.proto >= k)
             return;
 
         const int proto = ur.proto;
@@ -1827,8 +2078,32 @@ private:
         const auto& mine = own[(size_t) k];
         const auto& theirs = own[(size_t) proto];
 
+        // A varied rhythm changes the unit's last bar; a bar whose onsets still equal the prototype's is a rhythm copy
+        // like any other (GP 1.5.4 is a per-bar statistic), the changed bar re-picks along the prototype.
+        std::vector<char> eligible (mine.size(), 1);
+        if (ur.relation == kRelVaried && ur.rhythmChanged)
+        {
+            const int unitStart = plan.unitStart (k);
+            for (int bar = 0; bar < plan.unitBars; ++bar)
+            {
+                std::vector<int> a, b;
+                for (int i : mine)
+                    if ((o[(size_t) i].step - unitStart) / kBarSteps == bar)
+                        a.push_back (o[(size_t) i].step - unitStart);
+                for (int i : theirs)
+                    if ((o[(size_t) i].step - plan.unitStart (proto)) / kBarSteps == bar)
+                        b.push_back (o[(size_t) i].step - plan.unitStart (proto));
+                if (a != b)
+                    for (size_t x = 0; x < mine.size(); ++x)
+                        if ((o[(size_t) mine[x]].step - unitStart) / kBarSteps == bar)
+                            eligible[x] = 0;
+            }
+        }
+
         // Correspondence by the offset into the unit; an unmatched onset re-picks towards the nearest earlier one.
         bool changed = false;
+        double drift = 0.0;   // mean move of the contour path from the prototype's onsets to this unit's
+        int matched = 0, copyable = 0;
         std::vector<int> match (mine.size(), -1);
         for (size_t a = 0; a < mine.size(); ++a)
         {
@@ -1841,22 +2116,40 @@ private:
                 if (o[(size_t) t].step <= rel)
                     nearest = t;
             }
+            if (nearest >= 0)
+                protoRef[(size_t) mine[a]] = nearest;
+            if (! eligible[a])
+            {
+                match[a] = -1;
+                continue;
+            }
+            ++copyable;
             protoOf[(size_t) mine[a]] = match[a];
             if (match[a] < 0 || ! (slots[(size_t) o[(size_t) match[a]].slot].chord == slots[(size_t) o[(size_t) mine[a]].slot].chord))
                 changed = true;
-            if (nearest >= 0)
-                protoTarget[(size_t) mine[a]] = pitch[(size_t) nearest];
+            if (match[a] >= 0)
+            {
+                drift += pathTarget (mine[a]) - pathTarget (match[a]);
+                ++matched;
+            }
         }
+        drift = matched > 0 ? drift / matched : 0.0;
 
         auto clearTargets = [&] {
-            for (int i : mine)
-                protoTarget[(size_t) i] = -1;
+            for (size_t a = 0; a < mine.size(); ++a)
+                if (eligible[a])
+                    protoRef[(size_t) mine[a]] = -1;
         };
 
-        if (ur.relation == kRelVaried)
-            return;   // re-pick along the prototype's pitches (protoTarget)
+        if (copyable == 0)
+            return;   // a varied rhythm in every bar: re-pick along the prototype's pitches (protoRef)
 
-        int t = std::max (0, pickIndex (kTreatments[style][changed ? 0 : 1], kNumTreatments, uTreat));
+        // GP 1.5.4 treatment, tilted by repetition (kTreatmentTilt).
+        const double up = std::exp (kTreatmentTilt * (set.repetition - 0.5));
+        std::array<double, kNumTreatments> tw {};
+        for (int t = 0; t < kNumTreatments; ++t)
+            tw[(size_t) t] = kTreatments[style][changed ? 0 : 1][t] * (t == kTreatExact ? up : t == kTreatRepick ? 1.0 / up : 1.0);
+        int t = std::max (0, pickIndex (tw, kNumTreatments, uTreat));
 
         auto adapted = [&] (int src, int dst, int shift) {
             const auto& from = slots[(size_t) o[(size_t) src].slot];
@@ -1867,33 +2160,42 @@ private:
             return pitchAtPos (to, degreePos (from, p) + shift);
         };
 
-        if (t == kTreatExact && changed)
+        // A strong-position chord tone scores +1, a strong-position R2 avoid tone -1.
+        auto strongScore = [&] (const SlotInfo& sl, int q) {
+            return sl.chordTone[(size_t) pc (q)] ? 1.0 : isAvoidTone (sl, q) ? -1.0 : 0.0;
+        };
+
+        // A forced contour moves on between the prototype and the copy: the copy follows it (fit-transpose).
+        if (t == kTreatExact && forced && std::abs (drift) >= kForcedExactMaxDrift)
+            t = kTreatFit;
+
+        if (t == kTreatExact)
         {
-            int strong = 0, ct = 0;
+            int strong = 0;
+            double score = 0.0;
             for (size_t a = 0; a < mine.size(); ++a)
             {
                 const auto& x = o[(size_t) mine[a]];
-                if (match[a] < 0 || (x.pos != kDown && x.pos != kBeat3))
+                if (match[a] < 0 || ! strongPos (x.pos))
                     continue;
                 ++strong;
-                if (slots[(size_t) x.slot].chordTone[(size_t) pc (adapted (match[a], mine[a], 0))])
-                    ++ct;
+                score += strongScore (slots[(size_t) x.slot], adapted (match[a], mine[a], 0));
             }
-            if (strong > 0 && ct < kExactAcceptChordToneShare * strong)
+            if (strong > 0 && score < kExactAcceptChordToneShare * strong)
                 t = kTreatFit;
         }
 
         int shift = 0;
         if (t == kTreatFit)
         {
-            double bestScore = -1.0;
+            double bestScore = -1.0e9;
             int best = -100;
             static constexpr int order[] = { 0, -1, 1, -2, 2, -3, 3 };
             for (int sh : order)
             {
                 if (std::abs (sh) > kFitShiftMax || (sh == 0 && changed))
                     continue;
-                double score = 0.0;
+                double score = 0.0, moved = 0.0;
                 bool inside = true;
                 for (size_t a = 0; a < mine.size() && inside; ++a)
                 {
@@ -1901,10 +2203,16 @@ private:
                         continue;
                     const int q = adapted (match[a], mine[a], sh);
                     inside = q >= window.lo && q <= window.hi;
+                    moved += q - pitch[(size_t) match[a]];
                     const auto& x = o[(size_t) mine[a]];
-                    if (slots[(size_t) x.slot].chordTone[(size_t) pc (q)])
-                        score += (x.pos == kDown || x.pos == kBeat3) ? 1.0 : x.pos == kOff8 ? 0.5 : 0.0;
+                    const auto& sl = slots[(size_t) x.slot];
+                    if (strongPos (x.pos))
+                        score += strongScore (sl, q);
+                    else if (x.pos == kOff8 && sl.chordTone[(size_t) pc (q)])
+                        score += 0.5;
                 }
+                if (forced && matched > 0)
+                    score -= kFitContourCost * std::abs (moved / matched - drift);
                 if (inside && score > bestScore)
                 {
                     bestScore = score;
@@ -1919,11 +2227,17 @@ private:
         if (t == kTreatRepick)
             return;
 
-        const size_t keep = t == kTreatEnding ? mine.size() / 2 : mine.size();
+        const size_t keep = t == kTreatEnding ? (size_t) copyable / 2 : (size_t) copyable;
         clearTargets();
-        for (size_t a = 0; a < keep; ++a)
+        size_t kept = 0;
+        for (size_t a = 0; a < mine.size() && kept < keep; ++a)
+        {
+            if (! eligible[a])
+                continue;
+            ++kept;
             if (match[a] >= 0)
                 copyPitch[(size_t) mine[a]] = intoWindow (adapted (match[a], mine[a], shift), window.lo, window.hi);
+        }
     }
 
     //==========================================================================
@@ -1934,14 +2248,6 @@ private:
         for (int i = 0; i < size; ++i)
             w.push_back (table[i].weight);
         return table[std::max (0, pickIndex (w, size, u))].beats;
-    }
-
-    bool clashesWith (const SlotInfo& s, int p) const
-    {
-        const int ppc = pc (p);
-        if (s.chordTone[(size_t) ppc])
-            return false;
-        return s.chordTone[(size_t) pc (p + 1)] || s.chordTone[(size_t) pc (p - 1)] || ppc == pc (s.bassPc + 1);
     }
 
     void articulate (Melody& out)
