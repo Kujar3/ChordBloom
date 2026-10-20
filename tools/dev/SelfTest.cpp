@@ -17,369 +17,18 @@
 #include <sstream>
 #include <thread>
 
+#include "SelfTestUtil.h"
+
+using namespace cbtest;
+
 // Processor integration tests (owner: processor agent). Print one line per check; return 0 when all pass.
 //
 // The tests drive ChordbloomProcessor exactly like a host: prepareToPlay, a fake AudioPlayHead, processBlock with
 // real MidiBuffers, getState/setState. The dev tool is a console app, so the JUCE message queue is pumped by hand to
 // let the processor's AsyncUpdater / Timer (parameter-change re-render) run.
 
-namespace juce::detail
-{
-bool dispatchNextMessageOnSystemQueue (bool returnIfNoPendingMessages);   // juce_events (Windows / Linux)
-}
-
 namespace
 {
-int numPassed = 0;
-int numFailed = 0;
-
-void check (bool ok, const std::string& name, const std::string& detail = {})
-{
-    if (ok)
-    {
-        ++numPassed;
-        std::cout << "PASS " << name << "\n";
-    }
-    else
-    {
-        ++numFailed;
-        std::cout << "FAIL " << name << (detail.empty() ? std::string() : ": " + detail) << "\n";
-    }
-}
-
-template <typename... Args>
-std::string str (Args&&... args)
-{
-    std::ostringstream ss;
-    (ss << ... << args);
-    return ss.str();
-}
-
-void pumpMessages (int milliseconds)
-{
-    const double end = juce::Time::getMillisecondCounterHiRes() + milliseconds;
-    for (;;)
-    {
-        while (juce::detail::dispatchNextMessageOnSystemQueue (true)) {}
-        if (juce::Time::getMillisecondCounterHiRes() >= end)
-            break;
-        juce::Thread::sleep (2);
-    }
-}
-
-void setParam (ChordbloomProcessor& p, const char* id, float plainValue)
-{
-    if (auto* param = p.getAPVTS().getParameter (id))
-        param->setValueNotifyingHost (param->convertTo0to1 (plainValue));
-}
-
-float getParam (ChordbloomProcessor& p, const char* id)
-{
-    if (auto* v = p.getAPVTS().getRawParameterValue (id))
-        return v->load();
-    return std::nanf ("");
-}
-
-std::string notesToString (const std::vector<int>& notes)
-{
-    std::string s = "[";
-    for (size_t i = 0; i < notes.size(); ++i)
-        s += (i > 0 ? " " : "") + std::to_string (notes[i]);
-    return s + "]";
-}
-
-cb::Progression makeProgression (std::initializer_list<cb::Chord> chords, int lengthBeats = 4)
-{
-    cb::Progression p;
-    for (auto& c : chords)
-    {
-        cb::ProgressionSlot s;
-        s.chord = c;
-        s.lengthBeats = lengthBeats;
-        p.slots.push_back (s);
-    }
-    return p;
-}
-
-const cb::Chord C_ { 0, cb::ChordQuality::Major };
-const cb::Chord Am_ { 9, cb::ChordQuality::Minor };
-const cb::Chord F_ { 5, cb::ChordQuality::Major };
-const cb::Chord G_ { 7, cb::ChordQuality::Major };
-const cb::Chord Em_ { 4, cb::ChordQuality::Minor };
-
-//==============================================================================
-struct FakePlayHead final : juce::AudioPlayHead
-{
-    bool playing = false;
-    bool hasInfo = true;
-    double bpm = 120.0;
-    double ppq = 0.0;
-    bool reportLoop = false;            // report isLooping + loop points (some hosts do, FL's pattern mode may not)
-    double loopStart = 0.0, loopEnd = 0.0;
-
-    juce::Optional<PositionInfo> getPosition() const override
-    {
-        if (! hasInfo)
-            return {};
-
-        PositionInfo info;
-        info.setIsPlaying (playing);
-        info.setBpm (bpm);
-        info.setPpqPosition (ppq);
-        info.setTimeSignature (TimeSignature { 4, 4 });
-        if (reportLoop)
-        {
-            info.setIsLooping (true);
-            info.setLoopPoints (LoopPoints { loopStart, loopEnd });
-        }
-        return info;
-    }
-};
-
-struct Ev
-{
-    juce::int64 sample = 0;
-    bool on = false;
-    int channel = 1;
-    int note = 0;
-    int velocity = 0;
-};
-
-// Drives a processor block by block, recording every MIDI event it outputs and validating the stream.
-struct Rig
-{
-    explicit Rig (ChordbloomProcessor& proc, double sampleRate = 48000.0, int blockSize = 512, bool usePlayHead = true)
-        : p (proc), sr (sampleRate), blockSize (blockSize)
-    {
-        p.setRateAndBufferSizeDetails (sr, blockSize);
-        p.prepareToPlay (sr, blockSize);
-        p.setPlayHead (usePlayHead ? &head : nullptr);
-        buffer.setSize (2, blockSize);
-    }
-
-    ~Rig()
-    {
-        p.setPlayHead (nullptr);
-        p.releaseResources();
-    }
-
-    double samplesPerBeat() const { return sr * 60.0 / head.bpm; }
-
-    std::vector<Ev> processBlock (const juce::MidiBuffer& input = {})
-    {
-        // Fill with garbage: the processor must clear the output before the synth adds to it.
-        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
-            juce::FloatVectorOperations::fill (buffer.getWritePointer (ch), 0.5f, blockSize);
-
-        juce::MidiBuffer midi (input);
-        if (bypassed)
-            p.processBlockBypassed (buffer, midi);
-        else
-            p.processBlock (buffer, midi);
-
-        lastOut = midi;
-        auto out = record (midi);
-
-        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
-        {
-            const float* x = buffer.getReadPointer (ch);
-            for (int i = 0; i < blockSize; ++i)
-            {
-                if (! std::isfinite (x[i]))
-                    audioFinite = false;
-                else
-                    peak = juce::jmax (peak, std::abs (x[i]));
-            }
-        }
-
-        samplePos += blockSize;
-        if (head.playing)
-        {
-            head.ppq += blockSize * head.bpm / 60.0 / sr;
-            if (hostLoopLen > 0.0 && head.ppq >= hostLoopStart + hostLoopLen)
-                head.ppq -= hostLoopLen;   // host loop that does not split the block: the overshoot carries over
-        }
-        return out;
-    }
-
-    // A 0-sample processBlock call (VST3 parameter flush), optionally with a zeroed play head.
-    std::vector<Ev> processZero (const juce::MidiBuffer& input = {})
-    {
-        juce::AudioBuffer<float> empty (2, 0);
-        juce::MidiBuffer midi (input);
-        p.processBlock (empty, midi);
-        return record (midi);
-    }
-
-    std::vector<Ev> record (const juce::MidiBuffer& midi)
-    {
-        std::vector<Ev> out;
-        lastOthers.clear();
-        for (const auto meta : midi)
-        {
-            const auto msg = meta.getMessage();
-            if (! (msg.isNoteOn() || msg.isNoteOff()))
-            {
-                ++numOtherEvents;
-                lastOthers.push_back (msg);
-                if (msg.isController() && msg.getControllerNumber() == 64)
-                    pedal[msg.getChannel()] = msg.getControllerValue() >= 64;
-                else if (msg.isController() && msg.getControllerNumber() == 121)
-                    pedal[msg.getChannel()] = false;
-                continue;
-            }
-
-            Ev e;
-            e.sample = samplePos + meta.samplePosition;
-            e.on = msg.isNoteOn();
-            e.channel = msg.getChannel();
-            e.note = msg.getNoteNumber();
-            e.velocity = msg.getVelocity();
-            out.push_back (e);
-
-            const int key = e.channel * 128 + e.note;
-            if (e.on)
-            {
-                if (open[key] > 0)
-                    ++doubleOns;
-                open[key] = 1;
-            }
-            else
-            {
-                if (open[key] == 0)
-                    ++strayOffs;
-                open[key] = 0;
-            }
-        }
-
-        all.insert (all.end(), out.begin(), out.end());
-        return out;
-    }
-
-    std::vector<Ev> run (int numBlocks)
-    {
-        std::vector<Ev> out;
-        for (int i = 0; i < numBlocks; ++i)
-        {
-            auto evs = processBlock();
-            out.insert (out.end(), evs.begin(), evs.end());
-        }
-        return out;
-    }
-
-    float blockPeak() const
-    {
-        float m = 0.0f;
-        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
-            m = juce::jmax (m, buffer.getMagnitude (ch, 0, blockSize));
-        return m;
-    }
-
-    int openCount() const
-    {
-        int n = 0;
-        for (auto& kv : open)
-            n += kv.second > 0 ? 1 : 0;
-        return n;
-    }
-
-    int pedalsDown() const
-    {
-        int n = 0;
-        for (auto& kv : pedal)
-            n += kv.second ? 1 : 0;
-        return n;
-    }
-
-    std::set<int> openNotes (int channel) const
-    {
-        std::set<int> s;
-        for (auto& kv : open)
-            if (kv.second > 0 && kv.first / 128 == channel)
-                s.insert (kv.first % 128);
-        return s;
-    }
-
-    ChordbloomProcessor& p;
-    FakePlayHead head;
-    double sr;
-    int blockSize;
-    juce::AudioBuffer<float> buffer;
-    juce::int64 samplePos = 0;
-    std::vector<Ev> all;
-    std::map<int, int> open;
-    int doubleOns = 0, strayOffs = 0, numOtherEvents = 0;
-    std::vector<juce::MidiMessage> lastOthers;   // non-note messages of the last block
-    juce::MidiBuffer lastOut;                     // everything the last processBlock put out, in order
-    std::map<int, bool> pedal;                    // sustain pedal state downstream, per channel
-    bool audioFinite = true;
-    float peak = 0.0f;
-    bool bypassed = false;   // drive processBlockBypassed instead of processBlock
-    double hostLoopStart = 0.0, hostLoopLen = 0.0;   // > 0: the fake host loops (ppq wraps back while playing)
-};
-
-const Ev* findEvent (const std::vector<Ev>& evs, bool on, int channel, int note, juce::int64 sample, int tolerance = 1)
-{
-    for (auto& e : evs)
-        if (e.on == on && e.channel == channel && e.note == note && std::abs (e.sample - sample) <= tolerance)
-            return &e;
-    return nullptr;
-}
-
-int countOns (const std::vector<Ev>& evs, juce::int64 from = 0, juce::int64 to = std::numeric_limits<juce::int64>::max(),
-              int channel = 0)
-{
-    int n = 0;
-    for (auto& e : evs)
-        if (e.on && e.sample >= from && e.sample < to && (channel == 0 || e.channel == channel))
-            ++n;
-    return n;
-}
-
-std::set<int> onNotesAt (const std::vector<Ev>& evs, int channel, juce::int64 sample, int tolerance = 1)
-{
-    std::set<int> s;
-    for (auto& e : evs)
-        if (e.on && e.channel == channel && std::abs (e.sample - sample) <= tolerance)
-            s.insert (e.note);
-    return s;
-}
-
-juce::MidiBuffer noteOn (int note, int sample = 0, int channel = 1, int velocity = 100)
-{
-    juce::MidiBuffer b;
-    b.addEvent (juce::MidiMessage::noteOn (channel, note, (juce::uint8) velocity), sample);
-    return b;
-}
-
-juce::MidiBuffer noteOff (int note, int sample = 0, int channel = 1)
-{
-    juce::MidiBuffer b;
-    b.addEvent (juce::MidiMessage::noteOff (channel, note), sample);
-    return b;
-}
-
-std::set<int> pitchClassesOf (const std::set<int>& notes)
-{
-    std::set<int> s;
-    for (int n : notes)
-        s.insert (n % 12);
-    return s;
-}
-
-std::set<int> pitchClassesOf (const cb::Chord& chord)
-{
-    std::set<int> s;
-    for (int pcv : chord.pitchClasses())
-        s.insert (((pcv % 12) + 12) % 12);
-    return s;
-}
-
-struct ChangeCounter final : juce::ChangeListener
-{
-    int count = 0;
-    void changeListenerCallback (juce::ChangeBroadcaster*) override { ++count; }
-};
 
 //==============================================================================
 void testBasicsAndDefaults()
@@ -405,16 +54,17 @@ void testBasicsAndDefaults()
         check (std::abs (v - d.value) < 1.0e-4f, str ("default ", d.id, " == ", d.value), str ("got ", v));
     }
 
-    check (p.getParameters().size() == 22, "parameter count == 22", str ("got ", p.getParameters().size()));
+    check (p.getParameters().size() == 29, "parameter count == 29", str ("got ", p.getParameters().size()));
     {
         auto* sync = p.getAPVTS().getParameter (id::syncToHost);
         check (sync != nullptr && sync->getName (64) == "Play With Host", "syncToHost is shown as \"Play With Host\"",
                sync != nullptr ? sync->getName (64).toStdString() : std::string ("missing"));
         auto* part = dynamic_cast<juce::AudioParameterChoice*> (p.getAPVTS().getParameter (id::midiOutPart));
-        check (part != nullptr && part->choices.size() == 5 && part->choices[0] == "All parts"
+        check (part != nullptr && part->choices.size() == 6 && part->choices[0] == "All parts"
                    && part->choices[1] == "Chords only" && part->choices[2] == "Bass only"
-                   && part->choices[3] == "Melody only" && part->choices[4] == "Chords + Bass",
-               "midiOutPart choices (old indices 1 / 2 keep their meaning; melody parts appended)");
+                   && part->choices[3] == "Melody only" && part->choices[4] == "Chords + Bass"
+                   && part->choices[5] == "Arp only",
+               "midiOutPart choices (old indices keep their meaning; melody and arp parts appended)");
         auto* melodyOn = dynamic_cast<juce::AudioParameterBool*> (p.getAPVTS().getParameter (id::melodyOn));
         check (melodyOn != nullptr && melodyOn->get() && melodyOn->getName (64) == "Melody", "melodyOn defaults to on");
     }
@@ -732,42 +382,6 @@ void testStateRoundTrip()
     juce::MemoryBlock afterBad;
     z.getStateInformation (afterBad);
     check (afterBad.getSize() > 0, "state: still serialisable after bad input");
-}
-
-//==============================================================================
-// Checks one rendered loop against the playback output.
-void checkLoopAgainstRender (const std::vector<Ev>& evs, const std::vector<cb::NoteEvent>& expected, double samplesPerBeat,
-                             double loopStartBeat, juce::int64 sampleOffset, const std::string& label)
-{
-    int missingOn = 0, missingOff = 0, badVelocity = 0;
-    std::string firstMiss;
-    for (auto& e : expected)
-    {
-        const auto onSample = sampleOffset + (juce::int64) std::floor ((loopStartBeat + e.startBeat) * samplesPerBeat);
-        const auto offSample = sampleOffset + (juce::int64) std::floor ((loopStartBeat + e.startBeat + e.lengthBeats) * samplesPerBeat);
-        const auto* on = findEvent (evs, true, e.channel, e.note, onSample);
-        if (on == nullptr)
-        {
-            ++missingOn;
-            if (firstMiss.empty())
-                firstMiss = str ("on ch", e.channel, " n", e.note, " @", onSample);
-        }
-        else if (on->velocity != juce::jlimit (1, 127, juce::roundToInt (e.velocity * 127.0f)))
-        {
-            ++badVelocity;
-        }
-
-        if (findEvent (evs, false, e.channel, e.note, offSample) == nullptr)
-        {
-            ++missingOff;
-            if (firstMiss.empty())
-                firstMiss = str ("off ch", e.channel, " n", e.note, " @", offSample);
-        }
-    }
-
-    check (missingOn == 0, label + ": every rendered note-on at its sample position", str (missingOn, " missing, first ", firstMiss));
-    check (missingOff == 0, label + ": every rendered note-off at its sample position", str (missingOff, " missing, first ", firstMiss));
-    check (badVelocity == 0, label + ": velocities match the render", str (badVelocity, " differ"));
 }
 
 void testHostSyncedPlayback()
@@ -1336,149 +950,6 @@ void testReleaseResources()
     p.stopPreview();
     rig.processBlock (noteOff (40, 0, 3));   // late note-off for a closed note: harmless
     check (rig.doubleOns == 0, "releaseResources: stream balanced");
-}
-
-//==============================================================================
-// Editor size persistence through the real editor: default size first, then whatever the user resized it to,
-// also after a state round trip (project reload).
-void testEditorSize()
-{
-    auto sizeOf = [] (ChordbloomProcessor& proc)
-    {
-        std::unique_ptr<juce::AudioProcessorEditor> ed (proc.createEditor());
-        return juce::Point<int> (ed->getWidth(), ed->getHeight());
-    };
-
-    ChordbloomProcessor p;
-    const auto first = sizeOf (p);
-    check (first == juce::Point<int> (1100, 690), "editor: opens at the default 1100x690", str (first.x, "x", first.y));
-    check (p.getSavedEditorSize() == juce::Point<int> (1100, 690) || p.getSavedEditorSize() == juce::Point<int>(),
-           "editor: default size is what gets saved", str (p.getSavedEditorSize().x, "x", p.getSavedEditorSize().y));
-
-    {
-        std::unique_ptr<juce::AudioProcessorEditor> ed (p.createEditor());
-        ed->setSize (1300, 800);
-    }
-    check (p.getSavedEditorSize() == juce::Point<int> (1300, 800), "editor: resized size is remembered");
-    const auto again = sizeOf (p);
-    check (again == juce::Point<int> (1300, 800), "editor: reopens at the remembered size", str (again.x, "x", again.y));
-
-    juce::MemoryBlock state;
-    p.getStateInformation (state);
-    ChordbloomProcessor q;
-    q.setStateInformation (state.getData(), (int) state.getSize());
-    const auto restored = sizeOf (q);
-    check (restored == juce::Point<int> (1300, 800), "editor: size survives a state round trip", str (restored.x, "x", restored.y));
-}
-
-//==============================================================================
-// The real editor on the real processor, driven with synthesized mouse events: every press that starts a preview
-// must stop it on release (no stuck preview notes), and double-clicking a pad appends the chord.
-juce::MouseEvent mouseEventFor (juce::Component& c, juce::Point<float> pos, juce::ModifierKeys mods, int clicks = 1,
-                                bool dragged = false)
-{
-    const auto now = juce::Time::getCurrentTime();
-    return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), pos, mods,
-                             juce::MouseInputSource::defaultPressure, 0.0f, 0.0f, 0.0f, 0.0f, &c, &c, now, pos, now,
-                             clicks, dragged);
-}
-
-void testEditorInteraction()
-{
-    ChordbloomProcessor p;
-    std::unique_ptr<juce::AudioProcessorEditor> holder (p.createEditor());
-    auto* ed = dynamic_cast<ChordbloomEditor*> (holder.get());
-    check (ed != nullptr, "ui: createEditor returns the Chordbloom editor");
-    if (ed == nullptr)
-        return;
-
-    const auto left = juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier);
-    const auto none = juce::ModifierKeys();
-    pumpMessages (50);
-
-    // Palette pad: first pad of the first row is the tonic triad
-    auto* padSurface = ed->getPaletteView().getChildComponent (0);
-    juce::Point<float> padPos;
-    for (float x = 20.0f; x < (float) padSurface->getWidth() && padPos.isOrigin(); x += 4.0f)
-    {
-        const juce::Point<float> pos (x, 30.0f);
-        padSurface->mouseDown (mouseEventFor (*padSurface, pos, left));
-        if (p.getPreviewChord().has_value())
-            padPos = pos;
-        padSurface->mouseUp (mouseEventFor (*padSurface, pos, none));
-    }
-    check (! padPos.isOrigin(), "ui palette: a pad press starts a chord preview");
-
-    padSurface->mouseDown (mouseEventFor (*padSurface, padPos, left));
-    const auto previewed = p.getPreviewChord();
-    const auto previewNotes = p.getPreviewNotes();
-    check (previewed == cb::Chord { 0, cb::ChordQuality::Major } && previewNotes.size() >= 3,
-           "ui palette: first pad previews C major with its notes", notesToString (previewNotes));
-    padSurface->mouseUp (mouseEventFor (*padSurface, padPos, none));
-    check (! p.getPreviewChord().has_value() && p.getPreviewNotes().empty(), "ui palette: mouse up stops the preview");
-
-    // Double-click: down, up, down (2 clicks), double-click, up -> one chord appended, preview stopped
-    padSurface->mouseDown (mouseEventFor (*padSurface, padPos, left));
-    padSurface->mouseUp (mouseEventFor (*padSurface, padPos, none));
-    padSurface->mouseDown (mouseEventFor (*padSurface, padPos, left, 2));
-    padSurface->mouseDoubleClick (mouseEventFor (*padSurface, padPos, left, 2));
-    padSurface->mouseUp (mouseEventFor (*padSurface, padPos, none, 2));
-    check (p.getProgression().slots.size() == 1 && p.getProgression().slots[0].chord == cb::Chord { 0, cb::ChordQuality::Major },
-           "ui palette: double-click appends the chord", str (p.getProgression().slots.size(), " slots"));
-    check (! p.getPreviewChord().has_value() && p.getPreviewNotes().empty(), "ui palette: no preview left after double-click");
-
-    p.addChord ({ 7, cb::ChordQuality::Major });
-    pumpMessages (50);
-    ed->updateChordDisplays();
-
-    // Lane block: press previews the slot's voicing, release stops it
-    auto& lane = ed->getProgressionLane();
-    auto* laneSurface = lane.getChildComponent (0);
-    juce::Point<float> blockPos;
-    for (float y = (float) laneSurface->getHeight() - 12.0f; y > 30.0f && blockPos.isOrigin(); y -= 6.0f)
-    {
-        const juce::Point<float> pos (40.0f, y);
-        laneSurface->mouseDown (mouseEventFor (*laneSurface, pos, left));
-        if (p.getPreviewChord().has_value())
-            blockPos = pos;
-        laneSurface->mouseUp (mouseEventFor (*laneSurface, pos, none));
-    }
-    check (! blockPos.isOrigin(), "ui lane: pressing a block previews it");
-    laneSurface->mouseDown (mouseEventFor (*laneSurface, blockPos, left));
-    const auto voicings = p.getProgressionVoicings();
-    check (lane.getSelectedSlot() == 0 && ! voicings.empty() && p.getPreviewNotes() == voicings[0],
-           "ui lane: block press selects it and previews its exact voicing", notesToString (p.getPreviewNotes()));
-    laneSurface->mouseUp (mouseEventFor (*laneSurface, blockPos, none));
-    check (! p.getPreviewChord().has_value() && p.getPreviewNotes().empty(), "ui lane: mouse up stops the preview");
-
-    // Keyboard: press a key, slide to another, release
-    KeyboardGuide* keyboard = nullptr;
-    for (auto* child : ed->getChildren())
-        if (auto* k = dynamic_cast<KeyboardGuide*> (child))
-            keyboard = k;
-    check (keyboard != nullptr && keyboard->getNumChildComponents() > 0, "ui keyboard: present");
-    if (keyboard != nullptr && keyboard->getNumChildComponents() > 0)
-    {
-        auto* keys = keyboard->getChildComponent (0);
-        const float y = (float) keys->getHeight() - 6.0f;
-        const juce::Point<float> a (4.0f, y), b ((float) keys->getWidth() * 0.5f, y);
-        keys->mouseDown (mouseEventFor (*keys, a, left));
-        const auto first = p.getPreviewNotes();
-        keys->mouseDrag (mouseEventFor (*keys, b, left, 1, true));
-        const auto second = p.getPreviewNotes();
-        keys->mouseUp (mouseEventFor (*keys, b, none, 1, true));
-        check (first.size() == 1 && second.size() == 1 && first != second, "ui keyboard: press and glide play single notes",
-               notesToString (first) + " -> " + notesToString (second));
-        check (p.getPreviewNotes().empty(), "ui keyboard: mouse up stops the note");
-    }
-
-    // Nothing may be left sounding once the audio thread has caught up
-    {
-        Rig rig (p);
-        rig.run (4);
-        check (rig.openCount() == 0 && p.getSoundingNotes().none(), "ui: no stuck preview notes after the interactions",
-               str (rig.openCount(), " open"));
-    }
 }
 
 //==============================================================================
@@ -2390,73 +1861,6 @@ void testTranspose()
     check (range >= -5 && range <= 6, "best transposition stays within -5..+6", str (range));
 }
 
-// I26: a new instance starts with the last key / scale / tone picked in the editor; a loaded state always wins.
-void testUserDefaults()
-{
-    namespace id = cb::ParamIDs;
-    const auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("Chordbloom-selftest.settings");
-    file.deleteFile();
-    ChordbloomProcessor::setUserDefaultsFile (file);
-
-    {
-        ChordbloomProcessor fresh;
-        check (fresh.getKey().tonic == 0 && fresh.getKey().scale == cb::ScaleType::Major, "user defaults: none yet -> C Major");
-    }
-    {
-        ChordbloomProcessor p;
-        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditorAndMakeActive());
-        setParam (p, id::keyRoot, 6.0f);
-        setParam (p, id::scale, 1.0f);
-        setParam (p, id::previewTone, 1.0f);
-        pumpMessages (500);
-        check (! file.existsAsFile(), "user defaults: parameter changes alone (host / validator) are not recorded");
-        p.rememberUserDefaults();   // what the header's key / scale / tone menus call after the user's pick
-        pumpMessages (500);
-        check (file.existsAsFile(), "user defaults: written after picking a key in the editor");
-
-        // Host automation / a validator moving the key while the editor is open must not become the default.
-        setParam (p, id::keyRoot, 3.0f);
-        setParam (p, id::scale, 6.0f);
-        pumpMessages (500);
-    }
-    {
-        ChordbloomProcessor fresh;
-        check (fresh.getKey().tonic == 6 && fresh.getKey().scale == cb::ScaleType::NaturalMinor && getParam (fresh, id::previewTone) == 1.0f,
-               "user defaults: a new instance starts in F# minor with Warm Pad",
-               str (fresh.getKey().tonic, " ", (int) fresh.getKey().scale, " tone ", getParam (fresh, id::previewTone)));
-        check (fresh.getPalette().size() == (size_t) cb::numPaletteSections && ! fresh.getPalette()[0].chords.empty()
-                   && fresh.getPalette()[0].chords[0].chord.root == 6,
-               "user defaults: the palette is built for that key");
-    }
-
-    juce::MemoryBlock cMajorState;
-    {
-        ChordbloomProcessor src;   // starts in F# minor; set to C major without an editor (not recorded)
-        setParam (src, id::keyRoot, 0.0f);
-        setParam (src, id::scale, 0.0f);
-        setParam (src, id::previewTone, 0.0f);
-        pumpMessages (400);
-        src.getStateInformation (cMajorState);
-    }
-    {
-        ChordbloomProcessor q;
-        std::unique_ptr<juce::AudioProcessorEditor> editor (q.createEditorAndMakeActive());
-        q.setStateInformation (cMajorState.getData(), (int) cMajorState.getSize());
-        pumpMessages (500);
-        check (q.getKey().tonic == 0 && q.getKey().scale == cb::ScaleType::Major, "user defaults: a loaded project state wins");
-    }
-    {
-        ChordbloomProcessor fresh;
-        check (fresh.getKey().tonic == 6 && fresh.getKey().scale == cb::ScaleType::NaturalMinor,
-               "user defaults: neither a state load nor changes without the editor overwrite them");
-    }
-
-    ChordbloomProcessor::setUserDefaultsFile ({});   // back to disabled (dev tool default)
-    file.deleteFile();
-    ChordbloomProcessor plain;
-    check (plain.getKey().tonic == 0, "user defaults: disabled -> factory defaults");
-}
-
 // B27: Soft Keys must not alias on high notes at full velocity (the 9th harmonic of MIDI 104 folds to ~14.2 kHz).
 void testSoftKeysAliasing()
 {
@@ -2676,150 +2080,6 @@ void testHostLoopHintClears()
     check (rig.openCount() == 0 && rig.doubleOns == 0, "host loop hint: balanced afterwards");
 }
 
-// F1 + F4: timed slot auditions belong to the editor (closing it stops them; their stop never cuts a newer audition),
-// and scroll-to-resize steps one beat per notch-worth of travel with one undo step per gesture.
-void testEditorAuditionsAndWheel()
-{
-    const auto left = juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier);
-    const auto none = juce::ModifierKeys();
-
-    ChordbloomProcessor p;
-    p.setProgression (makeProgression ({ C_, G_ }));
-
-    auto findProxy = [] (juce::Component& laneSurface, const juce::String& prefix) -> juce::Component*
-    {
-        for (auto* c : laneSurface.getChildren())
-            if (c->getTitle().startsWith (prefix) && dynamic_cast<juce::Button*> (c) == nullptr)
-                return c;
-        return nullptr;
-    };
-    auto press = [] (juce::Component* proxy)
-    {
-        if (proxy == nullptr)
-            return false;
-        auto handler = proxy->createAccessibilityHandler();
-        return handler != nullptr && handler->getActions().invoke (juce::AccessibilityActionType::press);
-    };
-
-    // (a) Closing the editor right after a timed audition releases it.
-    {
-        std::unique_ptr<juce::AudioProcessorEditor> holder (p.createEditor());
-        auto* ed = dynamic_cast<ChordbloomEditor*> (holder.get());
-        if (ed == nullptr)
-        {
-            check (false, "audition: editor");
-            return;
-        }
-        pumpMessages (50);
-        ed->updateChordDisplays();
-        auto* proxy = findProxy (*ed->getProgressionLane().getChildComponent (0), "C (");
-        check (press (proxy) && ! p.getPreviewNotes().empty(), "audition: the block's accessibility press plays it");
-        holder.reset();
-        check (p.getPreviewNotes().empty() && ! p.getPreviewChord().has_value(),
-               "audition: closing the editor stops a timed audition at once (F1)");
-        pumpMessages (900);   // the orphaned stop timer fires into nothing
-        Rig rig (p);
-        rig.run (4);
-        check (rig.openCount() == 0 && p.getSoundingNotes().none(), "audition: nothing left sounding after the editor closed",
-               str (rig.openCount(), " open"));
-    }
-
-    std::unique_ptr<juce::AudioProcessorEditor> holder (p.createEditor());
-    auto* ed = dynamic_cast<ChordbloomEditor*> (holder.get());
-    if (ed == nullptr)
-        return;
-    pumpMessages (50);
-    ed->updateChordDisplays();
-    auto* laneSurface = ed->getProgressionLane().getChildComponent (0);
-
-    // (b) A timed audition stops by itself, but never cuts a pad held after it.
-    {
-        check (press (findProxy (*laneSurface, "C (")), "audition: press");
-        pumpMessages (950);
-        check (p.getPreviewNotes().empty(), "audition: a timed audition stops by itself after ~0.7 s");
-
-        auto* padSurface = ed->getPaletteView().getChildComponent (0);
-        juce::Point<float> padPos;
-        for (float x = 20.0f; x < (float) padSurface->getWidth() && padPos.isOrigin(); x += 4.0f)
-        {
-            const juce::Point<float> pos (x, 30.0f);
-            padSurface->mouseDown (mouseEventFor (*padSurface, pos, left));
-            if (p.getPreviewChord().has_value())
-                padPos = pos;
-            padSurface->mouseUp (mouseEventFor (*padSurface, pos, none));
-        }
-
-        check (press (findProxy (*laneSurface, "G (")), "audition: press G");
-        padSurface->mouseDown (mouseEventFor (*padSurface, padPos, left));   // hold a pad within the 0.7 s
-        const auto held = p.getPreviewChord();
-        pumpMessages (950);
-        check (held.has_value() && p.getPreviewChord() == held && ! p.getPreviewNotes().empty(),
-               "audition: the timed stop does not cut a pad held after it (F1)");
-        padSurface->mouseUp (mouseEventFor (*padSurface, padPos, none));
-        check (p.getPreviewNotes().empty(), "audition: releasing the pad stops it");
-    }
-
-    // (c) Scroll-to-resize.
-    {
-        juce::Point<float> blockPos;
-        for (float y = (float) laneSurface->getHeight() - 12.0f; y > 30.0f && blockPos.isOrigin(); y -= 6.0f)
-        {
-            const juce::Point<float> pos (40.0f, y);
-            laneSurface->mouseDown (mouseEventFor (*laneSurface, pos, left));
-            if (p.getPreviewChord().has_value())
-                blockPos = pos;
-            laneSurface->mouseUp (mouseEventFor (*laneSurface, pos, none));
-        }
-        check (! blockPos.isOrigin(), "wheel: found the first block");
-
-        auto wheel = [&] (float dy)
-        {
-            juce::MouseWheelDetails w;
-            w.deltaX = 0.0f;
-            w.deltaY = dy;
-            w.isReversed = false;
-            w.isSmooth = true;
-            w.isInertial = false;
-            laneSurface->mouseWheelMove (mouseEventFor (*laneSurface, blockPos, none), w);
-        };
-        auto length0 = [&p] { return p.getProgression().slots.empty() ? -1 : p.getProgression().slots[0].lengthBeats; };
-
-        const int before = length0();
-        for (int i = 0; i < 25; ++i)
-            wheel (0.03f);   // a touchpad: 25 small deltas, about three notches of travel
-        check (length0() == before, "wheel: the gesture is previewed, not committed per step");
-        pumpMessages (600);
-        check (length0() == before + 3, "wheel: three notches of touchpad travel = three beats (was eight)",
-               str (before, " -> ", length0()));
-        p.undo();
-        check (length0() == before, "wheel: the whole gesture is one undo step", str (length0()));
-        pumpMessages (50);
-
-        wheel (0.234f);   // one classic notch
-        pumpMessages (600);
-        check (length0() == before + 1, "wheel: one notch = one beat", str (length0()));
-        p.undo();
-        pumpMessages (50);
-
-        wheel (0.15f);   // direction change: leftovers never carry over
-        wheel (-0.15f);
-        wheel (0.15f);
-        pumpMessages (600);
-        check (length0() == before, "wheel: back-and-forth jitter does not resize", str (length0()));
-
-        wheel (0.15f);   // a pause restarts the accumulation
-        pumpMessages (500);
-        wheel (0.15f);
-        pumpMessages (600);
-        check (length0() == before, "wheel: leftovers do not carry into the next gesture", str (length0()));
-    }
-
-    holder.reset();
-    Rig rig (p);
-    rig.run (4);
-    check (rig.openCount() == 0 && p.getSoundingNotes().none(), "audition/wheel: nothing left sounding", str (rig.openCount(), " open"));
-}
-
 //==============================================================================
 // Random host behaviour, random edits and random live input; afterwards everything must be silent.
 void testFuzz()
@@ -2925,41 +2185,6 @@ void testFuzz()
 
 //==============================================================================
 // Melody (harmonic guide piano roll)
-
-cb::MelodyNote melodyNote (int note, double start, double length, float velocity = cb::kDefaultMelodyVelocity)
-{
-    cb::MelodyNote n;
-    n.note = note;
-    n.startBeat = start;
-    n.lengthBeats = length;
-    n.velocity = velocity;
-    return n;
-}
-
-cb::Melody makeMelody (std::initializer_list<cb::MelodyNote> notes)
-{
-    cb::Melody m;
-    m.notes = notes;
-    return cb::sanitiseMelody (m);
-}
-
-std::vector<double> melodyStarts (const cb::Melody& m)
-{
-    std::vector<double> v;
-    for (auto& n : m.notes)
-        v.push_back (n.startBeat);
-    return v;
-}
-
-std::string startsToString (const std::vector<double>& v)
-{
-    std::ostringstream ss;
-    ss << "[";
-    for (size_t i = 0; i < v.size(); ++i)
-        ss << (i > 0 ? " " : "") << v[i];
-    ss << "]";
-    return ss.str();
-}
 
 void testMelodyEditingAndUndo()
 {
@@ -3126,16 +2351,6 @@ void testMelodyState()
         pumpMessages (60);
         check (c.getMelody() == m && d.getMelody() == m, "melody state: loaded off the message thread, echoed back intact");
     }
-}
-
-// The MIDI-out notes on `channel` between two samples.
-std::vector<Ev> onChannel (const std::vector<Ev>& evs, int channel)
-{
-    std::vector<Ev> out;
-    for (auto& e : evs)
-        if (e.channel == channel)
-            out.push_back (e);
-    return out;
 }
 
 void testMelodyPlayback()
@@ -3413,197 +2628,6 @@ void testGhostMelodies()
     check (b->getGhostMelodies().empty() && b->getGhostSerial() != serial1, "ghosts: closing the instance removes its ghost");
 }
 
-juce::Component* findComponentByTitle (juce::Component& root, const juce::String& title)
-{
-    if (root.getTitle() == title)
-        return &root;
-
-    for (auto* child : root.getChildren())
-        if (auto* found = findComponentByTitle (*child, title))
-            return found;
-
-    return nullptr;
-}
-
-// The melody roll driven with synthetic mouse events, like a user would.
-void testMelodyRollEditing()
-{
-    const auto left = juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier);
-    const auto right = juce::ModifierKeys (juce::ModifierKeys::rightButtonModifier);
-    const auto leftAlt = juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier | juce::ModifierKeys::altModifier);
-
-    ChordbloomProcessor p;
-    p.setProgression (makeProgression ({ C_, Am_, F_, G_ }));   // C major, 16 beats
-
-    std::unique_ptr<juce::AudioProcessorEditor> holder (p.createEditor());
-    auto* ed = dynamic_cast<ChordbloomEditor*> (holder.get());
-
-    if (ed == nullptr)
-    {
-        check (false, "roll: editor");
-        return;
-    }
-
-    ed->setSize (ChordbloomEditor::kDefaultWidth, ChordbloomEditor::kDefaultHeight);
-    pumpMessages (40);
-    check (! ed->isMelodyViewVisible() && ed->getPaletteView().isVisible(), "roll: a new editor opens on the chord palette");
-    ed->setMelodyViewVisible (true);
-    auto& roll = ed->getMelodyRoll();
-    check (ed->isMelodyViewVisible() && roll.isVisible() && ! ed->getPaletteView().isVisible()
-               && roll.getBounds() == ed->getPaletteView().getBounds(),
-           "roll: the Melody view shows the roll in the palette's place");
-
-    // The roll's beats line up with the lane's chord blocks (same x range and scale as the lane's track)
-    {
-        const auto lane = ed->getProgressionLane().getBounds();
-        const float beat0 = (float) roll.getX() + roll.getCellCentre (0.0, 72).x;
-        const float beat16 = (float) roll.getX() + roll.getCellCentre (16.0, 72).x;
-        check (std::abs (beat0 - (float) (lane.getX() + 12)) < 0.01f && std::abs (beat16 - (float) (lane.getRight() - 12)) < 0.01f,
-               "roll: beat axis = the lane's track (chords line up under the notes)", str (beat0, " ", beat16));
-    }
-
-    auto* surface = roll.getChildComponent (0);
-    auto event = [surface] (juce::Point<float> pos, juce::ModifierKeys mods, juce::Point<float> downPos)
-    {
-        const auto now = juce::Time::getCurrentTime();
-        return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), pos, mods, juce::MouseInputSource::defaultPressure,
-                                 0.0f, 0.0f, 0.0f, 0.0f, surface, surface, now, downPos, now, 1, pos != downPos);
-    };
-    auto click = [&] (juce::Point<float> pos, juce::ModifierKeys mods)
-    {
-        surface->mouseDown (event (pos, mods, pos));
-        surface->mouseUp (event (pos, mods, pos));
-    };
-    auto drag = [&] (juce::Point<float> from, juce::Point<float> to, juce::ModifierKeys mods)
-    {
-        surface->mouseDown (event (from, mods, from));
-        for (int i = 1; i <= 4; ++i)
-            surface->mouseDrag (event (from + (to - from) * ((float) i / 4.0f), mods, from));
-        surface->mouseUp (event (to, mods, from));
-    };
-    auto melodyText = [&p]
-    {
-        std::ostringstream ss;
-        for (auto& n : p.getMelody().notes)
-            ss << n.note << "@" << n.startBeat << "+" << n.lengthBeats << " ";
-        return ss.str();
-    };
-
-    roll.setSnap (cb::MelodySnap::Scale);
-    roll.setGrid (cb::RateDivision::Eighth);
-    roll.setTopNote (78);
-    check (roll.getTopNote() == 78 && roll.getBottomNote() <= 62, "roll: pitch range scrolls (78 down to 62 or lower visible)",
-           str (roll.getTopNote(), "..", roll.getBottomNote()));
-
-    // Draw: click on F# at beat 1.3 -> F (Scale snap in C major, ties go down) on the 1/8 grid line at beat 1
-    {
-        const auto pos = roll.getCellCentre (1.3, 66);
-        surface->mouseDown (event (pos, left, pos));
-        const auto auditioned = p.getPreviewNotes();
-        surface->mouseUp (event (pos, left, pos));
-        const auto& m = p.getMelody();
-        check (m.notes.size() == 1 && m.notes[0].note == 65 && m.notes[0].startBeat == 1.0 && m.notes[0].lengthBeats == 1.0,
-               "roll: click draws a scale-snapped note on the grid (F at beat 1, one beat)", melodyText());
-        check (auditioned == std::vector<int> { 65 } && p.getPreviewNotes().empty(), "roll: the drawn note is auditioned while held");
-        check (p.canUndo(), "roll: drawing is undoable");
-    }
-
-    // Move: drag it two beats later and up to A
-    drag (roll.getCellCentre (1.5, 65), roll.getCellCentre (3.5, 69), left);
-    check (p.getMelody().notes.size() == 1 && p.getMelody().notes[0].note == 69 && p.getMelody().notes[0].startBeat == 3.0,
-           "roll: dragging a note moves it by grid steps and rows", melodyText());
-    p.undo();
-    check (p.getMelody().notes.size() == 1 && p.getMelody().notes[0].note == 65 && p.getMelody().notes[0].startBeat == 1.0,
-           "roll: one undo step per drag");
-    p.redo();
-
-    // Chord snap: moved onto B over Am (A C E) -> C
-    roll.setSnap (cb::MelodySnap::ChordTones);
-    drag (roll.getCellCentre (3.5, 69), roll.getCellCentre (5.5, 71), left);
-    check (p.getMelody().notes.size() == 1 && p.getMelody().notes[0].note == 72 && p.getMelody().notes[0].startBeat == 5.0,
-           "roll: Chord snap moves the note to the nearest tone of the chord under it", melodyText());
-
-    // Resize: drag the right edge to beat ~7.3 -> 7.5 on the grid
-    {
-        const auto r = roll.getNoteBounds (0);
-        drag ({ r.getRight() - 2.0f, r.getCentreY() }, { roll.getCellCentre (7.3, 72).x, r.getCentreY() }, left);
-        check (p.getMelody().notes.size() == 1 && p.getMelody().notes[0].lengthBeats == 2.5,
-               "roll: dragging the right edge resizes on the grid", melodyText());
-    }
-
-    // The next drawn note takes the last length; Alt places it off the grid
-    roll.setSnap (cb::MelodySnap::Off);
-    click (roll.getCellCentre (9.39, 76), leftAlt);
-    {
-        const auto& m = p.getMelody();
-        check (m.notes.size() == 2 && m.notes[1].note == 76 && std::abs (m.notes[1].startBeat - 9.375) < 1e-9
-                   && m.notes[1].lengthBeats == 2.5,
-               "roll: a new note takes the last length; Alt draws off the grid (1/48 beat)", melodyText());
-    }
-    click (roll.getCellCentre (12.2, 63), left);   // Snap Off: D# stays D#
-    check (p.getMelody().notes.size() == 3 && p.getMelody().notes[2].note == 63 && p.getMelody().notes[2].startBeat == 12.0,
-           "roll: Snap Off keeps any pitch", melodyText());
-
-    // Right-click deletes a note; a right-drag deletes every note it crosses
-    {
-        const auto r = roll.getNoteBounds (2);
-        click (r.getCentre(), right);
-        check (p.getMelody().notes.size() == 2, "roll: right-click deletes a note", melodyText());
-        p.undo();
-        check (p.getMelody().notes.size() == 3, "roll: deleting is undoable");
-
-        const auto a = roll.getNoteBounds (0), c = roll.getNoteBounds (2);
-        drag (a.getCentre(), c.getCentre(), right);   // from the C at beat 5 down to the D# at beat 12: the E above stays
-        check (p.getMelody().notes.size() == 1 && p.getMelody().notes[0].note == 76,
-               "roll: a right-drag erases the notes it crosses (and only those)", melodyText());
-        p.undo();
-        check (p.getMelody().notes.size() == 3, "roll: the erase undoes in one step");
-    }
-
-    // Mouse wheel scrolls the pitch range
-    {
-        const int top = roll.getTopNote();
-        juce::MouseWheelDetails notch {};
-        notch.deltaY = 0.234f;
-        const auto pos = roll.getCellCentre (2.0, top - 3);
-        surface->mouseWheelMove (event (pos, {}, pos), notch);
-        check (roll.getTopNote() == top + 2, "roll: one wheel notch scrolls up two rows", str (top, " -> ", roll.getTopNote()));
-    }
-
-    // Export chip follows the melody; Clear empties it (undoable)
-    {
-        pumpMessages (40);
-        ed->updateChordDisplays();
-        auto* chip = findComponentByTitle (*ed, "Melody MIDI clip");
-        check (chip != nullptr && chip->isEnabled(), "roll: the Melody chip is enabled with a melody in the loop");
-        auto* clear = dynamic_cast<juce::Button*> (findComponentByTitle (roll, "Clear melody"));
-        if (clear != nullptr)
-            clear->triggerClick();
-        pumpMessages (40);
-        ed->updateChordDisplays();
-        check (clear != nullptr && p.getMelody().empty(), "roll: Clear empties the melody");
-        check (chip != nullptr && ! chip->isEnabled(), "roll: the Melody chip is disabled without a melody");
-        p.undo();
-        ed->updateChordDisplays();
-    }
-
-    // Snap, grid, the view and the melody are part of the plugin state
-    roll.setSnap (cb::MelodySnap::ChordTones);
-    roll.setGrid (cb::RateDivision::Sixteenth);
-    juce::MemoryBlock state;
-    p.getStateInformation (state);
-    holder.reset();
-    check (p.getPreviewNotes().empty(), "roll: no audition left after closing the editor");
-
-    ChordbloomProcessor q;
-    q.setStateInformation (state.getData(), (int) state.getSize());
-    std::unique_ptr<juce::AudioProcessorEditor> holder2 (q.createEditor());
-    auto* ed2 = dynamic_cast<ChordbloomEditor*> (holder2.get());
-    check (ed2 != nullptr && ed2->isMelodyViewVisible() && ed2->getMelodyRoll().getSnap() == cb::MelodySnap::ChordTones
-               && ed2->getMelodyRoll().getGrid() == cb::RateDivision::Sixteenth && q.getMelody() == p.getMelody(),
-           "roll: view, snap, grid and melody come back with the plugin state");
-}
-
 // Random melody edits, part switches and transport moves while playing: the MIDI stream stays balanced.
 void testMelodyFuzz()
 {
@@ -3667,8 +2691,6 @@ int runSelfTest()
     testChordTrigger();
     testMidiOutAndAudio();
     testReleaseResources();
-    testEditorSize();
-    testEditorInteraction();
     testBypass();
     testPreviewSynth();
     testMidiExport();
@@ -3683,13 +2705,11 @@ int runSelfTest()
     testExportNames();
     testSingleChordExport();
     testTranspose();
-    testUserDefaults();
     testSoftKeysAliasing();
     testWarmPadFiniteSustain();
     testBypassPassThrough();
     testSameSampleInputOrder();
     testHostLoopHintClears();
-    testEditorAuditionsAndWheel();
     testFuzz();
     testMelodyEditingAndUndo();
     testMelodyState();
@@ -3697,8 +2717,12 @@ int runSelfTest()
     testMelodyPreview();
     testMelodyExport();
     testGhostMelodies();
-    testMelodyRollEditing();
     testMelodyFuzz();
+
+    // Phase 2: one file per work package (final-spec 8.2).
+    runEngineSelfTests();   // tools/dev/SelfTestEngine.cpp (WP4)
+    runRollSelfTests();     // tools/dev/SelfTestRoll.cpp (WP5)
+    runShellSelfTests();    // tools/dev/SelfTestShell.cpp (WP6)
 
     std::cout << "\nselftest: " << numPassed << " passed, " << numFailed << " failed\n";
     return numFailed == 0 ? 0 : 1;

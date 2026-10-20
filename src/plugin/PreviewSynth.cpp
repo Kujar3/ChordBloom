@@ -359,3 +359,6 @@ void PreviewSynth::allNotesOff (bool allowTailOff)
     impl->sustainDown.fill (false);   // the pedal-up may never arrive (bypass, sound switched off): never keep sustaining
     impl->stopNotes (allowTailOff);
 }
+
+// WP0 STUB (WP4 adds the counter with the 48-slot voice stealing of final-spec 6.5).
+int PreviewSynth::getHeldVoiceSteals() const noexcept { return 0; }

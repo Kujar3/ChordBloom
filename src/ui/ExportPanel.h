@@ -4,17 +4,21 @@
 
 #include "plugin/PluginProcessor.h"
 
-// "Drag to DAW" panel: three draggable chips (Chords, Bass, Both). Dragging a chip writes
-// processor.writeMidiToTempFile(part) and starts juce::DragAndDropContainer::performExternalDragDropOfFiles
-// so the clip can be dropped onto FL Studio's playlist / channel rack / piano roll.
-// Plus a "Save .mid..." button (async FileChooser -> processor.saveMidiFile). Chips are disabled when the
-// progression is empty. With Bass mode Off the Bass chip refuses to drag (and says why) and "Both" carries chords only.
-// A fourth chip, "Melody" (added with the melody roll), drags ExportPart::Melody; it is disabled (tooltip says why)
-// until a melody note starts inside the progression's loop, and the Save menu offers "Melody only". When the panel
-// is narrow the Save button shrinks to its icon so four chips fit.
+// "Drag to DAW" panel (phase 2, final-spec 7.10). Caption row: "DRAG TO DAW" + a detail line (dropped when narrow;
+// status toasts replace the caption text only) and a "Save v" pill on the right. Below it five equal draggable chips:
+// Chords (ch 1), Bass (ch 2), Melody (ch 3), Arp (ch 4), All (one track per playing part). Dragging a chip writes
+// processor.writeMidiToTempFile (part) and starts juce::DragAndDropContainer::performExternalDragDropOfFiles, so the
+// clip can be dropped onto FL Studio's playlist / channel rack / piano roll.
+//  - Chips are disabled when the progression is empty. Bass: an OFF badge (chips narrower than 70 px: no badge, the
+//    label dimmed and a slash over the grip instead) and a refusal (saying why) when its content is empty (auto with
+//    bassMode Off); the tooltip adds ", muted in Chordbloom" while bassOn is off. Melody: enabled
+//    once a melody note starts inside the loop. Arp: enabled with chords, exports while muted. All: the tooltip lists
+//    the tracks. Grip colours: Chords tonic, Bass / Melody / Arp cb::ui::layerColour, All accent.
+//  - Right-click a chip: one item "Save <Part> as .mid...". The Save menu: All parts, Chords + bass (ExportPart::Both,
+//    no chip), Chords only, Bass only, Melody only, Arp only (async FileChooser -> processor.saveMidiFile).
 // After a chip was dropped outside the plugin while Play with FL (syncToHost) is on, a clickable toast
 // "Dropped into FL? Chordbloom still plays along" offers to turn syncToHost off.
-// Nothing in the panel takes keyboard focus.
+// Nothing in the panel takes keyboard focus; a right-click never acts as a left click.
 class ExportPanel : public juce::Component
 {
 public:
@@ -35,6 +39,13 @@ public:
     // released): shows the hint above only when the release happened outside the plug-in window, like the chips do.
     // (A drag cancelled with Escape outside the window still counts as a drop: JUCE does not report the OS result.)
     void notifyExternalDragFinished();
+
+    // (Phase 2) Test hooks, panel coordinates; empty when there is no such chip (Both has no chip).
+    juce::Rectangle<int> getChipBounds (ChordbloomProcessor::ExportPart) const;
+    juce::Rectangle<int> getSaveButtonBounds() const;
+    // (Phase 2) The menus exactly as the Save pill and a chip right-click show them (test hooks for the async menus).
+    juce::PopupMenu createSaveMenu() const;
+    juce::PopupMenu createChipMenu (ChordbloomProcessor::ExportPart) const;
 
 private:
     struct Impl;

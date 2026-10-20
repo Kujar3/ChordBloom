@@ -17,5 +17,18 @@ juce::MidiFile buildMidiFile (const std::vector<NoteEvent>& events, double bpm,
 // `melodyEvents` (as from cb::renderMelody) on its own channel (3), note-offs before note-ons on the same tick.
 juce::MidiFile buildMelodyMidiFile (const std::vector<NoteEvent>& melodyEvents, double bpm, int ticksPerQuarterNote = 960);
 
+// (Phase 2) Type-1 file: track 0 = tempo + 4/4 + "Chordbloom", then one named track per entry with events, in the
+// given order (entries without events are left out). Events keep their own channels; note-offs before note-ons on the
+// same tick. Every track's end-of-track sits at max (its last event, loopBeats), so a clip dragged into FL is exactly
+// one loop long even when the part ends early (a Late start / Breath arp, a melody with a final gap); loopBeats <= 0:
+// no padding. Used for ExportPart::Arp (one track), ExportPart::All and `ChordbloomDev demos`.
+struct ExportTrack
+{
+    juce::String name;               // e.g. "Chordbloom Arp"
+    std::vector<NoteEvent> events;
+};
+juce::MidiFile buildTracksMidiFile (const std::vector<ExportTrack>&, double bpm, double loopBeats,
+                                    int ticksPerQuarterNote = 960);
+
 bool writeMidiFile (const juce::MidiFile&, const juce::File& destination);   // overwrites; creates parent dirs
 }

@@ -184,4 +184,10 @@ bool writeMidiFile (const juce::MidiFile& midiFile, const juce::File& destinatio
     // replaceWithData writes a temporary sibling and moves it into place, so readers never see half a file.
     return destination.replaceWithData (out.getData(), out.getDataSize());
 }
+
+// WP0 STUB (WP4 implements it): an empty file.
+juce::MidiFile buildTracksMidiFile (const std::vector<ExportTrack>&, double, double, int)
+{
+    return {};
+}
 } // namespace cb::midiexport

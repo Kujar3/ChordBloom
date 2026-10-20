@@ -439,6 +439,7 @@ struct ControlsPanel::Impl
 {
     Impl (ControlsPanel& o, ChordbloomProcessor& p)
         : owner (o),
+          processor (p),
           apvts (p.getAPVTS()),
           rate (param (apvts, cb::ParamIDs::rate), choiceNames (apvts, cb::ParamIDs::rate), "Rate"),
           style (param (apvts, cb::ParamIDs::voicing), choiceNames (apvts, cb::ParamIDs::voicing), "Voicing style"),
@@ -573,6 +574,7 @@ struct ControlsPanel::Impl
     };
 
     ControlsPanel& owner;
+    ChordbloomProcessor& processor;
     APVTS& apvts;
 
     juce::ComboBox pattern, bass;
@@ -737,4 +739,37 @@ void ControlsPanel::resized()
         d.velocity.setBounds (c.removeFromLeft (c.getWidth() / 2));
         d.humanize.setBounds (c);
     }
+}
+
+//==============================================================================
+// Phase 2. WP0 STUBS (WP6 implements the caption glyphs, the Bass popup and the Rate / Swing rule of final-spec 7.11).
+void ControlsPanel::refresh() {}
+
+// final-spec 7.11 order: the parameter first (host gesture), then beginUserLayerPick for a mode other than Off.
+void ControlsPanel::pickBassModeAsUser (cb::BassMode mode)
+{
+    const int index = juce::jlimit (0, cb::numBassModes - 1, (int) mode);
+
+    if (auto* p = impl->apvts.getParameter (cb::ParamIDs::bassMode))
+    {
+        p->beginChangeGesture();
+        p->setValueNotifyingHost (p->convertTo0to1 ((float) index));
+        p->endChangeGesture();
+    }
+
+    if (index != (int) cb::BassMode::Off)
+        impl->processor.beginUserLayerPick (cb::Layer::Bass);
+}
+
+juce::String ControlsPanel::getBassStateText() const
+{
+    const bool edited = impl->processor.isLayerCustom (cb::Layer::Bass);
+    const auto* bassOn = impl->apvts.getRawParameterValue (cb::ParamIDs::bassOn);
+    const bool muted = bassOn != nullptr && bassOn->load() < 0.5f;
+
+    if (edited && muted)
+        return "edited, muted";
+    if (edited)
+        return "edited";
+    return muted ? "muted" : "";
 }

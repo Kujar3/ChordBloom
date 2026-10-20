@@ -297,6 +297,19 @@ public:
         attachment.sendInitialUpdate();
     }
 
+    juce::String getSelectedLabel() const { return shortNames[selected]; }
+
+    std::vector<int> getMenuOrder() const
+    {
+        if (! order.empty())
+            return order;
+
+        std::vector<int> indices;
+        for (int i = 0; i < fullNames.size(); ++i)
+            indices.push_back (i);
+        return indices;
+    }
+
     int getIdealWidth() const
     {
         float w = 0.0f;
@@ -818,8 +831,10 @@ struct HeaderBar::Impl
 {
     Impl (HeaderBar& o, ChordbloomProcessor& p)
         : owner (o), processor (p), apvts (p.getAPVTS()),
-          outPart (*apvts.getParameter (cb::ParamIDs::midiOutPart), { "All", "Chords", "Bass", "Melody", "Ch+Bass" },
-                   { "ch 1-3", "ch 1", "ch 2", "ch 3", "ch 1 + 2" }, "MIDI out sends", "MIDI out part", { 0, 4, 1, 2, 3 })
+          outPart (*apvts.getParameter (cb::ParamIDs::midiOutPart),
+                   { "All", "Chords", "Bass", "Melody", "Ch+Bass", "Arp" },
+                   { "ch 1-4", "ch 1", "ch 2", "ch 3", "ch 1 + 2", "ch 4" }, "MIDI out sends", "MIDI out part",
+                   { 0, 4, 1, 2, 3, 5 })
     {
         namespace id = cb::ParamIDs;
 
@@ -882,10 +897,11 @@ struct HeaderBar::Impl
                           "Chordbloom's MIDI plays another instrument in FL.");
         tone.setTooltip ("Built-in sound: the instrument's tone.");
         volume.setTooltip ("Built-in sound volume (double-click to reset).");
-        midiOut.setTooltip ("MIDI out: send the chords (channel 1), bass (channel 2) and melody (channel 3) to FL Studio, "
+        midiOut.setTooltip ("MIDI out: send the chords (channel 1), bass (channel 2), melody (channel 3) and the arp "
+                            "(channel 4) to FL Studio, "
                             "to play them on another instrument. Click ? for the routing steps.");
-        outPart.setTooltip ("MIDI out part: what Chordbloom sends to FL: all parts, chords + bass, or the chords, the bass "
-                            "or the melody alone. Chordbloom channels set to different parts can feed different synths.");
+        outPart.setTooltip ("MIDI out part: what Chordbloom sends to FL: all parts, chords + bass, or the chords, the bass, "
+                            "the melody or the arp alone. Chordbloom channels set to different parts can feed different synths.");
         sync.setTooltip ("Play with FL: while FL Studio plays, Chordbloom loops the progression in time with it "
                          "(built-in sound and MIDI out). Turn it off once you've dragged the chords into FL, "
                          "or you will hear them twice.");
@@ -1209,6 +1225,9 @@ bool HeaderBar::isHelpVisible() const
 {
     return impl->helpPopover != nullptr && impl->helpPopover->isVisible();
 }
+
+juce::String HeaderBar::getOutPartLabel() const { return impl->outPart.getSelectedLabel(); }
+std::vector<int> HeaderBar::getOutPartMenuOrder() const { return impl->outPart.getMenuOrder(); }
 
 std::unique_ptr<juce::Component> HeaderBar::createHelpContent (int width)
 {

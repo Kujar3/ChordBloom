@@ -44,8 +44,190 @@ const char* rhythmPatternName (RhythmPattern p)
 
 const char* bassModeName (BassMode m)
 {
-    static const char* names[] = { "Off", "Root", "Root + 5th", "Octaves", "Pulse" };
+    static const char* names[] = { "Off", "Root", "Root + 5th", "Octaves", "Pulse",
+                                   "Offbeat 8ths", "Rolling 16ths", "Rolling, kick gap", "Offbeat pairs", "Gallop",
+                                   "Octave bounce", "Driving 8ths", "Off-kick", "Tresillo 3-3-2", "Dotted quarters" };
+    static_assert (sizeof (names) / sizeof (names[0]) == (size_t) numBassModes, "one name per BassMode");
     return names[std::clamp ((int) m, 0, numBassModes - 1)];
+}
+
+//==============================================================================
+// Phase 2 bass pattern data (final-spec 4.2; written by WP0, the renderer is WP2's).
+bool isBassPattern (BassMode m)
+{
+    return (int) m >= (int) BassMode::Offbeat8 && (int) m < numBassModes;
+}
+
+const std::vector<BassPatternStep>& bassPatternSteps (BassMode m)
+{
+    using S = BassPatternStep;
+    constexpr auto R = BassRole::Root;
+    constexpr auto O = BassRole::Octave;
+
+    static const std::vector<BassPatternStep> none;
+    static const std::vector<BassPatternStep> offbeat8 { S { 2, 2.0f, R }, S { 6, 2.0f, R }, S { 10, 2.0f, R },
+                                                         S { 14, 2.0f, R } };
+    static const std::vector<BassPatternStep> rolling16 = []
+    {
+        std::vector<BassPatternStep> v;
+        for (int i = 0; i < 16; ++i)
+            v.push_back ({ i, 0.96f, BassRole::Root });
+        return v;
+    }();
+    static const std::vector<BassPatternStep> rollingKickGap = []
+    {
+        std::vector<BassPatternStep> v;
+        for (int b = 0; b < 4; ++b)
+        {
+            v.push_back ({ 4 * b + 1, 0.96f, BassRole::Root });
+            v.push_back ({ 4 * b + 2, 0.96f, BassRole::Octave });
+            v.push_back ({ 4 * b + 3, 0.96f, BassRole::Root });
+        }
+        return v;
+    }();
+    static const std::vector<BassPatternStep> offbeatPairs { S { 2, 0.96f, R }, S { 3, 0.96f, R }, S { 6, 0.96f, R },
+                                                             S { 7, 0.96f, R }, S { 10, 0.96f, R }, S { 11, 0.96f, R },
+                                                             S { 14, 0.96f, R }, S { 15, 0.96f, R } };
+    static const std::vector<BassPatternStep> gallop { S { 0, 1.0f, R }, S { 2, 0.8f, R }, S { 3, 0.96f, R },
+                                                       S { 5, 0.96f, R }, S { 6, 1.6f, R }, S { 8, 1.0f, R },
+                                                       S { 10, 0.8f, R }, S { 11, 0.96f, R }, S { 13, 0.96f, R },
+                                                       S { 14, 1.6f, R } };
+    static const std::vector<BassPatternStep> octaveBounce8 { S { 0, 1.6f, R }, S { 2, 1.6f, O }, S { 4, 1.6f, R },
+                                                              S { 6, 1.6f, O }, S { 8, 1.6f, R }, S { 10, 1.6f, O },
+                                                              S { 12, 1.6f, R }, S { 14, 1.6f, O } };
+    static const std::vector<BassPatternStep> driving8 { S { 0, 1.6f, R }, S { 2, 1.6f, R }, S { 4, 1.6f, R },
+                                                         S { 6, 1.6f, R }, S { 8, 1.6f, R }, S { 10, 1.6f, R },
+                                                         S { 12, 1.6f, R }, S { 14, 1.6f, R } };
+    static const std::vector<BassPatternStep> offKick { S { 1, 0.96f, R }, S { 3, 1.0f, R }, S { 6, 2.0f, R },
+                                                        S { 9, 0.96f, R }, S { 11, 1.0f, R }, S { 14, 2.0f, R } };
+    static const std::vector<BassPatternStep> tresillo { S { 0, 2.0f, R }, S { 3, 2.0f, R }, S { 6, 2.0f, R },
+                                                         S { 8, 2.0f, R }, S { 11, 2.0f, R }, S { 14, 2.0f, R } };
+    static const std::vector<BassPatternStep> dottedQuarter { S { 0, 2.0f, R }, S { 6, 2.0f, R }, S { 12, 2.0f, R } };
+
+    switch (m)
+    {
+        case BassMode::Offbeat8:       return offbeat8;
+        case BassMode::Rolling16:      return rolling16;
+        case BassMode::RollingKickGap: return rollingKickGap;
+        case BassMode::OffbeatPairs:   return offbeatPairs;
+        case BassMode::Gallop:         return gallop;
+        case BassMode::OctaveBounce8:  return octaveBounce8;
+        case BassMode::Driving8:       return driving8;
+        case BassMode::OffKick:        return offKick;
+        case BassMode::Tresillo:       return tresillo;
+        case BassMode::DottedQuarter:  return dottedQuarter;
+        case BassMode::Off:
+        case BassMode::Root:
+        case BassMode::RootFifth:
+        case BassMode::Octaves:
+        case BassMode::Pulse:
+        case BassMode::NumModes:
+        default:                       break;
+    }
+    return none;
+}
+
+std::string bassPatternGrid (BassMode m)
+{
+    const auto& steps = bassPatternSteps (m);
+    if (steps.empty())
+        return {};
+
+    std::string grid (16, '-');
+    for (const auto& s : steps)
+        if (s.step >= 0 && s.step < 16)
+            grid[(size_t) s.step] = s.role == BassRole::Octave ? 'o' : 'x';
+    return grid;
+}
+
+bool bassPatternAvoidsKick (BassMode m)
+{
+    return m == BassMode::Offbeat8 || m == BassMode::RollingKickGap || m == BassMode::OffbeatPairs
+        || m == BassMode::OffKick;
+}
+
+const char* bassModeFamily (BassMode m)
+{
+    switch (m)
+    {
+        case BassMode::Root:
+        case BassMode::RootFifth:      return "Held";
+        case BassMode::Octaves:
+        case BassMode::Pulse:          return "Follows Rate";
+        case BassMode::Offbeat8:
+        case BassMode::Rolling16:
+        case BassMode::RollingKickGap:
+        case BassMode::OffbeatPairs:
+        case BassMode::Gallop:         return "Trance";
+        case BassMode::OctaveBounce8:
+        case BassMode::Driving8:
+        case BassMode::OffKick:
+        case BassMode::Tresillo:
+        case BassMode::DottedQuarter:  return "Groove";
+        case BassMode::Off:
+        case BassMode::NumModes:
+        default:                       break;
+    }
+    return "";
+}
+
+std::vector<BassMode> bassModeBrowseOrder()
+{
+    std::vector<BassMode> order;
+    for (int i = (int) BassMode::Root; i < numBassModes; ++i)
+        order.push_back ((BassMode) i);
+    return order;
+}
+
+int slotBassPitchClass (const ProgressionSlot& slot, const std::vector<int>& voicing)
+{
+    if (slot.inversion < 0)
+        return pc (slot.chord.root);
+
+    int lowest = -1;
+    for (int n : voicing)
+        if (n >= 0 && n <= 127 && (lowest < 0 || n < lowest))
+            lowest = n;
+
+    if (lowest >= 0)
+        return pc (lowest);
+
+    const auto chordPcs = slot.chord.pitchClasses();
+    if (chordPcs.empty())
+        return pc (slot.chord.root);
+    return chordPcs[(size_t) std::min (slot.inversion, (int) chordPcs.size() - 1)];
+}
+
+double grooveGridBeats (const RenderSettings& s)
+{
+    switch (s.rate)
+    {
+        case RateDivision::Quarter:       return 0.5;
+        case RateDivision::Eighth:        return 0.5;
+        case RateDivision::Sixteenth:     return 0.25;
+        case RateDivision::EighthTriplet: return 0.0;
+        case RateDivision::NumRates:      break;
+    }
+    return 0.5;
+}
+
+double swingWarp (double beat, double gridBeats, double swing)
+{
+    swing = std::clamp (swing, 0.0, 1.0);
+    if (! (gridBeats > 0.0) || ! (swing > 0.0) || ! std::isfinite (beat) || ! std::isfinite (gridBeats))
+        return beat;
+
+    const double window = 2.0 * gridBeats;
+    const double k = std::floor (beat / window);
+    const double windowStart = k * window;
+    const double local = beat - windowStart;
+    const double mid = gridBeats + swing * gridBeats / 3.0;
+
+    if (local <= 0.0)
+        return windowStart;
+    if (local < gridBeats)
+        return windowStart + local * mid / gridBeats;
+    return windowStart + mid + (local - gridBeats) * (window - mid) / gridBeats;
 }
 
 const char* rateDivisionName (RateDivision r)
@@ -298,7 +480,10 @@ void renderBass (const SlotRenderer& r, int rootPc, int bassPc, int fifthPc, int
     const double rate = rateInBeats (s.rate);
     const double swingDelay = s.rate == RateDivision::EighthTriplet ? 0.0 : swing * rate / 3.0;
 
-    switch (s.bass)
+    // WP0 STUB (WP2 renders the phase-2 pattern modes): every pattern mode plays exactly like Root for now.
+    const BassMode mode = isBassPattern (s.bass) ? BassMode::Root : s.bass;
+
+    switch (mode)
     {
         case BassMode::Root:
             r.emit (root, 0.0, heldLength (slotLength, gate), kBassChannel, 0, 0);

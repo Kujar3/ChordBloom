@@ -128,4 +128,37 @@ Melody transposeMelody (const Melody&, int semitones);
 Melody melodyFollowingSlots (const Melody&, const Progression& before, const Progression& after,
                              const std::vector<int>& sourceSlot);
 
+//==============================================================================
+// Phase 2: note limits. The arp and bass layers reuse cb::Melody as their note list with their own pitch range and
+// note cap (cb::layerLimits in Layers.h). Every arp / bass path (render, sanitise, snap, transpose, follow, state
+// parse, paste) uses these overloads: the melody-range ones above would clamp a bass to 36..96 and cut a long arp at
+// 512 notes. The overloads above are exactly these with kMelodyLimits.
+
+constexpr int kMaxLayerNotes = 2048;   // note cap of the arp and bass layers (a 1/16 arp over 64 bars is 1024 notes)
+
+struct NoteLimits
+{
+    int lowest = kMelodyLowestNote;     // lowest allowed MIDI note (functions clamp it to 0..127)
+    int highest = kMelodyHighestNote;   // highest allowed MIDI note (functions use max (lowest, highest))
+    int maxNotes = kMaxMelodyNotes;     // a canonical list keeps at most this many notes (the first in canonical order)
+};
+
+constexpr NoteLimits kMelodyLimits { kMelodyLowestNote, kMelodyHighestNote, kMaxMelodyNotes };
+
+// sanitiseMelody's rules with the pitch range and note cap of `limits`.
+// sanitiseMelody (m, kMelodyLimits) == sanitiseMelody (m). Idempotent for the same limits.
+Melody sanitiseMelody (const Melody&, const NoteLimits& limits);
+
+// snapMelodyPitch, always inside [limits.lowest, limits.highest].
+int snapMelodyPitch (int note, MelodySnap, const Key&, const std::optional<Chord>& chord, const NoteLimits& limits);
+
+// renderMelody with the notes sanitised for `limits` instead of the melody range and cap.
+std::vector<NoteEvent> renderMelody (const Melody&, double loopBeats, int channel, const NoteLimits& limits);
+
+// transposeMelody / melodyFollowingSlots inside `limits` (a note that would leave the range moves by an octave less;
+// the result is sanitised for `limits`).
+Melody transposeMelody (const Melody&, int semitones, const NoteLimits& limits);
+Melody melodyFollowingSlots (const Melody&, const Progression& before, const Progression& after,
+                             const std::vector<int>& sourceSlot, const NoteLimits& limits);
+
 } // namespace cb

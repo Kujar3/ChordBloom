@@ -1509,6 +1509,9 @@ struct MelodyRoll::Impl final : public juce::Component,
     std::optional<cb::MelodyNote> hoverDraw;
     bool auditioning = false;
     int auditionedNote = -1;
+
+    // Phase 2 (WP0 stub state; WP5 replaces it): the toolbar exists but is not a child yet.
+    std::unique_ptr<RollToolbar> rollToolbar;
 };
 
 //==============================================================================
@@ -1518,6 +1521,7 @@ MelodyRoll::MelodyRoll (ChordbloomProcessor& p) : impl (std::make_unique<Impl> (
     noFocus (*this);
     setTitle ("Melody");
     addAndMakeVisible (*impl);
+    impl->rollToolbar = std::make_unique<RollToolbar> (p);   // WP0: created, added as child 1 by WP5
 }
 
 MelodyRoll::~MelodyRoll() = default;
@@ -1567,3 +1571,34 @@ juce::Rectangle<float> MelodyRoll::getNoteBounds (int noteIndex) const
 }
 
 int MelodyRoll::getNumGhostNotesShown() const noexcept { return impl->countVisibleGhosts(); }
+
+//==============================================================================
+// Phase 2. WP0 STUBS (WP5 implements layers, selection, commands, the velocity lane and the pills): the roll stays the
+// phase-1.5 melody roll, so only the Melody layer exists, nothing is ever selected and no command applies.
+cb::Layer MelodyRoll::getLayer() const noexcept { return cb::Layer::Melody; }
+void MelodyRoll::setLayer (cb::Layer) {}
+std::vector<int> MelodyRoll::getSelection() const { return {}; }
+void MelodyRoll::setSelection (const std::vector<int>&) {}
+bool MelodyRoll::performCommand (Command, double) { return false; }
+
+bool MelodyRoll::areOtherLayersShown() const noexcept { return impl->showGhosts; }
+
+void MelodyRoll::setOtherLayersShown (bool shouldShow)
+{
+    impl->showGhosts = shouldShow;
+    impl->ghostButton.setToggleState (shouldShow, juce::dontSendNotification);
+    impl->processor.getAPVTS().state.setProperty (kGhostsProp, shouldShow, nullptr);
+    impl->repaint();
+}
+
+juce::PopupMenu MelodyRoll::createMenu (MenuSection, double, std::optional<cb::Layer>) { return {}; }
+std::optional<MelodyRoll::MenuSection> MelodyRoll::getLastMenuShown() const noexcept { return std::nullopt; }
+juce::Rectangle<float> MelodyRoll::getChordStripArea() const noexcept { return impl->stripArea; }
+int MelodyRoll::getNumOtherLayerNotesShown() const noexcept { return 0; }
+bool MelodyRoll::isVelocityLaneVisible() const noexcept { return false; }
+void MelodyRoll::setVelocityLaneVisible (bool) {}
+juce::Rectangle<float> MelodyRoll::getVelocityLaneArea() const noexcept { return {}; }
+juce::Rectangle<float> MelodyRoll::getEmptyStateButtonArea() const noexcept { return {}; }
+juce::Rectangle<float> MelodyRoll::getSelectionPillArea() const noexcept { return {}; }
+juce::Rectangle<float> MelodyRoll::getLayerOffPillArea() const noexcept { return {}; }
+RollToolbar& MelodyRoll::getToolbar() noexcept { return *impl->rollToolbar; }

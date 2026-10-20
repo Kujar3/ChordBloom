@@ -308,4 +308,34 @@ Melody melodyFollowingSlots (const Melody& melodyIn, const Progression& before, 
     return sanitiseMelody (out);
 }
 
+//==============================================================================
+// Phase 2 NoteLimits overloads. WP0 STUBS (WP3 implements them): they call the melody-range functions and ignore
+// `limits`, which is exactly right for kMelodyLimits and keeps phase-1.5 behaviour until WP3 lands.
+Melody sanitiseMelody (const Melody& melody, const NoteLimits& /*limits*/)
+{
+    return sanitiseMelody (melody);
+}
+
+int snapMelodyPitch (int note, MelodySnap snap, const Key& key, const std::optional<Chord>& chord,
+                     const NoteLimits& /*limits*/)
+{
+    return snapMelodyPitch (note, snap, key, chord);
+}
+
+std::vector<NoteEvent> renderMelody (const Melody& melody, double loopBeats, int channel, const NoteLimits& /*limits*/)
+{
+    return renderMelody (melody, loopBeats, channel);
+}
+
+Melody transposeMelody (const Melody& melody, int semitones, const NoteLimits& /*limits*/)
+{
+    return transposeMelody (melody, semitones);
+}
+
+Melody melodyFollowingSlots (const Melody& melody, const Progression& before, const Progression& after,
+                             const std::vector<int>& sourceSlot, const NoteLimits& /*limits*/)
+{
+    return melodyFollowingSlots (melody, before, after, sourceSlot);
+}
+
 } // namespace cb

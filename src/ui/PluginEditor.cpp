@@ -358,6 +358,9 @@ void ChordbloomEditor::resized()
 ProgressionLane& ChordbloomEditor::getProgressionLane() noexcept { return *lane; }
 ChordPaletteView& ChordbloomEditor::getPaletteView() noexcept { return *palette; }
 MelodyRoll& ChordbloomEditor::getMelodyRoll() noexcept { return *melodyRoll; }
+ExportPanel& ChordbloomEditor::getExportPanel() noexcept { return *exportPanel; }
+ControlsPanel& ChordbloomEditor::getControlsPanel() noexcept { return *controls; }
+HeaderBar& ChordbloomEditor::getHeaderBar() noexcept { return *header; }
 
 bool ChordbloomEditor::isMelodyViewVisible() const noexcept { return melodyView; }
 

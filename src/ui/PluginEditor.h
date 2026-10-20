@@ -56,6 +56,9 @@ public:
     ProgressionLane& getProgressionLane() noexcept;
     ChordPaletteView& getPaletteView() noexcept;
     MelodyRoll& getMelodyRoll() noexcept;
+    ExportPanel& getExportPanel() noexcept;       // (phase 2)
+    ControlsPanel& getControlsPanel() noexcept;   // (phase 2)
+    HeaderBar& getHeaderBar() noexcept;           // (phase 2)
 
     // Melody view (the view switch calls this too). Remembered in the APVTS state tree.
     void setMelodyViewVisible (bool shouldShowMelody);
@@ -103,6 +106,7 @@ private:
     int focusSweepCountdown = 0;
     bool fittedToDisplay = false;   // fitToCurrentDisplay() ran once the editor was on screen
     bool externalDropPending = false;   // a pad / block went out as a MIDI file: show the "plays along" hint on release
+    uint64_t lastLayerSerial = 0;       // (phase 2) getLayerSerial() last pushed to the layer UI (the timer polls it)
 
     ChordbloomProcessor& processor;
     cb::ui::LookAndFeel lookAndFeel;

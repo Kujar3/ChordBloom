@@ -2,6 +2,7 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
+#include "core/Layers.h"
 #include "core/Theory.h"
 
 // Visual language for Chordbloom. Dark slate UI that sits comfortably next to FL Studio's blue-grey,
@@ -149,5 +150,18 @@ public:
     void fillTextEditorBackground (juce::Graphics&, int width, int height, juce::TextEditor&) override;
     void drawTextEditorOutline (juce::Graphics&, int width, int height, juce::TextEditor&) override;
 };
+
+// (Phase 2) Layer colours: roll tab LEDs, other layers' notes, export chip grips.
+inline juce::Colour layerColour (cb::Layer layer)
+{
+    switch (layer)
+    {
+        case cb::Layer::Arp:  return Colours::subdominant;   // amber
+        case cb::Layer::Bass: return Colours::secondary;     // sky
+        case cb::Layer::Melody:
+        case cb::Layer::NumLayers:
+        default:              return Colours::borrowed;      // lavender
+    }
+}
 
 } // namespace cb::ui

@@ -778,3 +778,9 @@ void ExportPanel::refresh() { impl->updateEnablement(); }
 
 void ExportPanel::showPlaysAlongHint() { impl->showPlaysAlongHint(); }
 void ExportPanel::notifyExternalDragFinished() { impl->externalDragFinished(); }
+
+// Phase 2. WP0 STUBS (WP6 implements the five-chip layout).
+juce::Rectangle<int> ExportPanel::getChipBounds (ChordbloomProcessor::ExportPart) const { return {}; }
+juce::Rectangle<int> ExportPanel::getSaveButtonBounds() const { return {}; }
+juce::PopupMenu ExportPanel::createSaveMenu() const { return {}; }
+juce::PopupMenu ExportPanel::createChipMenu (ChordbloomProcessor::ExportPart) const { return {}; }

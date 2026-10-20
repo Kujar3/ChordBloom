@@ -91,8 +91,21 @@ juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
     // Index 0 was "Chords + Bass" before the melody existed (old projects have no melody, so nothing changes for them);
     // new choices are only ever appended so stored values keep their meaning.
     layout.add (std::make_unique<AudioParameterChoice> (pid (id::midiOutPart), "MIDI Out Part",
-        StringArray { "All parts", "Chords only", "Bass only", "Melody only", "Chords + Bass" }, 0));
+        StringArray { "All parts", "Chords only", "Bass only", "Melody only", "Chords + Bass", "Arp only" }, 0));
     layout.add (std::make_unique<AudioParameterBool> (pid (id::melodyOn), "Melody", true));
+
+    // Phase 2 (appended, ParameterID version 2). midiOutPart gained 5 "Arp only" and bassMode choices 5..14 above.
+    auto pid2 = [] (const char* s) { return ParameterID { s, 2 }; };
+    layout.add (std::make_unique<AudioParameterBool> (pid2 (id::arpOn), "Arp", false));
+    layout.add (std::make_unique<AudioParameterChoice> (pid2 (id::arpShape), "Arp Shape",
+        namesFrom (cb::numArpShapes, [] (int i) { return cb::arpShapeName ((cb::ArpShape) i); }), 0));
+    layout.add (std::make_unique<AudioParameterChoice> (pid2 (id::arpRate), "Arp Rate",
+        namesFrom (cb::numRateDivisions, [] (int i) { return cb::rateDivisionName ((cb::RateDivision) i); }), 2));
+    layout.add (std::make_unique<AudioParameterChoice> (pid2 (id::arpRhythm), "Arp Rhythm",
+        namesFrom (cb::numArpRhythms, [] (int i) { return cb::arpRhythmName ((cb::ArpRhythm) i); }), 0));
+    layout.add (std::make_unique<AudioParameterInt> (pid2 (id::arpOctave), "Arp Octave", -2, 2, 0));
+    layout.add (std::make_unique<AudioParameterFloat> (pid2 (id::arpGate), "Arp Gate", NormalisableRange<float> (0.05f, 1.0f), 0.9f, percent));
+    layout.add (std::make_unique<AudioParameterBool> (pid2 (id::bassOn), "Bass On", true));
     return layout;
 }
 
@@ -120,11 +133,14 @@ const char* const kAllParamIds[] = {
     cb::ParamIDs::pattern, cb::ParamIDs::rate, cb::ParamIDs::bassMode, cb::ParamIDs::velocity, cb::ParamIDs::gate,
     cb::ParamIDs::swing, cb::ParamIDs::humanize, cb::ParamIDs::previewOn, cb::ParamIDs::previewTone,
     cb::ParamIDs::previewVolume, cb::ParamIDs::midiOut, cb::ParamIDs::syncToHost, cb::ParamIDs::scaleLock,
-    cb::ParamIDs::chordTrigger, cb::ParamIDs::triggerSevenths, cb::ParamIDs::melodyOn
+    cb::ParamIDs::chordTrigger, cb::ParamIDs::triggerSevenths, cb::ParamIDs::melodyOn,
+    cb::ParamIDs::arpOn, cb::ParamIDs::arpShape, cb::ParamIDs::arpRate, cb::ParamIDs::arpRhythm, cb::ParamIDs::arpOctave,
+    cb::ParamIDs::arpGate, cb::ParamIDs::bassOn
 };
 
-// MIDI-out parts that each midiOutPart choice lets through (bit 0 chords, bit 1 bass, bit 2 melody).
-constexpr uint8_t kOutPartMask[] = { 0b111, 0b001, 0b010, 0b100, 0b011 };
+// MIDI-out parts that each midiOutPart choice lets through (bit 0 chords, bit 1 bass, bit 2 melody, bit 3 arp):
+// 0 All parts, 1 Chords only, 2 Bass only, 3 Melody only, 4 Chords + Bass, 5 Arp only.
+constexpr uint8_t kOutPartMask[] = { 0b1111, 0b0001, 0b0010, 0b0100, 0b0011, 0b1000 };
 constexpr int kNumOutPartChoices = (int) std::size (kOutPartMask);
 
 // White-key pitch class -> degree (C D E F G A B -> 0..6), -1 for black keys.
@@ -169,7 +185,7 @@ struct PreviewMsg
     uint8_t on = 0;
     uint8_t note = 0;
     uint8_t velocity = 0;
-    uint8_t channel = 1;   // chord previews and keyboard clicks: 1; melody auditions: 3
+    uint8_t channel = 1;   // chord previews and keyboard clicks: 1; bass auditions 2; melody auditions: 3; arp 4
 };
 
 // Parameters that change what the message thread renders.
@@ -178,6 +194,10 @@ struct RenderSnapshot
     int keyRoot = 0, scale = 0, octave = 0, voicing = 0, pattern = 0, rate = 0, bass = 0;
     bool voiceLeading = true, melodyOn = true;
     float velocity = 0.0f, gate = 0.0f, swing = 0.0f, humanize = 0.0f;
+    // Phase 2: structural (bassOn, arpOn, arpShape, arpRate, arpRhythm, arpOctave); timing-only (arpGate).
+    bool bassOn = true, arpOn = false;
+    int arpShape = 0, arpRate = 2, arpRhythm = 0, arpOctave = 0;
+    float arpGate = 0.9f;
 
     bool sameVoicing (const RenderSnapshot& o) const
     {
@@ -188,7 +208,14 @@ struct RenderSnapshot
     {
         return keyRoot == o.keyRoot && scale == o.scale && sameVoicing (o) && pattern == o.pattern && rate == o.rate
             && bass == o.bass && melodyOn == o.melodyOn && velocity == o.velocity && gate == o.gate && swing == o.swing
-            && humanize == o.humanize;
+            && humanize == o.humanize && sameLayerStructure (o) && arpGate == o.arpGate;
+    }
+
+    // Phase 2 structural fields of the layers (a change re-renders with chase, like pattern / rate / bass).
+    bool sameLayerStructure (const RenderSnapshot& o) const
+    {
+        return bassOn == o.bassOn && arpOn == o.arpOn && arpShape == o.arpShape && arpRate == o.arpRate
+            && arpRhythm == o.arpRhythm && arpOctave == o.arpOctave;
     }
     bool operator!= (const RenderSnapshot& o) const { return ! (*this == o); }
 };
@@ -235,6 +262,8 @@ juce::String partName (ChordbloomProcessor::ExportPart part)
         case ChordbloomProcessor::ExportPart::Chords: return "Chords";
         case ChordbloomProcessor::ExportPart::Bass:   return "Bass";
         case ChordbloomProcessor::ExportPart::Melody: return "Melody";
+        case ChordbloomProcessor::ExportPart::Arp:    return "Arp";
+        case ChordbloomProcessor::ExportPart::All:    return "All parts";
         case ChordbloomProcessor::ExportPart::Both:   break;
     }
     return "Chords + Bass";
@@ -447,6 +476,13 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         prm.triggerSevenths = get (cb::ParamIDs::triggerSevenths);
         prm.midiOutPart = get (cb::ParamIDs::midiOutPart);
         prm.melodyOn = get (cb::ParamIDs::melodyOn);
+        prm.arpOn = get (cb::ParamIDs::arpOn);
+        prm.arpShape = get (cb::ParamIDs::arpShape);
+        prm.arpRate = get (cb::ParamIDs::arpRate);
+        prm.arpRhythm = get (cb::ParamIDs::arpRhythm);
+        prm.arpOctave = get (cb::ParamIDs::arpOctave);
+        prm.arpGate = get (cb::ParamIDs::arpGate);
+        prm.bassOn = get (cb::ParamIDs::bassOn);
 
         applyUserDefaults();   // before the listeners: a fresh instance simply starts there (a loaded state overrides it)
 
@@ -509,6 +545,13 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         std::atomic<float>* triggerSevenths = nullptr;
         std::atomic<float>* midiOutPart = nullptr;
         std::atomic<float>* melodyOn = nullptr;
+        std::atomic<float>* arpOn = nullptr;
+        std::atomic<float>* arpShape = nullptr;
+        std::atomic<float>* arpRate = nullptr;
+        std::atomic<float>* arpRhythm = nullptr;
+        std::atomic<float>* arpOctave = nullptr;
+        std::atomic<float>* arpGate = nullptr;
+        std::atomic<float>* bassOn = nullptr;
     };
 
     static float rawValue (const std::atomic<float>* p, float fallback = 0.0f) noexcept
@@ -572,7 +615,26 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         s.swing = rawValue (prm.swing);
         s.humanize = rawValue (prm.humanize);
         s.melodyOn = boolValue (prm.melodyOn);
+        s.bassOn = boolValue (prm.bassOn);
+        s.arpOn = boolValue (prm.arpOn);
+        s.arpShape = intValue (prm.arpShape, 0, cb::numArpShapes - 1);
+        s.arpRate = intValue (prm.arpRate, 0, cb::numRateDivisions - 1, 2);
+        s.arpRhythm = intValue (prm.arpRhythm, 0, cb::numArpRhythms - 1);
+        s.arpOctave = intValue (prm.arpOctave, -2, 2);
+        s.arpGate = rawValue (prm.arpGate, 0.9f);
         return s;
+    }
+
+    // Phase 2: the arp parameters (final-spec 4.3 / 6.1); centre = voicing centre + 5 + 12 * arpOctave, clamped 40..96.
+    cb::ArpSettings arpFromParams() const
+    {
+        cb::ArpSettings a;
+        a.shape = (cb::ArpShape) intValue (prm.arpShape, 0, cb::numArpShapes - 1);
+        a.rate = (cb::RateDivision) intValue (prm.arpRate, 0, cb::numRateDivisions - 1, 2);
+        a.rhythm = (cb::ArpRhythm) intValue (prm.arpRhythm, 0, cb::numArpRhythms - 1);
+        a.centreNote = juce::jlimit (40, 96, voicingFromParams().centerNote + 5 + 12 * intValue (prm.arpOctave, -2, 2));
+        a.gate = juce::jlimit (0.05f, 1.0f, rawValue (prm.arpGate, 0.9f));
+        return a;
     }
 
     //==============================================================================
@@ -612,7 +674,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         const bool timingOnly = ! force && snap.keyRoot == renderedSnap.keyRoot && snap.scale == renderedSnap.scale
                              && snap.sameVoicing (renderedSnap) && snap.pattern == renderedSnap.pattern
                              && snap.rate == renderedSnap.rate && snap.bass == renderedSnap.bass
-                             && snap.melodyOn == renderedSnap.melodyOn;
+                             && snap.melodyOn == renderedSnap.melodyOn && snap.sameLayerStructure (renderedSnap);
 
         if (changed)
         {
@@ -727,6 +789,10 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
 
     void rebuildAndPublish (bool structural = true)
     {
+        // (Phase 2) Every re-render may change what the layer UI shows (notes, custom flags, the play switches): commits,
+        // undo / redo, state loads and parameter refreshes all come through here (getLayerSerial contract).
+        layerSerial.fetch_add (1);
+
         auto data = std::make_unique<EngineData>();
         data->serial = nextSerial++;
         if (structural)
@@ -746,6 +812,12 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         if (total > 0.0)
         {
             auto events = renderEvents();
+
+            // (Phase 2, WP0) bassOn mutes the bass layer's playback (renderProgressionEvents keeps it for export).
+            if (! boolValue (prm.bassOn))
+                events.erase (std::remove_if (events.begin(), events.end(), [] (const cb::NoteEvent& e)
+                                              { return e.channel == ChordbloomProcessor::kBassChannel; }),
+                              events.end());
 
             if (boolValue (prm.melodyOn))
             {
@@ -1042,32 +1114,36 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         if (auto params = apvts.copyState().createXml())
             root.addChildElement (params.release());
 
-        auto* prog = root.createNewChildElement (kProgressionTag);
+        // One lock, one consistent copy of the song (final-spec 3.4): a commit between two separate locks could pair
+        // a progression with another edit's melody (phase 2: layer notes). The XML is built from the copies.
+        cb::Progression progressionCopy;
+        cb::Melody melodyCopy;
         {
             const std::lock_guard<std::mutex> lock (stateMutex);
-            for (auto& s : stateProgression.slots)
-            {
-                auto* e = prog->createNewChildElement (kSlotTag);
-                e->setAttribute ("root", s.chord.root);
-                e->setAttribute ("quality", (int) s.chord.quality);
-                e->setAttribute ("length", s.lengthBeats);
-                e->setAttribute ("inversion", s.inversion);
-                e->setAttribute ("octave", s.octaveShift);
-            }
+            progressionCopy = stateProgression;
+            melodyCopy = stateMelody;
+        }
+
+        auto* prog = root.createNewChildElement (kProgressionTag);
+        for (auto& s : progressionCopy.slots)
+        {
+            auto* e = prog->createNewChildElement (kSlotTag);
+            e->setAttribute ("root", s.chord.root);
+            e->setAttribute ("quality", (int) s.chord.quality);
+            e->setAttribute ("length", s.lengthBeats);
+            e->setAttribute ("inversion", s.inversion);
+            e->setAttribute ("octave", s.octaveShift);
         }
 
         auto* mel = root.createNewChildElement (kMelodyTag);
         mel->setAttribute ("ticksPerBeat", (int) kStateTicksPerBeat);
+        for (auto& n : melodyCopy.notes)
         {
-            const std::lock_guard<std::mutex> lock (stateMutex);
-            for (auto& n : stateMelody.notes)
-            {
-                auto* e = mel->createNewChildElement (kNoteTag);
-                e->setAttribute ("note", n.note);
-                e->setAttribute ("start", (int) std::lround (n.startBeat * kStateTicksPerBeat));
-                e->setAttribute ("length", (int) std::lround (n.lengthBeats * kStateTicksPerBeat));
-                e->setAttribute ("velocity", (double) n.velocity);
-            }
+            auto* e = mel->createNewChildElement (kNoteTag);
+            e->setAttribute ("note", n.note);
+            e->setAttribute ("start", (int) std::lround (n.startBeat * kStateTicksPerBeat));
+            e->setAttribute ("length", (int) std::lround (n.lengthBeats * kStateTicksPerBeat));
+            e->setAttribute ("velocity", (double) n.velocity);
         }
 
         auto* editor = root.createNewChildElement (kEditorTag);
@@ -1281,12 +1357,13 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         uint8_t channel = 1;
     };
 
-    // MIDI-out parts for the midiOutPart filter: playback bass is "bass"; playback melody and melody auditions are
-    // "melody"; playback chords, other previews and live input are "chords".
+    // MIDI-out parts for the midiOutPart filter (by channel, see playbackPart): bass (2) is "bass"; melody (3) is
+    // "melody"; the arp (4) is "arp"; playback chords, other previews and live input are "chords".
     static constexpr uint8_t kPartChords = 0;
     static constexpr uint8_t kPartBass = 1;
     static constexpr uint8_t kPartMelody = 2;
-    static constexpr int kNumParts = 3;
+    static constexpr uint8_t kPartArp = 3;
+    static constexpr int kNumParts = 4;
 
     struct LogicalEvent
     {
@@ -1329,7 +1406,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         bool prevPreviewOn = true;
         bool wasBypassed = false;         // the previous block was processBlockBypassed (hostOn etc. = what passed through)
         int outPart = 0;                  // midiOutPart choice (kOutPartMask): 0 = all parts, 1 = chords, 2 = bass,
-                                          // 3 = melody, 4 = chords + bass
+                                          // 3 = melody, 4 = chords + bass, 5 = arp
 
         // timing of the current block (for beat -> sample conversion)
         int numSamples = 0;
@@ -1376,6 +1453,8 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
     {
         if (channel == ChordbloomProcessor::kBassChannel)
             return kPartBass;
+        if (channel == ChordbloomProcessor::kArpChannel)
+            return kPartArp;
         return channel == ChordbloomProcessor::kMelodyChannel ? kPartMelody : kPartChords;
     }
 
@@ -2667,6 +2746,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
     std::atomic<EngineData*> latest { nullptr };
     std::atomic<EngineData*> audioInUse { nullptr };
     uint64_t nextSerial = 1;
+    std::atomic<uint64_t> layerSerial { 1 };   // getLayerSerial (any thread)
 
     // Preview FIFO (message thread -> audio thread)
     juce::AbstractFifo fifo { kPreviewFifoSize };
@@ -2923,6 +3003,154 @@ void ChordbloomProcessor::setMelody (const cb::Melody& melody) { impl->commitSon
 void ChordbloomProcessor::clearMelody() { setMelody ({}); }
 std::vector<cb::NoteEvent> ChordbloomProcessor::renderMelodyEvents() const { return impl->renderMelodyEvents(); }
 
+//==============================================================================
+// Layers (phase 2). WP0 STUBS (WP4 implements the layer model): no layer is ever custom, Arp / Bass show no auto notes
+// yet, the Melody layer delegates to the melody API, and the play switches read / write the parameters (final-spec 2.3).
+bool ChordbloomProcessor::isLayerCustom (cb::Layer) const { return false; }
+
+cb::Melody ChordbloomProcessor::getLayerNotes (cb::Layer layer) const
+{
+    if (layer == cb::Layer::Melody)
+        return impl->melody;
+    return {};
+}
+
+void ChordbloomProcessor::setLayerNotes (cb::Layer layer, const cb::Melody& notes)
+{
+    if (layer == cb::Layer::Melody)
+        setMelody (notes);
+}
+
+void ChordbloomProcessor::resetLayer (cb::Layer, int) {}
+
+std::vector<bool> ChordbloomProcessor::getEditedSlots (cb::Layer) const
+{
+    return std::vector<bool> (impl->progression.slots.size(), false);
+}
+
+bool ChordbloomProcessor::isLayerOn (cb::Layer layer) const
+{
+    auto& i = *impl;
+    switch (layer)
+    {
+        case cb::Layer::Arp:  return i.boolValue (i.prm.arpOn);
+        case cb::Layer::Bass: return i.boolValue (i.prm.bassOn) && i.intValue (i.prm.bassMode, 0, cb::numBassModes - 1, 1) != 0;
+        case cb::Layer::Melody:
+        case cb::Layer::NumLayers:
+        default:              break;
+    }
+    return i.boolValue (i.prm.melodyOn);
+}
+
+namespace
+{
+void setParameterAsUser (juce::AudioProcessorValueTreeState& apvts, const char* id, float plainValue)
+{
+    if (auto* p = apvts.getParameter (id))
+    {
+        const float normalised = p->convertTo0to1 (plainValue);
+        if (p->getValue() == normalised)
+            return;
+        p->beginChangeGesture();
+        p->setValueNotifyingHost (normalised);
+        p->endChangeGesture();
+    }
+}
+} // namespace
+
+void ChordbloomProcessor::setLayerOn (cb::Layer layer, bool shouldBeOn)
+{
+    auto& apvts = impl->apvts;
+    switch (layer)
+    {
+        case cb::Layer::Arp:
+            setParameterAsUser (apvts, cb::ParamIDs::arpOn, shouldBeOn ? 1.0f : 0.0f);
+            break;
+        case cb::Layer::Bass:
+            setParameterAsUser (apvts, cb::ParamIDs::bassOn, shouldBeOn ? 1.0f : 0.0f);
+            if (shouldBeOn && impl->intValue (impl->prm.bassMode, 0, cb::numBassModes - 1, 1) == (int) cb::BassMode::Off)
+                setParameterAsUser (apvts, cb::ParamIDs::bassMode, (float) cb::BassMode::Root);
+            break;
+        case cb::Layer::Melody:
+        case cb::Layer::NumLayers:
+        default:
+            setParameterAsUser (apvts, cb::ParamIDs::melodyOn, shouldBeOn ? 1.0f : 0.0f);
+            break;
+    }
+}
+
+bool ChordbloomProcessor::isLayerPlaying (cb::Layer layer) const
+{
+    if (! isLayerOn (layer))
+        return false;
+    const double total = (double) impl->progression.totalBeats();
+    for (const auto& n : getLayerNotes (layer).notes)
+        if (n.startBeat < total)
+            return true;
+    return false;
+}
+
+void ChordbloomProcessor::beginUserLayerPick (cb::Layer layer)
+{
+    // WP0 STUB: no custom layer exists yet, so a pick only switches the layer on (the bass: bassOn, never bassMode).
+    // The UI has already set the picked parameter (final-spec 7.5 / 7.11 order).
+    if (layer == cb::Layer::Arp)
+        setParameterAsUser (impl->apvts, cb::ParamIDs::arpOn, 1.0f);
+    else if (layer == cb::Layer::Bass)
+        setParameterAsUser (impl->apvts, cb::ParamIDs::bassOn, 1.0f);
+}
+
+std::vector<cb::NoteEvent> ChordbloomProcessor::renderLayerEvents (cb::Layer layer) const
+{
+    switch (layer)
+    {
+        case cb::Layer::Melody: return renderMelodyEvents();
+        case cb::Layer::Bass:
+        {
+            auto events = impl->renderEvents();
+            events.erase (std::remove_if (events.begin(), events.end(),
+                                          [] (const cb::NoteEvent& e) { return e.channel != kBassChannel; }),
+                          events.end());
+            return events;
+        }
+        case cb::Layer::Arp:
+        case cb::Layer::NumLayers:
+        default:                break;
+    }
+    return {};
+}
+
+cb::ArpSettings ChordbloomProcessor::getArpSettings() const { return impl->arpFromParams(); }
+
+uint64_t ChordbloomProcessor::getLayerSerial() const noexcept { return impl->layerSerial.load(); }
+
+void ChordbloomProcessor::startPreviewLayerNote (cb::Layer layer, int midiNote)
+{
+    auto& i = *impl;
+    i.stopPreviewNotes();
+    if (midiNote < 0 || midiNote > 127)
+        return;
+    i.startPreviewNotes ({ midiNote }, cb::layerMidiChannel (layer));
+}
+
+//==============================================================================
+// Melody generator (phase 2). WP0 STUBS (WP4 implements them on top of WP1's cb::generateMelody).
+bool ChordbloomProcessor::generateMelody (const cb::MelodyGenSettings&, std::uint32_t) { return false; }
+bool ChordbloomProcessor::isMelodyFromGenerator() const { return false; }
+std::uint32_t ChordbloomProcessor::getLastGeneratorSeed() const { return 0; }
+
+cb::MelodyGenContext ChordbloomProcessor::getMelodyGenContext() const
+{
+    cb::MelodyGenContext context;
+    context.voicings = getProgressionVoicings();
+    context.accompaniment = impl->renderEvents();
+    if (! isLayerOn (cb::Layer::Bass))
+        context.accompaniment.erase (std::remove_if (context.accompaniment.begin(), context.accompaniment.end(),
+                                                     [] (const cb::NoteEvent& e) { return e.channel == kBassChannel; }),
+                                     context.accompaniment.end());
+    return context;
+}
+
 std::vector<ChordbloomProcessor::GhostMelody> ChordbloomProcessor::getGhostMelodies() const
 {
     std::vector<GhostMelody> result;
@@ -3067,6 +3295,8 @@ juce::File ChordbloomProcessor::writeMidiToTempFile (ExportPart part) const
 {
     if (impl->progression.empty() || (part == ExportPart::Melody && renderMelodyEvents().empty()))
         return {};
+    if (part == ExportPart::Arp || part == ExportPart::All)   // WP0 STUB: WP4 exports these
+        return {};
 
     const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("Chordbloom");
     const auto file = dir.getChildFile (getExportFileName (part));
@@ -3087,19 +3317,30 @@ bool ChordbloomProcessor::saveMidiFile (const juce::File& destination, ExportPar
     if (impl->progression.empty() || destination == juce::File())
         return false;
 
-    if (part == ExportPart::Melody)
+    // Every part is dispatched explicitly (phase 2: a new part must never fall into the chords + bass branch).
+    bool chords = false, bass = false;
+    switch (part)
     {
-        const auto melodyEvents = renderMelodyEvents();
-        if (melodyEvents.empty())
-            return false;
+        case ExportPart::Melody:
+        {
+            const auto melodyEvents = renderMelodyEvents();
+            if (melodyEvents.empty())
+                return false;
 
-        const auto file = cb::midiexport::buildMelodyMidiFile (melodyEvents, getHostBpm(), 960);
-        return cb::midiexport::writeMidiFile (withLoopLength (file, (double) impl->progression.totalBeats()), destination);
+            const auto file = cb::midiexport::buildMelodyMidiFile (melodyEvents, getHostBpm(), 960);
+            return cb::midiexport::writeMidiFile (withLoopLength (file, (double) impl->progression.totalBeats()), destination);
+        }
+
+        case ExportPart::Arp:
+        case ExportPart::All:
+            return false;   // WP0 STUB: WP4 exports these (cb::midiexport::buildTracksMidiFile)
+
+        case ExportPart::Chords: chords = true; break;
+        case ExportPart::Bass:   bass = true; break;
+        case ExportPart::Both:   chords = bass = true; break;
     }
 
     const auto events = renderProgressionEvents();
-    const bool chords = part != ExportPart::Bass;
-    const bool bass = part != ExportPart::Chords;
     const auto file = cb::midiexport::buildMidiFile (events, getHostBpm(), chords, bass, 960);
     return cb::midiexport::writeMidiFile (withLoopLength (file, (double) impl->progression.totalBeats()), destination);
 }

@@ -23,6 +23,9 @@ public:
 
     void allNotesOff (bool allowTailOff);
 
+    int getHeldVoiceSteals() const noexcept;  // (phase 2 test hook) voices stolen while still held (no note-off yet)
+                                              // since prepare()
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
