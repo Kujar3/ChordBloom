@@ -39,6 +39,18 @@ bool allowedBySnap (int pitchClass, MelodySnap snap, const Key& key, const std::
     return true;
 }
 
+// NoteLimits as the functions use them: pitches clamped to 0..127, highest never below lowest, a non-negative cap.
+struct ResolvedLimits
+{
+    int low, high, maxNotes;
+};
+
+ResolvedLimits resolve (const NoteLimits& limits)
+{
+    const int low = std::clamp (limits.lowest, 0, 127);
+    return { low, std::max (low, std::clamp (limits.highest, 0, 127)), std::max (0, limits.maxNotes) };
+}
+
 bool canonicalLess (const MelodyNote& a, const MelodyNote& b)
 {
     if (a.startBeat != b.startBeat)
@@ -57,8 +69,15 @@ bool canonicalLess (const MelodyNote& a, const MelodyNote& b)
 //==============================================================================
 Melody sanitiseMelody (const Melody& in)
 {
+    return sanitiseMelody (in, kMelodyLimits);
+}
+
+Melody sanitiseMelody (const Melody& in, const NoteLimits& limits)
+{
+    const auto lim = resolve (limits);
+
     Melody out;
-    out.notes.reserve (std::min (in.notes.size(), (size_t) kMaxMelodyNotes * 2));
+    out.notes.reserve (std::min (in.notes.size(), (size_t) lim.maxNotes * 2));
 
     const double latestStart = kMaxMelodyBeat - kMinMelodyNoteBeats;
 
@@ -67,7 +86,7 @@ Melody sanitiseMelody (const Melody& in)
         if (! std::isfinite (n.startBeat) || ! std::isfinite (n.lengthBeats))
             continue;
 
-        n.note = std::clamp (n.note, kMelodyLowestNote, kMelodyHighestNote);
+        n.note = std::clamp (n.note, lim.low, lim.high);
         n.velocity = std::isfinite (n.velocity) ? std::clamp (n.velocity, 0.05f, 1.0f) : kDefaultMelodyVelocity;
         n.startBeat = roundToTick (std::clamp (n.startBeat, 0.0, latestStart));
 
@@ -93,8 +112,8 @@ Melody sanitiseMelody (const Melody& in)
             unique.push_back (out.notes[i]);
     }
 
-    if ((int) unique.size() > kMaxMelodyNotes)
-        unique.resize ((size_t) kMaxMelodyNotes);
+    if ((int) unique.size() > lim.maxNotes)
+        unique.resize ((size_t) lim.maxNotes);
 
     out.notes = std::move (unique);
     return out;
@@ -161,7 +180,14 @@ const char* melodySnapName (MelodySnap snap)
 
 int snapMelodyPitch (int note, MelodySnap snap, const Key& key, const std::optional<Chord>& chord)
 {
-    note = std::clamp (note, kMelodyLowestNote, kMelodyHighestNote);
+    return snapMelodyPitch (note, snap, key, chord, kMelodyLimits);
+}
+
+int snapMelodyPitch (int note, MelodySnap snap, const Key& key, const std::optional<Chord>& chord,
+                     const NoteLimits& limits)
+{
+    const auto lim = resolve (limits);
+    note = std::clamp (note, lim.low, lim.high);
 
     if (snap == MelodySnap::Off)
         return note;
@@ -170,10 +196,10 @@ int snapMelodyPitch (int note, MelodySnap snap, const Key& key, const std::optio
     {
         const int down = note - d, up = note + d;
 
-        if (down >= kMelodyLowestNote && allowedBySnap (pc (down), snap, key, chord))
+        if (down >= lim.low && allowedBySnap (pc (down), snap, key, chord))
             return down;
 
-        if (up <= kMelodyHighestNote && allowedBySnap (pc (up), snap, key, chord))
+        if (up <= lim.high && allowedBySnap (pc (up), snap, key, chord))
             return up;
     }
 
@@ -194,12 +220,17 @@ double snapBeatToGrid (double beat, double grid, bool roundToNearest)
 //==============================================================================
 std::vector<NoteEvent> renderMelody (const Melody& melodyIn, double loopBeats, int channel)
 {
+    return renderMelody (melodyIn, loopBeats, channel, kMelodyLimits);
+}
+
+std::vector<NoteEvent> renderMelody (const Melody& melodyIn, double loopBeats, int channel, const NoteLimits& limits)
+{
     std::vector<NoteEvent> events;
 
     if (! (loopBeats > 0.0) || ! std::isfinite (loopBeats))
         return events;
 
-    const auto melody = sanitiseMelody (melodyIn);
+    const auto melody = sanitiseMelody (melodyIn, limits);
 
     for (const auto& n : melody.notes)
     {
@@ -243,6 +274,12 @@ std::vector<NoteEvent> renderMelody (const Melody& melodyIn, double loopBeats, i
 
 Melody transposeMelody (const Melody& melody, int semitones)
 {
+    return transposeMelody (melody, semitones, kMelodyLimits);
+}
+
+Melody transposeMelody (const Melody& melody, int semitones, const NoteLimits& limits)
+{
+    const auto lim = resolve (limits);
     int shift = pc (semitones);
 
     if (shift > 6)
@@ -254,21 +291,27 @@ Melody transposeMelody (const Melody& melody, int semitones)
     {
         int moved = n.note + shift;
 
-        if (moved > kMelodyHighestNote)
+        if (moved > lim.high)
             moved -= 12;
-        else if (moved < kMelodyLowestNote)
+        else if (moved < lim.low)
             moved += 12;
 
         n.note = moved;
     }
 
-    return sanitiseMelody (out);
+    return sanitiseMelody (out, limits);
 }
 
 Melody melodyFollowingSlots (const Melody& melodyIn, const Progression& before, const Progression& after,
                              const std::vector<int>& sourceSlot)
 {
-    const auto melody = sanitiseMelody (melodyIn);
+    return melodyFollowingSlots (melodyIn, before, after, sourceSlot, kMelodyLimits);
+}
+
+Melody melodyFollowingSlots (const Melody& melodyIn, const Progression& before, const Progression& after,
+                             const std::vector<int>& sourceSlot, const NoteLimits& limits)
+{
+    const auto melody = sanitiseMelody (melodyIn, limits);
 
     if (sourceSlot.size() != after.slots.size())
         return melody;
@@ -305,37 +348,7 @@ Melody melodyFollowingSlots (const Melody& melodyIn, const Progression& before, 
         }
     }
 
-    return sanitiseMelody (out);
-}
-
-//==============================================================================
-// Phase 2 NoteLimits overloads. WP0 STUBS (WP3 implements them): they call the melody-range functions and ignore
-// `limits`, which is exactly right for kMelodyLimits and keeps phase-1.5 behaviour until WP3 lands.
-Melody sanitiseMelody (const Melody& melody, const NoteLimits& /*limits*/)
-{
-    return sanitiseMelody (melody);
-}
-
-int snapMelodyPitch (int note, MelodySnap snap, const Key& key, const std::optional<Chord>& chord,
-                     const NoteLimits& /*limits*/)
-{
-    return snapMelodyPitch (note, snap, key, chord);
-}
-
-std::vector<NoteEvent> renderMelody (const Melody& melody, double loopBeats, int channel, const NoteLimits& /*limits*/)
-{
-    return renderMelody (melody, loopBeats, channel);
-}
-
-Melody transposeMelody (const Melody& melody, int semitones, const NoteLimits& /*limits*/)
-{
-    return transposeMelody (melody, semitones);
-}
-
-Melody melodyFollowingSlots (const Melody& melody, const Progression& before, const Progression& after,
-                             const std::vector<int>& sourceSlot, const NoteLimits& /*limits*/)
-{
-    return melodyFollowingSlots (melody, before, after, sourceSlot);
+    return sanitiseMelody (out, limits);
 }
 
 } // namespace cb
