@@ -27,6 +27,31 @@
 // releaseResources and midiOut switching all produce the matching note-offs.
 //==============================================================================
 
+#if CHORDBLOOM_DEV_TOOL
+// Development-only test hook (final-spec 9 WP4 fuzz; dev tool builds only, not part of the frozen header: the engine
+// selftests declare it themselves). The observer sees every MIDI buffer handed to the preview synth, on the audio
+// thread, before the synth renders it; midi == nullptr means the synth released or dropped every voice (allNotesOff /
+// reset). The hook itself is lock- and allocation-free; the observer must be too.
+namespace cbdev
+{
+using SynthStreamObserver = void (*) (void* context, const ChordbloomProcessor& processor, const juce::MidiBuffer* midi);
+void setSynthStreamObserver (SynthStreamObserver observer, void* context) noexcept;
+}
+
+namespace
+{
+std::atomic<cbdev::SynthStreamObserver> synthStreamObserver { nullptr };
+std::atomic<void*> synthStreamContext { nullptr };
+}
+
+void cbdev::setSynthStreamObserver (SynthStreamObserver observer, void* context) noexcept
+{
+    synthStreamObserver.store (nullptr);
+    synthStreamContext.store (context);
+    synthStreamObserver.store (observer);
+}
+#endif
+
 namespace
 {
 juce::StringArray namesFrom (int count, const std::function<const char* (int)>& nameOf)
@@ -1281,8 +1306,11 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
 
     // Canonical members: auto layers carry no notes; a custom layer is canonical for its limits and becomes auto when
     // its notes equal the auto display notes of the committed progression (so a follow that leaves nothing edited
-    // turns the layer back to auto in the same step).
-    void normalise (SongState& s) const
+    // turns the layer back to auto in the same step). Only a layer the commit can have changed is compared with auto:
+    // `touched` (an explicit edit of that layer), a layer whose state differs from the current one, or every layer when
+    // the progression changes. A melody edit or a no-op commit never flips a custom layer (that may equal auto after a
+    // parameter change or a load) and so never creates a step of its own.
+    void normalise (SongState& s, std::optional<cb::Layer> touched) const
     {
         s.progression = sanitiseProgression (s.progression);
         s.melody = sanitiseFor (s.melody, cb::kMelodyLimits);
@@ -1296,23 +1324,38 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
                 st.notes = sanitiseFor (st.notes, cb::layerLimits (layer));
         }
 
-        if (! s.arp.custom && ! s.bass.custom)
+        const bool progressionEdited = s.progression != progression;
+        auto mayEqualAuto = [&] (cb::Layer layer)
+        {
+            const auto& st = layerOf (s, layer);
+            const auto& now = layer == cb::Layer::Arp ? arpState : bassState;
+            return st.custom && (progressionEdited || st != now || touched == layer);
+        };
+
+        if (! mayEqualAuto (cb::Layer::Arp) && ! mayEqualAuto (cb::Layer::Bass))
             return;
 
         const auto autoNotes = autoNotesFor (s.progression);
         for (auto layer : { cb::Layer::Arp, cb::Layer::Bass })
         {
             auto& st = layerOf (s, layer);
-            if (st.custom && st.notes == autoNotes.of (layer))
+            if (mayEqualAuto (layer) && st.notes == autoNotes.of (layer))
                 st = {};
         }
     }
 
     // The single commit path. No step when the normalised state equals current(); otherwise one undo entry, then
-    // re-render, ghost publish, layer serial bump (rebuildAndPublish) and a change message.
-    bool commitState (SongState next, bool fromGenerator = false)
+    // re-render, ghost publish, layer serial bump (rebuildAndPublish) and a change message. `touched`: the layer this
+    // commit edits explicitly (setLayerNotes / resetLayer), compared with auto even when its state did not change.
+    // Every public edit applies a pending off-thread load first (applyPendingState), so `next` is built from the
+    // loaded song; should one still be pending here, `next` is stale and the commit is dropped rather than letting it
+    // overwrite the loaded song and the state copies.
+    bool commitState (SongState next, bool fromGenerator = false, std::optional<cb::Layer> touched = std::nullopt)
     {
-        normalise (next);
+        if (applyPendingState())
+            return false;
+
+        normalise (next, touched);
         if (next == current())
             return false;
 
@@ -1722,7 +1765,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
     }
 
     // Every state load (on or off the message thread): the whole song, both stacks cleared, the generator result
-    // forgotten. Loaded custom layers stay custom (only commits normalise them).
+    // forgotten. Loaded custom layers stay custom (only a commit that changes a layer or the progression normalises it).
     void applyLoadedSong (const SongState& loaded)
     {
         progression = sanitiseProgression (loaded.progression);
@@ -1742,15 +1785,20 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         owner.sendChangeMessage();
     }
 
-    void applyPendingState()
+    // Message thread: applies a load made off the message thread that is still waiting for its async update. Called
+    // by the async update / timer and at the start of every public edit, undo and redo (one lock), so an edit made in
+    // that window applies to the loaded song and never overwrites the state copies readState set. True when it did.
+    bool applyPendingState()
     {
         std::optional<SongState> pending;
         {
             const std::lock_guard<std::mutex> lock (stateMutex);
             pending.swap (pendingSong);
         }
-        if (pending.has_value())
-            applyLoadedSong (*pending);
+        if (! pending.has_value())
+            return false;
+        applyLoadedSong (*pending);
+        return true;
     }
 
     //==============================================================================
@@ -2954,12 +3002,16 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         {
             synth.setTone ((PreviewSynth::Tone) intValue (prm.previewTone, 0, (int) PreviewSynth::Tone::NumTones - 1));
             synth.setGainDecibels (juce::jlimit (-48.0f, 0.0f, rawValue (prm.previewVolume, -9.0f)));
+            observeSynthStream (&combined);
             synth.render (buffer, combined, numSamples);
         }
         else
         {
             if (au.prevPreviewOn)
+            {
                 synth.allNotesOff (true);
+                observeSynthStream (nullptr);
+            }
             synth.render (buffer, emptyMidi, numSamples);   // let release tails fade instead of clicking
         }
         au.prevPreviewOn = previewOnNow;
@@ -2979,6 +3031,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
                 for (int ch = 0; ch < numChannels; ++ch)
                     buffer.clear (ch, 0, numSamples);
                 synth.reset();
+                observeSynthStream (nullptr);
             }
         }
 
@@ -3010,6 +3063,17 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         au.prevMidiOut = midiOutNow;
 
         publishSoundingNotes();
+    }
+
+    // Dev tool only: reports what the preview synth is handed (cbdev::setSynthStreamObserver). nullptr = all voices off.
+    void observeSynthStream (const juce::MidiBuffer* midi) const noexcept
+    {
+       #if CHORDBLOOM_DEV_TOOL
+        if (auto* observer = synthStreamObserver.load())
+            observer (synthStreamContext.load(), owner, midi);
+       #else
+        juce::ignoreUnused (midi);
+       #endif
     }
 
     void publishSoundingNotes() noexcept
@@ -3055,6 +3119,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         playbackBeat.store (0.0);
 
         synth.allNotesOff (true);
+        observeSynthStream (nullptr);
         synth.render (buffer, emptyMidi, numSamples);
 
         if (numChannels > 0 && numSamples > 0)
@@ -3071,6 +3136,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
                 for (int ch = 0; ch < numChannels; ++ch)
                     buffer.clear (ch, 0, numSamples);
                 synth.reset();
+                observeSynthStream (nullptr);
             }
         }
 
@@ -3215,6 +3281,7 @@ void ChordbloomProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     impl->sampleRate = (std::isfinite (sampleRate) && sampleRate > 0.0) ? sampleRate : 44100.0;
     impl->synth.prepare (impl->sampleRate, juce::jmax (1, samplesPerBlock));
     impl->synth.reset();
+    impl->observeSynthStream (nullptr);
     impl->combined.ensureSize ((size_t) juce::jmax (32768, samplesPerBlock * 16));
     impl->outBuffer.ensureSize ((size_t) juce::jmax (32768, samplesPerBlock * 16));
     impl->forcedOut.ensureSize (32768);
@@ -3226,6 +3293,7 @@ void ChordbloomProcessor::releaseResources()
     // MIDI cannot be sent from here: the next processed block starts with note-offs for everything still on.
     impl->panicRequested.store (true);
     impl->synth.reset();
+    impl->observeSynthStream (nullptr);
 }
 
 bool ChordbloomProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -3270,10 +3338,15 @@ cb::RenderSettings ChordbloomProcessor::getRenderSettings() const { return impl-
 const cb::Progression& ChordbloomProcessor::getProgression() const { return impl->progression; }
 
 // Every edit goes through the follow policy of final-spec 6.2 and the single commit path (one undo step each).
-void ChordbloomProcessor::setProgression (const cb::Progression& p) { impl->commitProgression (p); }
+void ChordbloomProcessor::setProgression (const cb::Progression& p)
+{
+    impl->applyPendingState();
+    impl->commitProgression (p);
+}
 
 bool ChordbloomProcessor::addChord (const cb::Chord& chord, int insertIndex)
 {
+    impl->applyPendingState();
     auto p = impl->progression;
     if ((int) p.slots.size() >= cb::kMaxSlots)
         return false;
@@ -3300,6 +3373,7 @@ bool ChordbloomProcessor::addChord (const cb::Chord& chord, int insertIndex)
 
 void ChordbloomProcessor::removeSlot (int index)
 {
+    impl->applyPendingState();
     auto p = impl->progression;
     if (index < 0 || index >= (int) p.slots.size())
         return;
@@ -3315,6 +3389,7 @@ void ChordbloomProcessor::removeSlot (int index)
 
 void ChordbloomProcessor::moveSlot (int fromIndex, int toIndex)
 {
+    impl->applyPendingState();
     auto p = impl->progression;
     const int n = (int) p.slots.size();
     if (fromIndex < 0 || fromIndex >= n)
@@ -3336,6 +3411,7 @@ void ChordbloomProcessor::moveSlot (int fromIndex, int toIndex)
 
 void ChordbloomProcessor::updateSlot (int index, const cb::ProgressionSlot& slot)
 {
+    impl->applyPendingState();
     auto p = impl->progression;
     if (index < 0 || index >= (int) p.slots.size())
         return;
@@ -3350,6 +3426,7 @@ void ChordbloomProcessor::updateSlot (int index, const cb::ProgressionSlot& slot
 
 bool ChordbloomProcessor::duplicateSlot (int index)
 {
+    impl->applyPendingState();
     auto p = impl->progression;
     if (index < 0 || index >= (int) p.slots.size() || (int) p.slots.size() >= cb::kMaxSlots)
         return false;
@@ -3363,11 +3440,16 @@ bool ChordbloomProcessor::duplicateSlot (int index)
     return true;
 }
 
-void ChordbloomProcessor::clearProgression() { impl->commitProgression ({}); }
+void ChordbloomProcessor::clearProgression()
+{
+    impl->applyPendingState();
+    impl->commitProgression ({});
+}
 
 bool ChordbloomProcessor::undo()
 {
     auto& i = *impl;
+    i.applyPendingState();
     if (i.undoStack.empty())
         return false;
 
@@ -3382,6 +3464,7 @@ bool ChordbloomProcessor::undo()
 bool ChordbloomProcessor::redo()
 {
     auto& i = *impl;
+    i.applyPendingState();
     if (i.redoStack.empty())
         return false;
 
@@ -3405,7 +3488,11 @@ std::vector<cb::NoteEvent> ChordbloomProcessor::renderProgressionEvents() const 
 
 //==============================================================================
 const cb::Melody& ChordbloomProcessor::getMelody() const { return impl->melody; }
-void ChordbloomProcessor::setMelody (const cb::Melody& melody) { impl->commitMelody (melody); }
+void ChordbloomProcessor::setMelody (const cb::Melody& melody)
+{
+    impl->applyPendingState();
+    impl->commitMelody (melody);
+}
 void ChordbloomProcessor::clearMelody() { setMelody ({}); }
 std::vector<cb::NoteEvent> ChordbloomProcessor::renderMelodyEvents() const { return impl->renderMelodyEvents(); }
 
@@ -3447,20 +3534,22 @@ void ChordbloomProcessor::setLayerNotes (cb::Layer layer, const cb::Melody& note
     }
 
     // Custom with these notes; commitState makes it auto (no step when it already is) when they equal the auto notes.
+    impl->applyPendingState();
     auto s = impl->current();
     Impl::layerOf (s, layer) = { true, notes };
-    impl->commitState (s);
+    impl->commitState (s, false, layer);
 }
 
 void ChordbloomProcessor::resetLayer (cb::Layer layer, int slotIndex)
 {
     auto& i = *impl;
-    if (! Impl::isGeneratedLayer (layer) || ! isLayerCustom (layer))
+    i.applyPendingState();
+    if (! Impl::isGeneratedLayer (layer) || ! isLayerCustom (layer) || slotIndex < -1)
         return;
 
     auto s = i.current();
     auto& st = Impl::layerOf (s, layer);
-    if (slotIndex < 0)
+    if (slotIndex == -1)
     {
         st = {};
     }
@@ -3478,7 +3567,7 @@ void ChordbloomProcessor::resetLayer (cb::Layer layer, int slotIndex)
             return;
         }
     }
-    i.commitState (s);
+    i.commitState (s, false, layer);
 }
 
 std::vector<bool> ChordbloomProcessor::getEditedSlots (cb::Layer layer) const
@@ -3570,6 +3659,7 @@ void ChordbloomProcessor::beginUserLayerPick (cb::Layer layer)
     if (! Impl::isGeneratedLayer (layer))
         return;
 
+    impl->applyPendingState();
     if (isLayerCustom (layer))
     {
         auto s = impl->current();
@@ -3600,6 +3690,7 @@ void ChordbloomProcessor::startPreviewLayerNote (cb::Layer layer, int midiNote)
 bool ChordbloomProcessor::generateMelody (const cb::MelodyGenSettings& settings, std::uint32_t seed)
 {
     auto& i = *impl;
+    i.applyPendingState();
     if (i.progression.empty())
         return false;
 
@@ -3615,13 +3706,26 @@ bool ChordbloomProcessor::generateMelody (const cb::MelodyGenSettings& settings,
     if (generated.empty())
         return false;
 
+    // Parked notes (at or after the loop end) always stay: they take their share of the 512-note cap first and the
+    // generated notes inside the loop fill what is left (in canonical order). The melody is canonical, so the parked
+    // notes need no sanitising, and a generated note never shares a start with one (it starts inside the loop).
     const double total = (double) i.progression.totalBeats();
+    cb::Melody parked;
     for (const auto& n : i.melody.notes)
         if (n.startBeat >= total)
-            generated.notes.push_back (n);
+            parked.notes.push_back (n);
 
+    const auto room = (size_t) juce::jmax (0, cb::kMaxMelodyNotes - (int) parked.notes.size());
+    cb::Melody inside;
+    for (const auto& n : Impl::sanitiseFor (generated, cb::kMelodyLimits).notes)
+        if (n.startBeat < total && inside.notes.size() < room)
+            inside.notes.push_back (n);
+    if (inside.empty())
+        return false;   // no generated note inside the loop, or no room left beside the parked notes
+
+    inside.notes.insert (inside.notes.end(), parked.notes.begin(), parked.notes.end());
     auto s = i.current();
-    s.melody = Impl::sanitiseFor (generated, cb::kMelodyLimits);
+    s.melody = Impl::sanitiseFor (inside, cb::kMelodyLimits);
     if (s.melody == i.melody || ! i.commitState (s, true))
         return false;
 
@@ -4015,6 +4119,7 @@ juce::File ChordbloomProcessor::writeSlotMidiToTempFile (int slotIndex) const
 void ChordbloomProcessor::transposeProgression (int semitones)
 {
     auto& i = *impl;
+    i.applyPendingState();
     if (i.progression.empty() || cb::pc (semitones) == 0)
         return;
 

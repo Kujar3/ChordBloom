@@ -1,5 +1,6 @@
 #include "SelfTestUtil.h"
 
+#include <array>
 #include <atomic>
 #include <iterator>
 #include <thread>
@@ -11,6 +12,14 @@
 // NoteLimits / layers / follow) go through checkAfter: while that core function is still a WP0 stub (detected at run
 // time below) the check is printed as DEFER and not counted; once the code is merged every such check counts like any
 // other. After the integration merge the summary line must read "0 deferred".
+
+// Dev tool hook defined in PluginProcessor.cpp (CHORDBLOOM_DEV_TOOL builds only, not in the frozen header): sees every
+// MIDI buffer the processor hands to its PreviewSynth; midi == nullptr = the synth released / dropped every voice.
+namespace cbdev
+{
+using SynthStreamObserver = void (*) (void* context, const ChordbloomProcessor& processor, const juce::MidiBuffer* midi);
+void setSynthStreamObserver (SynthStreamObserver observer, void* context) noexcept;
+}
 
 using namespace cbtest;
 
@@ -895,6 +904,93 @@ void testCustomLayers (const Deps& d)
 }
 
 //==============================================================================
+// Only a commit that can change a layer compares it with auto; resetLayer reserves only -1 for the whole layer.
+void testNormaliseScope (const Deps& d)
+{
+    {
+        ChordbloomProcessor p;
+        p.setProgression (makeProgression ({ C_, Am_, F_, G_ }));
+        p.setLayerNotes (Layer::Bass, customBassLine());
+        const int depth = undoDepth (p);
+        p.resetLayer (Layer::Bass, -2);
+        p.resetLayer (Layer::Bass, -7);
+        check (p.isLayerCustom (Layer::Bass) && p.getLayerNotes (Layer::Bass) == customBassLine() && undoDepth (p) == depth,
+               "resetLayer: a slot index below -1 is a no-op (notes, custom flag and undo depth unchanged)");
+        p.resetLayer (Layer::Bass, -1);
+        check (! p.isLayerCustom (Layer::Bass) && undoDepth (p) == depth + 1, "resetLayer: -1 resets the whole layer (one step)");
+    }
+
+    // A custom bass that equals auto after a parameter change (automation: custom wins) stays custom through a no-op
+    // commit, a melody edit and a save / load; only an edit of the layer itself (or of the progression) turns it auto.
+    {
+        ChordbloomProcessor root;
+        root.setProgression (makeProgression ({ C_, Am_, F_, G_ }));
+        setParam (root, id::bassMode, (float) cb::BassMode::Root);
+        pumpMessages (40);
+        const auto rootNotes = root.getLayerNotes (Layer::Bass);
+
+        ChordbloomProcessor p;
+        p.setProgression (makeProgression ({ C_, Am_, F_, G_ }));
+        setParam (p, id::bassMode, (float) cb::BassMode::Pulse);
+        pumpMessages (40);
+        p.setLayerNotes (Layer::Bass, rootNotes);
+        const bool customAtPulse = p.isLayerCustom (Layer::Bass);
+        setParam (p, id::bassMode, (float) cb::BassMode::Root);   // automation: the custom notes now equal auto
+        pumpMessages (40);
+        const bool equalsAuto = p.getLayerNotes (Layer::Bass) == root.getLayerNotes (Layer::Bass);
+
+        const int depth = undoDepth (p);
+        p.setMelody (p.getMelody());
+        const bool afterNoOp = p.isLayerCustom (Layer::Bass) && undoDepth (p) == depth;
+        p.setMelody (makeMelody ({ melodyNote (72, 1.0, 1.0) }));
+        const bool afterMelody = p.isLayerCustom (Layer::Bass) && undoDepth (p) == depth + 1;
+
+        ChordbloomProcessor loaded;
+        loaded.setProgression (makeProgression ({ G_ }));
+        if (auto xml = stateXml (p))
+            loadXml (loaded, *xml);
+        pumpMessages (40);
+        const bool loadedCustom = loaded.isLayerCustom (Layer::Bass) && ! loaded.canUndo();
+        loaded.setMelody (loaded.getMelody());
+        const bool loadedNoOp = loaded.isLayerCustom (Layer::Bass) && ! loaded.canUndo();
+        loaded.setMelody ({});
+        const bool loadedMelody = loaded.isLayerCustom (Layer::Bass);
+
+        p.setLayerNotes (Layer::Bass, p.getLayerNotes (Layer::Bass));   // an edit of the layer: equal to auto -> auto
+        const bool editTurnsAuto = ! p.isLayerCustom (Layer::Bass) && undoDepth (p) == depth + 2;
+
+        checkAfter (d.layers, "WP3 notesFromEvents",
+                    customAtPulse && ! rootNotes.empty() && equalsAuto && afterNoOp && afterMelody && loadedCustom && loadedNoOp
+                        && loadedMelody && editTurnsAuto,
+                    "normalise: a custom layer equal to auto is only turned auto by an edit of that layer, never by a melody or no-op commit",
+                    str (customAtPulse, equalsAuto, afterNoOp, afterMelody, loadedCustom, loadedNoOp, loadedMelody, editTurnsAuto));
+    }
+
+    // 2.3: a pick of Off keeps the custom notes; a silenced (custom-empty) bass stays silent through a melody edit and
+    // the LED switching it back on (bassMode Root, still no notes).
+    {
+        ChordbloomProcessor p;
+        p.setProgression (makeProgression ({ C_, Am_, F_, G_ }));
+        pumpMessages (40);
+        p.setLayerNotes (Layer::Bass, {});
+        const bool silenced = p.isLayerCustom (Layer::Bass);
+        setParamAsUser (p, id::bassMode, (float) cb::BassMode::Off);
+        pumpMessages (40);
+        const bool afterOff = p.isLayerCustom (Layer::Bass);
+        p.setMelody (makeMelody ({ melodyNote (72, 1.0, 1.0) }));
+        const bool afterMelody = p.isLayerCustom (Layer::Bass);
+        p.setLayerOn (Layer::Bass, true);
+        pumpMessages (40);
+        checkAfter (d.layers, "WP3 notesFromEvents",
+                    silenced && afterOff && afterMelody && p.isLayerCustom (Layer::Bass)
+                        && juce::roundToInt (getParam (p, id::bassMode)) == (int) cb::BassMode::Root
+                        && p.renderLayerEvents (Layer::Bass).empty(),
+                    "normalise: a silenced custom bass set to Off survives a melody edit; the LED turns it on silent",
+                    str (silenced, afterOff, afterMelody, " events ", p.renderLayerEvents (Layer::Bass).size()));
+    }
+}
+
+//==============================================================================
 // Undo / redo across layers (every push uses current(): nothing drops a custom layer).
 void testUndoAcrossLayers()
 {
@@ -1390,7 +1486,10 @@ void testStateConsistencyOffThread()
         }
     });
 
+    // Each structural edit is followed by an edit of the bass (one extra note in the first slot, a new pitch each
+    // time), so the bass stays custom for the whole run and every saved state has to pair its own notes.
     const cb::Chord chords[] = { C_, Am_, F_, G_, Em_ };
+    int customCommits = 0;
     for (int i = 0; i < 300; ++i)
     {
         switch (i % 3)
@@ -1400,11 +1499,16 @@ void testStateConsistencyOffThread()
             default: p.addChord (chords[i % 5]); break;
         }
         record();
+        auto bass = p.getLayerNotes (Layer::Bass);
+        bass.notes.push_back (melodyNote (30 + i % 40, 0.5, 0.25));
+        p.setLayerNotes (Layer::Bass, bass);
+        record();
+        customCommits += p.isLayerCustom (Layer::Bass) ? 1 : 0;
     }
     stop.store (true);
     saver.join();
 
-    int bad = 0, parsed = 0;
+    int bad = 0, parsed = 0, withBass = 0;
     for (auto& b : saved)
     {
         const auto xml = juce::AudioProcessor::getXmlFromBinary (b.getData(), (int) b.getSize());
@@ -1415,12 +1519,15 @@ void testStateConsistencyOffThread()
         }
         ++parsed;
         const auto key = progressionKey (xml->getChildByName ("Progression"));
+        const auto bassKey = notesKey (*xml, "bass");
+        withBass += bassKey != "auto" ? 1 : 0;
         const auto it = committed.find (key);
-        if (it == committed.end() || it->second.count (notesKey (*xml, "bass")) == 0)
+        if (it == committed.end() || it->second.count (bassKey) == 0)
             ++bad;
     }
-    check (parsed > 10 && bad == 0, "state off-thread: every state saved during commits pairs a progression with its own bass notes",
-           str (bad, " inconsistent of ", saved.size()));
+    check (customCommits == 300 && parsed > 100 && withBass > 100 && bad == 0,
+           "state off-thread: every state saved during commits on a custom bass pairs a progression with its own bass notes",
+           str (bad, " inconsistent of ", saved.size(), ", ", withBass, " with a custom bass, custom after ", customCommits, " of 300"));
 
     // setStateInformation off the message thread, then getStateInformation from that thread before the async update
     ChordbloomProcessor src;
@@ -1450,6 +1557,40 @@ void testStateConsistencyOffThread()
     check (c.getProgression() == src.getProgression() && c.isLayerCustom (Layer::Arp) && c.isLayerCustom (Layer::Bass)
                && c.getLayerNotes (Layer::Arp) == src.getLayerNotes (Layer::Arp) && ! c.canUndo(),
            "state off-thread: applied on the message thread afterwards");
+
+    // An edit, undo or redo on the message thread before the async apply works on the loaded song: the load is applied
+    // first, so a save in that window holds the new song plus the edit and the edit is not lost afterwards.
+    ChordbloomProcessor e;
+    e.setProgression (makeProgression ({ C_ }));
+    std::thread worker ([&] { e.setStateInformation (state.getData(), (int) state.getSize()); });
+    worker.join();
+    e.addChord (G_);
+    const auto afterEdit = stateXml (e);
+    auto expected = src.getProgression();
+    cb::ProgressionSlot appended;
+    appended.chord = G_;
+    expected.slots.push_back (appended);
+    const bool savedOk = afterEdit != nullptr && progressionKey (afterEdit->getChildByName ("Progression")) == progressionKey (expected)
+                         && notesKey (*afterEdit, "arp") == notesKey (e.isLayerCustom (Layer::Arp), e.getLayerNotes (Layer::Arp))
+                         && notesKey (*afterEdit, "arp") != "auto";
+    pumpMessages (60);
+    const bool kept = e.getProgression() == expected && e.isLayerCustom (Layer::Arp) && e.canUndo();
+    e.undo();
+    const bool undone = e.getProgression() == src.getProgression() && ! e.canUndo();
+    check (savedOk && kept && undone,
+           "state off-thread: an edit before the async apply lands on the loaded song (saved with it, kept, one undo step)",
+           str (savedOk, kept, undone));
+
+    ChordbloomProcessor u;
+    u.setProgression (makeProgression ({ C_ }));
+    u.addChord (G_);
+    std::thread worker2 ([&] { u.setStateInformation (state.getData(), (int) state.getSize()); });
+    worker2.join();
+    const bool undid = u.undo();
+    const auto afterUndo = stateXml (u);
+    check (! undid && u.getProgression() == src.getProgression() && afterUndo != nullptr
+               && progressionKey (afterUndo->getChildByName ("Progression")) == progressionKey (src.getProgression()),
+           "state off-thread: an undo before the async apply finds the loaded song (cleared stacks), nothing reverts it");
 }
 
 void scriptedSession (ChordbloomProcessor& p)
@@ -1571,6 +1712,49 @@ void testGenerate (const Deps& d)
     checkAfter (d.gen, needs, fresh && ! afterEdit && ! afterUndo && regenerated && ! afterRedo && ! afterLoad && g.getLastGeneratorSeed() == 10u,
                 "generate: isMelodyFromGenerator false after an edit, an undo, a redo and a state load (even of the same melody)",
                 str (fresh, afterEdit, afterUndo, regenerated, afterRedo, afterLoad));
+
+    // Parked notes keep their share of the 512-note cap: the generated notes fill only what is left, and with no room
+    // left the generator changes nothing.
+    {
+        auto parkedNotes = [] (int count)
+        {
+            cb::Melody m;
+            for (int i = 0; i < count; ++i)
+                m.notes.push_back (melodyNote (48 + i % 12, 16.0 + (i / 12) * 0.5, 0.25));
+            return cb::sanitiseMelody (m);
+        };
+        auto countFrom = [] (const cb::Melody& m, double from)
+        {
+            return (int) std::count_if (m.notes.begin(), m.notes.end(), [from] (const cb::MelodyNote& n) { return n.startBeat >= from; });
+        };
+
+        ChordbloomProcessor full;
+        full.setProgression (makeProgression ({ Am_, F_, C_, G_ }));
+        const auto all512 = parkedNotes (512);
+        full.setMelody (all512);
+        const int fullDepth = undoDepth (full);
+        bool anyTrue = false;
+        for (std::uint32_t seed = 1; seed <= 4; ++seed)
+            anyTrue = full.generateMelody (settings, seed) || anyTrue;
+        check (all512.notes.size() == 512 && ! anyTrue && full.getMelody() == all512 && undoDepth (full) == fullDepth,
+               "generate: 512 parked notes leave no room -> false, melody and undo depth unchanged");
+
+        ChordbloomProcessor some;
+        some.setProgression (makeProgression ({ Am_, F_, C_, G_ }));
+        const auto parked500 = parkedNotes (500);
+        some.setMelody (parked500);
+        bool done = false;
+        for (std::uint32_t seed = 1; seed <= 8 && ! done; ++seed)
+            done = some.generateMelody (settings, seed);
+        const auto& out = some.getMelody();
+        bool allKept = true;
+        for (auto& n : parked500.notes)
+            allKept = allKept && std::count (out.notes.begin(), out.notes.end(), n) == 1;
+        check (allKept && countFrom (out, 16.0) == 500 && out.notes.size() <= 512,
+               "generate: every parked note stays when the generated notes would exceed the cap");
+        checkAfter (d.gen, needs, done && out.notes.size() > 500,
+                    "generate: ... and the generated notes fill the room that is left", str (out.notes.size()));
+    }
 
     // The generator's context (own worktree): chords, the audible bass, the arp only when on
     ChordbloomProcessor c;
@@ -1878,10 +2062,66 @@ cb::Melody randomNotes (XorShift& rng, int low, int high, int count)
     return m;
 }
 
+// What the processor hands to its PreviewSynth, checked like the MIDI out: per (channel, note) on / off pairing.
+// Fed on the audio thread through cbdev::setSynthStreamObserver; fixed tables, no allocation.
+struct SynthStreamCheck
+{
+    const ChordbloomProcessor* processor = nullptr;
+    std::array<std::array<std::uint8_t, 128>, 16> open {};
+    int ons = 0, offs = 0, doubleOns = 0, strayOffs = 0, clears = 0;
+
+    static void observe (void* context, const ChordbloomProcessor& from, const juce::MidiBuffer* midi)
+    {
+        auto& self = *static_cast<SynthStreamCheck*> (context);
+        if (&from != self.processor)
+            return;
+        if (midi == nullptr)
+        {
+            ++self.clears;
+            for (auto& ch : self.open)
+                ch.fill (0);
+            return;
+        }
+        for (const auto meta : *midi)
+        {
+            if (meta.numBytes < 3)
+                continue;
+            const int status = meta.data[0] & 0xf0;
+            const int ch = meta.data[0] & 0x0f;
+            const int note = meta.data[1] & 0x7f;
+            auto& slot = self.open[(size_t) ch][(size_t) note];
+            if (status == 0x90 && meta.data[2] > 0)
+            {
+                ++self.ons;
+                self.doubleOns += slot != 0 ? 1 : 0;
+                slot = 1;
+            }
+            else if (status == 0x80 || status == 0x90)
+            {
+                ++self.offs;
+                self.strayOffs += slot == 0 ? 1 : 0;
+                slot = 0;
+            }
+        }
+    }
+
+    int openCount() const
+    {
+        int n = 0;
+        for (auto& ch : open)
+            for (auto v : ch)
+                n += v != 0 ? 1 : 0;
+        return n;
+    }
+};
+
 void testEngineFuzz()
 {
     ChordbloomProcessor p;
     p.setProgression (makeProgression ({ C_, Am_, F_, G_ }, 2));
+    SynthStreamCheck synthStream;
+    synthStream.processor = &p;
+    cbdev::setSynthStreamObserver (&SynthStreamCheck::observe, &synthStream);
     Rig rig (p, 44100.0, 256);
     rig.head.playing = true;
     XorShift rng;
@@ -1974,9 +2214,15 @@ void testEngineFuzz()
     p.stopPreview();
     rig.head.playing = false;
     rig.run (3);
+    cbdev::setSynthStreamObserver (nullptr, nullptr);
     check (! threw && rig.doubleOns == 0 && rig.strayOffs == 0 && rig.openCount() == 0 && p.getSoundingNotes().none() && rig.audioFinite,
            "engine fuzz: 2000 random layer / edit / parameter / state operations while playing stay balanced",
            str (threw ? "threw, " : "", rig.doubleOns, " double, ", rig.strayOffs, " stray, ", rig.openCount(), " open"));
+    check (synthStream.ons > 1000 && synthStream.ons == synthStream.offs && synthStream.doubleOns == 0 && synthStream.strayOffs == 0
+               && synthStream.openCount() == 0 && synthStream.clears <= 1,
+           "engine fuzz: the stream handed to the PreviewSynth stays balanced per (channel, note) too",
+           str (synthStream.ons, " on, ", synthStream.offs, " off, ", synthStream.doubleOns, " double, ", synthStream.strayOffs,
+                " stray, ", synthStream.openCount(), " open, ", synthStream.clears, " clears"));
 }
 
 //==============================================================================
@@ -2023,16 +2269,62 @@ void testWorstCaseLoad (const Deps& d)
     check (ms[ms.size() / 2] < 2.0, "load: a processBlock (512 @ 48 kHz) that picks up a new EngineData takes < 2 ms",
            str ("median ", ms[ms.size() / 2], " ms, max ", ms.back(), " ms"));
 
-    // 2 s of arpGate automation at the 20 Hz timer
+    // 2 s of arpGate automation at 20 Hz from a host thread (no async update: only the processor's 20 Hz timer picks
+    // it up), while the rig plays in real time and the message loop runs.
     rig.head.ppq = 0.0;
-    for (int i = 0; i < 40; ++i)
+    pumpMessages (20);
+    std::atomic<bool> automationDone { false };
+    std::thread host ([&]
     {
-        setParam (p, id::arpGate, 0.05f + 0.095f * (float) (i % 11));
-        pumpMessages (0);
-        rig.run (5);
+        for (int i = 0; i < 40; ++i)
+        {
+            setParam (p, id::arpGate, 0.05f + 0.095f * (float) (i % 11));
+            juce::Thread::sleep (50);
+        }
+        automationDone.store (true);
+    });
+
+    std::vector<Ev> played;
+    int publications = 0;
+    auto lastSerial = p.getLayerSerial();
+    const double blockMs = 1000.0 * rig.blockSize / rig.sr;
+    auto due = juce::Time::getMillisecondCounterHiRes();
+    for (int guard = 0; ! automationDone.load() && guard < 2000; ++guard)
+    {
+        auto evs = rig.processBlock();
+        played.insert (played.end(), evs.begin(), evs.end());
+        due += blockMs;
+        pumpMessages (juce::jmax (0, (int) (due - juce::Time::getMillisecondCounterHiRes())));
+        if (const auto serial = p.getLayerSerial(); serial != lastSerial)
+        {
+            ++publications;
+            lastSerial = serial;
+        }
     }
+    host.join();
+
+    // Note lengths of the arp (quantised to 64 samples): the gate changes must reach playback.
+    std::map<int, juce::int64> arpOnAt;
+    std::set<juce::int64> arpLengths;
+    for (auto& e : played)
+    {
+        if (e.channel != kArp)
+            continue;
+        if (e.on)
+            arpOnAt[e.note] = e.sample;
+        else if (auto it = arpOnAt.find (e.note); it != arpOnAt.end())
+        {
+            arpLengths.insert ((e.sample - it->second) / 64);
+            arpOnAt.erase (it);
+        }
+    }
+
     rig.head.playing = false;
     rig.run (2);
+    check (publications >= 10, "load: arpGate automation from a host thread is published by the 20 Hz timer",
+           str (publications, " publications"));
+    checkAfter (d.arp, "WP2 renderArp", arpLengths.size() >= 3, "load: ... and the arp's note-off timing follows the gate",
+                str (arpLengths.size(), " distinct arp note lengths"));
     check (rig.openCount() == 0 && rig.doubleOns == 0 && rig.strayOffs == 0 && p.getSoundingNotes().none(),
            "load: 2 s of arpGate automation leaves no hanging note");
 }
@@ -2062,6 +2354,7 @@ void cbtest::runEngineSelfTests()
     timed ("testRenderClasses", [&] { testRenderClasses(); });
     timed ("testAutoArp", [&] { testAutoArp (deps); });
     timed ("testCustomLayers", [&] { testCustomLayers (deps); });
+    timed ("testNormaliseScope", [&] { testNormaliseScope (deps); });
     timed ("testUndoAcrossLayers", [&] { testUndoAcrossLayers(); });
     timed ("testUserPick", [&] { testUserPick (deps); });
     timed ("testFollow", [&] { testFollow (deps); });
