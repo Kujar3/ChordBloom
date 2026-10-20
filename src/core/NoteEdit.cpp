@@ -125,6 +125,22 @@ NoteEditResult editSelected (const Melody& melody, const std::vector<int>& selec
     return finish (all, selected, limits);
 }
 
+// Earliest finite start of `notes` (0 when there is none), used to stop a negative offset at beat 0.
+double earliestStart (const std::vector<MelodyNote>& notes)
+{
+    double first = 0.0;
+    bool any = false;
+
+    for (const auto& n : notes)
+        if (std::isfinite (n.startBeat))
+        {
+            first = any ? std::min (first, n.startBeat) : n.startBeat;
+            any = true;
+        }
+
+    return std::max (first, 0.0);
+}
+
 // Scale position helpers for transposeNotesInScale: index n = 7 * octave + degree of `key`.
 int scalePitchAt (const Key& key, int index)
 {
@@ -258,9 +274,11 @@ NoteEditResult moveNotes (const Melody& melody, const std::vector<int>& selectio
     if (! std::isfinite (deltaBeats))
         deltaBeats = 0.0;
 
+    // The delta is rounded to the tick first (as every start is afterwards), so a sub-tick drag is a true zero move.
+    const double maxBeat = std::isfinite (context.maxBeat) ? std::min (context.maxBeat, kMaxMelodyBeat) : kMaxMelodyBeat;
     const double beatLow = std::min (-minStart, 0.0);
-    const double beatHigh = std::max ((context.maxBeat - kMinMelodyNoteBeats) - maxStart, 0.0);
-    deltaBeats = std::clamp (deltaBeats, beatLow, beatHigh);
+    const double beatHigh = std::max ((maxBeat - kMinMelodyNoteBeats) - maxStart, 0.0);
+    deltaBeats = std::clamp (roundToTick (deltaBeats), beatLow, beatHigh);
 
     const int pitchLow = std::min (lim.low - minPitch, 0);
     const int pitchHigh = std::max (lim.high - maxPitch, 0);
@@ -350,8 +368,12 @@ NoteEditResult duplicateNotes (const Melody& melody, const std::vector<int>& sel
 
     Melody all = melody;
     std::vector<MelodyNote> copies;
+    const auto source = pickNotes (melody, selection);
 
-    for (auto n : pickNotes (melody, selection))
+    // One clamp for the whole group: a negative offset stops where the earliest copy starts at beat 0.
+    offsetBeats = std::max (offsetBeats, -earliestStart (source));
+
+    for (auto n : source)
     {
         n.startBeat += offsetBeats;
 
@@ -403,6 +425,10 @@ NoteEditResult transposeNotes (const Melody& melody, const std::vector<int>& sel
 {
     const auto lim = resolve (limits);
 
+    // No delta beyond an octave-span can land inside 0..127; refusing here keeps the sums below free of overflow.
+    if (semitones < -127 || semitones > 127)
+        return unchanged (melody, selection, limits);
+
     for (const auto& n : pickNotes (melody, selection))
     {
         const int moved = n.note + semitones;
@@ -419,6 +445,9 @@ NoteEditResult transposeNotesInScale (const Melody& melody, const std::vector<in
 {
     const auto lim = resolve (limits);
     const auto& offsets = scaleInfo (key.scale).offsets;
+
+    if (steps < -128 || steps > 128)
+        return unchanged (melody, selection, limits);
 
     auto transposed = [&] (int pitch)
     {
@@ -539,6 +568,10 @@ NoteEditResult pasteNotes (const Melody& melody, const NoteClip& clip, double at
     std::vector<MelodyNote> pasted;
 
     if (std::isfinite (atBeat))
+    {
+        // Same group clamp as duplicateNotes: the earliest pasted note never starts before beat 0.
+        atBeat = std::max (atBeat, -earliestStart (clip.notes.notes));
+
         for (auto n : clip.notes.notes)
         {
             n.startBeat += atBeat;
@@ -547,6 +580,7 @@ NoteEditResult pasteNotes (const Melody& melody, const NoteClip& clip, double at
             if (std::isfinite (n.startBeat) && n.startBeat < kMaxMelodyBeat)
                 pasted.push_back (n);
         }
+    }
 
     all.notes.insert (all.notes.end(), pasted.begin(), pasted.end());
     return finish (all, pasted, limits);

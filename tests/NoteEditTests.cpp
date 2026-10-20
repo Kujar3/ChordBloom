@@ -341,6 +341,98 @@ TEST_CASE ("note edit: a zero (or fully clamped) group delta returns the input w
     CHECK (moveNotes (m, { 9, -1 }, 3.0, 3, ctx).selection.empty());
 }
 
+TEST_CASE ("note edit: a sub-tick move is a zero move (no re-snap of off-snap notes)")
+{
+    NoteEditContext ctx;
+    ctx.key = cMajor;
+    ctx.snap = MelodySnap::Scale;
+
+    const auto m = mel ({ mn (61, 0.0, 1.0) });   // C#4, off the C major scale
+
+    // anything that rounds to no tick (under 1/96 beat, including float noise) leaves the note exactly as it is
+    for (double delta : { 0.005, -0.005, 1.0e-12, 1.0 / 96.0 - 1.0e-9 })
+    {
+        const auto r = moveNotes (m, { 0 }, delta, 0, ctx);
+        CHECK (r.notes == m);
+        CHECK_EQ (r.selection, (std::vector<int> { 0 }));
+    }
+
+    // one real tick moves and re-snaps
+    const auto t = moveNotes (m, { 0 }, 1.0 / 48.0, 0, ctx);
+    CHECK_EQ (starts (t.notes), (std::vector<double> { 1.0 / 48.0 }));
+    CHECK_EQ (pitches (t.notes), (std::vector<int> { 60 }));
+}
+
+TEST_CASE ("note edit: moveNotes never clamps beyond kMaxMelodyBeat, whatever ctx.maxBeat says")
+{
+    NoteEditContext ctx;
+    const auto m = mel ({ mn (60, 250.0, 1.0), mn (64, 255.0, 0.5) });
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double last = kMaxMelodyBeat - kMinMelodyNoteBeats;   // latest allowed start
+
+    for (double maxBeat : { 300.0, nan, std::numeric_limits<double>::infinity(), kMaxMelodyBeat })
+    {
+        ctx.maxBeat = maxBeat;
+        const auto r = moveNotes (m, { 0, 1 }, 10.0, 0, ctx);
+        // one group clamp: the move stops at +0.9375 and the notes keep their spacing (no squeeze onto one tick)
+        CHECK_EQ (starts (r.notes), (std::vector<double> { 250.0 + (last - 255.0), last }));
+        CHECK_EQ (pitches (r.notes), (std::vector<int> { 60, 64 }));
+        CHECK_EQ (lengths (r.notes)[0], 1.0);
+        CHECK_EQ (r.selection, (std::vector<int> { 0, 1 }));
+    }
+}
+
+TEST_CASE ("note edit: moveNotes re-snaps with the layer limits (bass notes below 36 are not pulled into the melody range)")
+{
+    const auto p = prog ({ { C, 4 }, { G, 4 } });
+    NoteEditContext ctx;
+    ctx.limits = layerLimits (Layer::Bass);   // 24..72
+    ctx.progression = &p;
+    ctx.key = cMajor;
+    ctx.snap = MelodySnap::ChordTones;
+
+    // E1 (28) is a C chord tone: a time move inside the C chord keeps it
+    CHECK_EQ (pitches (moveNotes (mel ({ mn (28, 0.0, 1.0) }), { 0 }, 1.0, 0, ctx).notes), (std::vector<int> { 28 }));
+
+    // D1 (26) + 1 semitone = 27 (D#), which snaps to the nearest C chord tone, E1 (28); the melody range would give 36
+    CHECK_EQ (pitches (moveNotes (mel ({ mn (26, 0.0, 1.0) }), { 0 }, 0.0, 1, ctx).notes), (std::vector<int> { 28 }));
+
+    // Scale snap below 36: C#1 (25) moved one beat snaps down to C1 (24), not up into 36..
+    ctx.snap = MelodySnap::Scale;
+    CHECK_EQ (pitches (moveNotes (mel ({ mn (25, 0.0, 1.0) }), { 0 }, 1.0, 0, ctx).notes), (std::vector<int> { 24 }));
+    CHECK_EQ (pitches (moveNotes (mel ({ mn (30, 0.0, 1.0) }), { 0 }, 0.0, 1, ctx).notes), (std::vector<int> { 31 }));   // F#1 -> G1
+
+    // arp limits (28..108): a note above 96 keeps its place when moved in time
+    NoteEditContext arp;
+    arp.limits = layerLimits (Layer::Arp);
+    arp.key = cMajor;
+    arp.snap = MelodySnap::Scale;
+    CHECK_EQ (pitches (moveNotes (mel ({ mn (100, 0.0, 1.0) }), { 0 }, 1.0, 0, arp).notes), (std::vector<int> { 100 }));
+}
+
+TEST_CASE ("note edit: the move clamp looks at the selected notes only (unselected outliers do not block it)")
+{
+    NoteEditContext ctx;
+    ctx.maxBeat = 8.0;
+
+    // selected: 60@0 and 62@1; outliers: 95 (high), 37 (low) and a late note at 7.5
+    const auto m = mel ({ mn (60, 0.0, 1.0), mn (62, 1.0, 1.0), mn (95, 2.0, 1.0), mn (37, 3.0, 1.0), mn (64, 7.5, 0.25) });
+
+    const auto up = moveNotes (m, { 0, 1 }, 0.0, 12, ctx);   // the 95 would allow +1 only if it counted
+    CHECK_EQ (pitches (up.notes), (std::vector<int> { 72, 74, 95, 37, 64 }));
+    CHECK_EQ (starts (up.notes), (std::vector<double> { 0.0, 1.0, 2.0, 3.0, 7.5 }));
+    CHECK_EQ (up.selection, (std::vector<int> { 0, 1 }));
+
+    const auto down = moveNotes (m, { 0, 1 }, 0.0, -20, ctx);   // the 37 would allow -1 only if it counted
+    CHECK_EQ (pitches (down.notes), (std::vector<int> { 40, 42, 95, 37, 64 }));
+    CHECK_EQ (down.selection, (std::vector<int> { 0, 1 }));
+
+    const auto later = moveNotes (m, { 0, 1 }, 4.0, 0, ctx);   // the note at 7.5 would allow +0.4375 only if it counted
+    CHECK_EQ (starts (later.notes), (std::vector<double> { 2.0, 3.0, 4.0, 5.0, 7.5 }));
+    CHECK_EQ (pitches (later.notes), (std::vector<int> { 95, 37, 60, 62, 64 }));
+    CHECK_EQ (later.selection, (std::vector<int> { 2, 3 }));
+}
+
 TEST_CASE ("note edit: two notes moved onto the same pitch and start keep the longer and select it")
 {
     NoteEditContext ctx;
@@ -498,6 +590,99 @@ TEST_CASE ("note edit: duplicateNotes copies, selects the copies and drops copie
     CHECK_EQ (r.notes.notes.size(), (size_t) kMaxMelodyNotes);
 }
 
+TEST_CASE ("note edit: duplicate and paste with a negative offset stop at beat 0 as a group")
+{
+    // duplicate: offset -5 is clamped to -1 (the earliest copy starts at 0), the copies keep their spacing
+    const auto m = mel ({ mn (60, 1.0, 1.0), mn (60, 2.0, 1.0), mn (64, 2.0, 1.0) });
+    auto r = duplicateNotes (m, { 0, 1, 2 }, -5.0, kMelodyLimits);
+    // copies at 0 (60), 1 (60, merging with the original 60@1) and 1 (64)
+    CHECK_EQ (r.notes.notes.size(), (size_t) 5);
+    CHECK_EQ (starts (r.notes), (std::vector<double> { 0.0, 1.0, 1.0, 2.0, 2.0 }));
+    CHECK_EQ (pitches (r.notes), (std::vector<int> { 60, 60, 64, 60, 64 }));
+    CHECK_EQ (r.selection.size(), (size_t) 3);
+
+    // a small negative offset is unchanged
+    r = duplicateNotes (m, { 1 }, -0.5, kMelodyLimits);
+    CHECK_EQ (starts (r.notes), (std::vector<double> { 1.0, 1.5, 2.0, 2.0 }));
+
+    // paste: the clip is moved right so that its earliest note starts at 0
+    const NoteClip clip { mel ({ mn (60, 0.5, 1.0), mn (64, 1.5, 1.0) }), 0.0 };
+    r = pasteNotes (Melody {}, clip, -3.0, kMelodyLimits);
+    CHECK_EQ (starts (r.notes), (std::vector<double> { 0.0, 1.0 }));
+    CHECK_EQ (pitches (r.notes), (std::vector<int> { 60, 64 }));
+    CHECK_EQ (r.selection, (std::vector<int> { 0, 1 }));
+
+    r = pasteNotes (Melody {}, clip, -0.25, kMelodyLimits);
+    CHECK_EQ (starts (r.notes), (std::vector<double> { 0.25, 1.25 }));
+}
+
+TEST_CASE ("note edit: duplicate and paste into a full 2048-note list keep a canonical result and point at the new notes")
+{
+    const auto arp = layerLimits (Layer::Arp);
+    Melody full;
+
+    for (int i = 0; i < kMaxLayerNotes; ++i)
+        full.notes.push_back (mn (60 + i % 12, i * 0.125, 0.125));
+
+    REQUIRE (full == sanitiseMelody (full, arp));
+    REQUIRE (full.notes.size() == (size_t) kMaxLayerNotes);
+
+    // duplicate the last 100 notes 1/16 beat later: the list is truncated to 2048, the copies that survive stay selected
+    std::vector<int> last;
+    std::vector<MelodyNote> copies;
+
+    for (int i = kMaxLayerNotes - 100; i < kMaxLayerNotes; ++i)
+    {
+        last.push_back (i);
+        auto c = full.notes[(size_t) i];
+        c.startBeat += 0.0625;
+        copies.push_back (c);
+    }
+
+    const auto d = duplicateNotes (full, last, 0.0625, arp);
+    CHECK_EQ (d.notes.notes.size(), (size_t) kMaxLayerNotes);
+    CHECK (d.notes == sanitiseMelody (d.notes, arp));
+    CHECK (validResultSelection (d));
+    CHECK (! d.selection.empty());
+    CHECK (d.selection == findNotes (d.notes, copies));
+
+    for (int index : d.selection)
+    {
+        bool isCopy = false;
+        for (const auto& c : copies)
+            isCopy = isCopy || (c.note == d.notes.notes[(size_t) index].note && c.startBeat == d.notes.notes[(size_t) index].startBeat);
+        CHECK (isCopy);
+    }
+
+    // paste a 3-note clip at beat 100.0625: it sits between existing notes, the last notes of the list fall off the end
+    const NoteClip clip { mel ({ mn (60, 0.0, 0.0625), mn (62, 0.0625, 0.0625), mn (64, 0.125, 0.0625) }), 0.0 };
+    const auto p = pasteNotes (full, clip, 100.0625, arp);
+    CHECK_EQ (p.notes.notes.size(), (size_t) kMaxLayerNotes);
+    CHECK (p.notes == sanitiseMelody (p.notes, arp));
+    CHECK_EQ (p.selection.size(), (size_t) 3);
+
+    for (int index : p.selection)
+        CHECK (p.notes.notes[(size_t) index].startBeat >= 100.0625);
+
+    CHECK_EQ (p.notes.notes[(size_t) p.selection[0]].note, 60);
+    CHECK_EQ (p.notes.notes[(size_t) p.selection[1]].note, 62);
+    CHECK_EQ (p.notes.notes[(size_t) p.selection[2]].note, 64);
+
+    // the same call twice gives the same result
+    CHECK (pasteNotes (full, clip, 100.0625, arp).notes == p.notes);
+    CHECK (duplicateNotes (full, last, 0.0625, arp).notes == d.notes);
+
+    // large lists: edits keep their selection pointing at the edited notes
+    const auto all = allNoteIndices (full);
+    const auto v = setNoteVelocity (full, all, 0.5f, arp);
+    CHECK_EQ (v.selection.size(), (size_t) kMaxLayerNotes);
+    const auto mv = moveNotes (full, last, 0.0, -2, [&] { NoteEditContext c; c.limits = arp; return c; }());
+    CHECK_EQ (mv.notes.notes.size(), (size_t) kMaxLayerNotes);
+    CHECK (! mv.selection.empty());
+    for (int index : mv.selection)
+        CHECK (mv.notes.notes[(size_t) index].startBeat >= (double) (kMaxLayerNotes - 100) * 0.125);
+}
+
 TEST_CASE ("note edit: deleteNotes removes the selection and clears it")
 {
     const auto m = mel ({ mn (60, 0.0, 1.0), mn (62, 1.0, 1.0), mn (64, 2.0, 1.0) });
@@ -588,6 +773,14 @@ TEST_CASE ("note edit: transposeNotes moves by semitones and is refused at the l
     CHECK_EQ (pitches (transposeNotes (low, { 0 }, 44, bass).notes), (std::vector<int> { 72 }));
     CHECK (transposeNotes (low, { 0 }, 45, bass).notes == low);
 
+    // huge deltas are refused without overflowing
+    const int big = std::numeric_limits<int>::max(), small = std::numeric_limits<int>::min();
+    CHECK (transposeNotes (low, { 0 }, big, bass).notes == low);
+    CHECK (transposeNotes (low, { 0 }, small, bass).notes == low);
+    CHECK (transposeNotes (low, { 0 }, big, kMelodyLimits).selection == (std::vector<int> { 0 }));
+    CHECK (transposeNotes (low, { 0 }, -128, NoteLimits { 0, 127, 16 }).notes == low);
+    CHECK (transposeNotes (low, { 0 }, 128, NoteLimits { 0, 127, 16 }).notes == low);
+
     // zero and empty
     CHECK (transposeNotes (low, { 0 }, 0, bass).notes == low);
     CHECK (transposeNotes (low, {}, 5, bass).notes == low);
@@ -644,6 +837,26 @@ TEST_CASE ("note edit: transposeNotesInScale in A minor and C major, including n
     CHECK_EQ (pitches (r.notes), (std::vector<int> { 36 }));
     r = transposeNotesInScale (mel ({ mn (36, 0.0, 1.0) }), { 0 }, 0, cMajor, kMelodyLimits);
     CHECK_EQ (pitches (r.notes), (std::vector<int> { 36 }));
+
+    // the refusal uses the limits it is given: bass notes below 36 and arp notes above 96 transpose
+    const auto bass = layerLimits (Layer::Bass);
+    const auto arp = layerLimits (Layer::Arp);
+    const auto low = mel ({ mn (28, 0.0, 1.0) });
+    CHECK_EQ (pitches (transposeNotesInScale (low, { 0 }, 1, cMajor, bass).notes), (std::vector<int> { 29 }));
+    CHECK_EQ (pitches (transposeNotesInScale (low, { 0 }, -2, cMajor, bass).notes), (std::vector<int> { 24 }));
+    const auto floorNote = mel ({ mn (24, 0.0, 1.0) });
+    r = transposeNotesInScale (floorNote, { 0 }, -1, cMajor, bass);   // B0 is below the bass range: refused
+    CHECK (r.notes == floorNote);
+    CHECK_EQ (r.selection, (std::vector<int> { 0 }));
+    CHECK_EQ (pitches (transposeNotesInScale (mel ({ mn (98, 0.0, 1.0) }), { 0 }, 1, cMajor, arp).notes), (std::vector<int> { 100 }));
+    const auto ceiling = mel ({ mn (108, 0.0, 1.0) });
+    CHECK (transposeNotesInScale (ceiling, { 0 }, 1, cMajor, arp).notes == ceiling);
+    CHECK (transposeNotesInScale (low, { 0 }, 1, cMajor, kMelodyLimits).notes.notes[0].note == 36);   // refused (29 is below the melody range): the input comes back sanitised, 28 clamped to 36
+
+    // huge step counts are refused without overflowing
+    CHECK (transposeNotesInScale (low, { 0 }, std::numeric_limits<int>::max(), cMajor, bass).notes == low);
+    CHECK (transposeNotesInScale (low, { 0 }, std::numeric_limits<int>::min(), cMajor, bass).notes == low);
+    CHECK (transposeNotesInScale (low, { 0 }, std::numeric_limits<int>::max() / 2, cMajor, bass).notes == low);
 
     // selection follows re-sorted notes
     r = transposeNotesInScale (mel ({ mn (60, 0.0, 1.0), mn (62, 0.0, 1.0) }), { 0 }, 1, cMajor, kMelodyLimits);   // C -> D collides
@@ -797,21 +1010,23 @@ TEST_CASE ("note edit: copy and paste origin, folding into the target limits and
 }
 
 //==============================================================================
-TEST_CASE ("note edit: 10k-step random fuzz keeps lists canonical with valid selections")
+namespace
 {
-    Rng rng (0xc0ffee11u);
+// Runs `steps` random edit steps on `current`; the working list is thinned when it grows past `trimAbove` notes.
+void runEditFuzz (uint32_t seed, int steps, Melody current, int trimAbove, int firstLimitSet)
+{
+    Rng rng (seed);
 
     const NoteLimits limitSets[3] = { kMelodyLimits, layerLimits (Layer::Arp), layerLimits (Layer::Bass) };
     const Progression progs[2] = { prog ({ { C, 4 }, { G, 4 }, { C, 2 }, { G, 6 } }), prog ({ { G, 3 }, { C, 1 } }) };
     const Key keys[2] = { cMajor, aMinor };
 
-    Melody current;
     NoteClip clip;
     std::vector<int> selection;
 
-    for (int step = 0; step < 10000; ++step)
+    for (int step = 0; step < steps; ++step)
     {
-        const NoteLimits limits = limitSets[rng.range (0, 2)];
+        const NoteLimits limits = limitSets[rng.range (firstLimitSet, 2)];
 
         NoteEditContext ctx;
         ctx.limits = limits;
@@ -832,19 +1047,28 @@ TEST_CASE ("note edit: 10k-step random fuzz keeps lists canonical with valid sel
         const double delta = rng.chance (4) ? std::numeric_limits<double>::quiet_NaN() : rng.range (-40, 40) * 0.25;
         NoteEditResult r;
 
+        // The selected notes of the (canonical) input and, for edits that keep pitch and start, what must stay selected.
+        Melody picked;
+        for (int i : validSelection (current, selection))
+            picked.notes.push_back (current.notes[(size_t) i]);
+
+        enum class Expect { None, SamePlace, Transposed, Survivors };
+        Expect expect = Expect::None;
+        int transposedBy = 0;
+
         switch (rng.range (0, 15))
         {
             case 0:
-            case 1:   r = moveNotes (current, selection, delta, rng.range (-14, 14), ctx); break;
-            case 2:   r = resizeNotes (current, selection, delta, rng.chance (50) ? 0.25 : 1.0 / 16.0, limits); break;
+            case 1:   r = moveNotes (current, selection, delta, rng.range (-14, 14), ctx); expect = Expect::Survivors; break;
+            case 2:   r = resizeNotes (current, selection, delta, rng.chance (50) ? 0.25 : 1.0 / 16.0, limits); expect = Expect::SamePlace; break;
             case 3:   r = duplicateNotes (current, selection, rng.chance (50) ? defaultDuplicateOffset (current, selection, 0.25) : delta, limits); break;
             case 4:   r = deleteNotes (current, selection, limits); break;
-            case 5:   r = setNoteVelocity (current, selection, (float) (rng.unit() * 1.4 - 0.2), limits); break;
-            case 6:   r = offsetNoteVelocity (current, selection, (float) (rng.unit() - 0.5), limits); break;
-            case 7:   r = transposeNotes (current, selection, rng.range (-30, 30), limits); break;
-            case 8:   r = transposeNotesInScale (current, selection, rng.range (-9, 9), ctx.key, limits); break;
-            case 9:   r = quantizeNotes (current, selection, rng.chance (80) ? 0.25 : (rng.chance (50) ? 1.0 / 3.0 : 0.0), limits); break;
-            case 10:  r = legatoNotes (current, selection, limits); break;
+            case 5:   r = setNoteVelocity (current, selection, (float) (rng.unit() * 1.4 - 0.2), limits); expect = Expect::SamePlace; break;
+            case 6:   r = offsetNoteVelocity (current, selection, (float) (rng.unit() - 0.5), limits); expect = Expect::SamePlace; break;
+            case 7:   transposedBy = rng.range (-30, 30); r = transposeNotes (current, selection, transposedBy, limits); expect = Expect::Transposed; break;
+            case 8:   r = transposeNotesInScale (current, selection, rng.range (-9, 9), ctx.key, limits); expect = Expect::Survivors; break;
+            case 9:   r = quantizeNotes (current, selection, rng.chance (80) ? 0.25 : (rng.chance (50) ? 1.0 / 3.0 : 0.0), limits); expect = Expect::Survivors; break;
+            case 10:  r = legatoNotes (current, selection, limits); expect = Expect::SamePlace; break;
             case 11:  clip = copyNotes (current, selection, rng.chance (50) ? 0.25 : 0.0); r = deleteNotes (current, {}, limits); break;
             default:  // 12..15: paste or draw (a one-note clip)
             {
@@ -880,11 +1104,36 @@ TEST_CASE ("note edit: 10k-step random fuzz keeps lists canonical with valid sel
                 return;
             }
 
+        // the selection points at the edited notes, not just at valid indices
+        const NoteLimits uncapped { limits.lowest, limits.highest, 1000000 };
+        bool selectionOk = true;
+
+        if (expect == Expect::SamePlace)
+            selectionOk = r.selection == findNotes (r.notes, sanitiseMelody (picked, uncapped).notes);
+        else if (expect == Expect::Transposed)
+        {
+            auto expected = picked;
+
+            if (! (r.notes == sanitiseMelody (current, limits)))   // not refused: every picked note moved
+                for (auto& n : expected.notes)
+                    n.note += transposedBy;
+
+            selectionOk = r.selection == findNotes (r.notes, sanitiseMelody (expected, uncapped).notes);
+        }
+        else if (expect == Expect::Survivors)
+            selectionOk = r.selection.size() <= picked.notes.size() && (picked.notes.empty() || ! r.selection.empty());
+
+        if (! selectionOk)
+        {
+            cbtest::reportFailure (__FILE__, __LINE__, "selection does not match the edited notes at step " + std::to_string (step));
+            return;
+        }
+
         current = r.notes;
         selection = r.selection;
 
         // keep the working list small enough to stay interesting
-        if ((int) current.notes.size() > 60)
+        if ((int) current.notes.size() > trimAbove)
         {
             std::vector<int> half;
             for (int i = 0; i < (int) current.notes.size(); i += 2)
@@ -893,6 +1142,26 @@ TEST_CASE ("note edit: 10k-step random fuzz keeps lists canonical with valid sel
             selection.clear();
         }
     }
+}
+} // namespace
 
+TEST_CASE ("note edit: 10k-step random fuzz keeps lists canonical with valid selections")
+{
+    runEditFuzz (0xc0ffee11u, 10000, Melody {}, 60, 0);
+    CHECK (true);
+}
+
+TEST_CASE ("note edit: fuzz on lists of about 2000 notes (up to the 2048 cap)")
+{
+    Rng rng (0x5eed2000u);
+    Melody big;
+
+    for (int i = 0; i < 2000; ++i)
+        big.notes.push_back (mn (rng.range (36, 96), rng.range (0, 2047) * 0.125, 0.125 * rng.range (1, 4)));
+
+    big = sanitiseMelody (big, layerLimits (Layer::Arp));
+    REQUIRE (big.notes.size() > 1500);
+
+    runEditFuzz (0xb16b00b5u, 400, big, 100000, 1);
     CHECK (true);
 }

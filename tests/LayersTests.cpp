@@ -156,6 +156,169 @@ Melody legacySanitise (const Melody& in)
     return out;
 }
 
+bool legacyInChord (int pitchClass, const Chord& chord)
+{
+    for (int p : chord.pitchClasses())
+        if (pc (p) == pitchClass)
+            return true;
+
+    return false;
+}
+
+bool legacyAllowed (int pitchClass, MelodySnap snap, const Key& key, const std::optional<Chord>& chord)
+{
+    switch (snap)
+    {
+        case MelodySnap::Scale:       return key.contains (pitchClass) || (chord.has_value() && legacyInChord (pitchClass, *chord));
+        case MelodySnap::ChordTones:  return chord.has_value() ? legacyInChord (pitchClass, *chord) : key.contains (pitchClass);
+        case MelodySnap::Off:
+        case MelodySnap::NumModes:    break;
+    }
+
+    return true;
+}
+
+// The phase-1.5 (f86c2fa) snapMelodyPitch, transposeMelody, renderMelody and melodyFollowingSlots, kept verbatim as
+// references (on top of legacySanitise) so the kMelodyLimits overloads are compared with the old behaviour and not
+// with themselves.
+int legacySnapMelodyPitch (int note, MelodySnap snap, const Key& key, const std::optional<Chord>& chord)
+{
+    note = std::clamp (note, kMelodyLowestNote, kMelodyHighestNote);
+
+    if (snap == MelodySnap::Off)
+        return note;
+
+    for (int d = 0; d <= 12; ++d)
+    {
+        const int down = note - d, up = note + d;
+
+        if (down >= kMelodyLowestNote && legacyAllowed (pc (down), snap, key, chord))
+            return down;
+
+        if (up <= kMelodyHighestNote && legacyAllowed (pc (up), snap, key, chord))
+            return up;
+    }
+
+    return note;
+}
+
+std::vector<NoteEvent> legacyRenderMelody (const Melody& melodyIn, double loopBeats, int channel)
+{
+    std::vector<NoteEvent> events;
+    constexpr double eps = 1.0e-9;
+
+    if (! (loopBeats > 0.0) || ! std::isfinite (loopBeats))
+        return events;
+
+    const auto melody = legacySanitise (melodyIn);
+
+    for (const auto& n : melody.notes)
+    {
+        if (n.startBeat >= loopBeats - eps)
+            continue;
+
+        NoteEvent e;
+        e.note = n.note;
+        e.velocity = n.velocity;
+        e.startBeat = n.startBeat;
+        e.lengthBeats = std::min (n.startBeat + n.lengthBeats, loopBeats) - n.startBeat;
+        e.channel = channel;
+        events.push_back (e);
+    }
+
+    std::sort (events.begin(), events.end(), [] (const NoteEvent& a, const NoteEvent& b)
+    {
+        return a.note != b.note ? a.note < b.note : a.startBeat < b.startBeat;
+    });
+
+    for (size_t i = 0; i + 1 < events.size(); ++i)
+    {
+        auto& e = events[i];
+        const auto& next = events[i + 1];
+
+        if (next.note == e.note && e.startBeat + e.lengthBeats > next.startBeat)
+            e.lengthBeats = next.startBeat - e.startBeat;
+    }
+
+    events.erase (std::remove_if (events.begin(), events.end(), [] (const NoteEvent& e) { return e.lengthBeats <= eps; }),
+                  events.end());
+
+    std::sort (events.begin(), events.end(), [] (const NoteEvent& a, const NoteEvent& b)
+    {
+        return a.startBeat != b.startBeat ? a.startBeat < b.startBeat : a.note < b.note;
+    });
+
+    return events;
+}
+
+Melody legacyTransposeMelody (const Melody& melody, int semitones)
+{
+    int shift = pc (semitones);
+
+    if (shift > 6)
+        shift -= 12;
+
+    Melody out = melody;
+
+    for (auto& n : out.notes)
+    {
+        int moved = n.note + shift;
+
+        if (moved > kMelodyHighestNote)
+            moved -= 12;
+        else if (moved < kMelodyLowestNote)
+            moved += 12;
+
+        n.note = moved;
+    }
+
+    return legacySanitise (out);
+}
+
+Melody legacyFollowingSlots (const Melody& melodyIn, const Progression& before, const Progression& after,
+                             const std::vector<int>& sourceSlot)
+{
+    constexpr double eps = 1.0e-9;
+    const auto melody = legacySanitise (melodyIn);
+
+    if (sourceSlot.size() != after.slots.size())
+        return melody;
+
+    const double beforeTotal = (double) before.totalBeats();
+    const double afterTotal = (double) after.totalBeats();
+    Melody out;
+
+    for (const auto& n : melody.notes)
+    {
+        if (n.startBeat >= beforeTotal)
+        {
+            auto moved = n;
+            moved.startBeat = n.startBeat - beforeTotal + afterTotal;
+            out.notes.push_back (moved);
+            continue;
+        }
+
+        const int slot = before.slotAtBeat (n.startBeat);
+
+        if (slot < 0)
+            continue;
+
+        const double offset = n.startBeat - before.slotStartBeat (slot);
+
+        for (size_t i = 0; i < sourceSlot.size(); ++i)
+        {
+            if (sourceSlot[i] != slot || offset >= (double) after.slots[i].lengthBeats - eps)
+                continue;
+
+            auto moved = n;
+            moved.startBeat = after.slotStartBeat ((int) i) + offset;
+            out.notes.push_back (moved);
+        }
+    }
+
+    return legacySanitise (out);
+}
+
 // Random lists that exercise every sanitising branch: out-of-range pitches and starts, tiny / huge / negative lengths,
 // off-grid times, NaN / infinity, duplicated (pitch, start), velocities outside 0..1.
 Melody randomMessyMelody (Rng& rng)
@@ -422,19 +585,27 @@ TEST_CASE ("note limits: every overload equals the old function with kMelodyLimi
         const double loop = rng.chance (10) ? 0.0 : (double) rng.range (1, 64);
         CHECK (renderMelody (m, loop) == renderMelody (m, loop, 3, kMelodyLimits));
         CHECK (renderMelody (m, loop, 5) == renderMelody (m, loop, 5, kMelodyLimits));
+        CHECK (legacyRenderMelody (m, loop, 3) == renderMelody (m, loop));
+        CHECK (legacyRenderMelody (m, loop, 5) == renderMelody (m, loop, 5, kMelodyLimits));
 
         const int semis = rng.range (-30, 30);
         CHECK (transposeMelody (m, semis) == transposeMelody (m, semis, kMelodyLimits));
+        CHECK (legacyTransposeMelody (m, semis) == transposeMelody (m, semis));
+        CHECK (legacyTransposeMelody (m, semis) == transposeMelody (m, semis, kMelodyLimits));
 
         const auto before = randomProgression (rng, 1, 6);
         const auto edit = randomEdit (rng, before);
         CHECK (melodyFollowingSlots (m, before, edit.after, edit.source)
+               == melodyFollowingSlots (m, before, edit.after, edit.source, kMelodyLimits));
+        CHECK (legacyFollowingSlots (m, before, edit.after, edit.source) == melodyFollowingSlots (m, before, edit.after, edit.source));
+        CHECK (legacyFollowingSlots (m, before, edit.after, edit.source)
                == melodyFollowingSlots (m, before, edit.after, edit.source, kMelodyLimits));
 
         auto badSource = edit.source;
         badSource.push_back (0);
         CHECK (melodyFollowingSlots (m, before, edit.after, badSource)
                == melodyFollowingSlots (m, before, edit.after, badSource, kMelodyLimits));
+        CHECK (legacyFollowingSlots (m, before, edit.after, badSource) == melodyFollowingSlots (m, before, edit.after, badSource, kMelodyLimits));
 
         const int pitch = rng.range (-10, 140);
         const auto snap = (MelodySnap) rng.range (0, numMelodySnapModes - 1);
@@ -442,6 +613,8 @@ TEST_CASE ("note limits: every overload equals the old function with kMelodyLimi
         const std::optional<Chord> chord = rng.chance (30) ? std::nullopt
                                                            : std::optional<Chord> (before.slots[0].chord);
         CHECK_EQ (snapMelodyPitch (pitch, snap, key, chord), snapMelodyPitch (pitch, snap, key, chord, kMelodyLimits));
+        CHECK_EQ (legacySnapMelodyPitch (pitch, snap, key, chord), snapMelodyPitch (pitch, snap, key, chord, kMelodyLimits));
+        CHECK_EQ (legacySnapMelodyPitch (pitch, snap, key, chord), snapMelodyPitch (pitch, snap, key, chord));
     }
 }
 
@@ -587,6 +760,15 @@ TEST_CASE ("notesFromEvents: rounding to 1/48, folding, minimum length, non-fini
     REQUIRE (m.notes.size() == 2);
     CHECK_EQ (m.notes[0].startBeat, 16.0 / 48.0);
     CHECK_EQ (m.notes[1].startBeat, 62.0 / 48.0);
+
+    // round to nearest, never truncate: 0.24 = 11.52 ticks -> 12, length 0.99 = 47.52 ticks -> 48, and a swung onset a
+    // hair below a tick lands on it
+    m = notesFromEvents ({ ev (40, 0.24, 0.99), ev (42, 62.0 / 48.0 - 1.0e-9, 0.5) }, bass);
+    REQUIRE (m.notes.size() == 2);
+    CHECK_EQ (m.notes[0].startBeat, 12.0 / 48.0);
+    CHECK_EQ (m.notes[0].lengthBeats, 48.0 / 48.0);
+    CHECK_EQ (m.notes[1].startBeat, 62.0 / 48.0);
+    CHECK_EQ (m.notes[1].lengthBeats, 24.0 / 48.0);
 
     // minimum length
     m = notesFromEvents ({ ev (40, 0.0, 0.001), ev (42, 1.0, 0.0) }, bass);
