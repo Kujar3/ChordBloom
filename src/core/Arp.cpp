@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 
-// Arp layer (final-spec 4.3): the name / table / mask functions, then renderArp.
+// Arp layer (final-spec 4.3). The name / table / mask functions are WP0's data (frozen behaviour); renderArp is WP2's.
 
 namespace cb
 {
@@ -80,14 +80,7 @@ bool arpStepSounds (ArpRhythm r, int stepInBar, int stepsPerBar)
     {
         case ArpRhythm::EveryStep:     return true;
         case ArpRhythm::ThreeOnOneOff: return inGroup != 3;
-        case ArpRhythm::KickGap:
-        {
-            // Rests on the steps that start a beat (where the kick is), at every rate: steps 0, 4, 8, 12 at 1/16, the
-            // 8ths on the beat at 1/8, the triplets 0, 3, 6, 9 at 1/8T. At 1/4 every step starts a beat, so the
-            // 16th-group mask (rest on the bar's first step only) stays.
-            const int stepsPerBeat = stepsPerBar > 0 && stepsPerBar % 4 == 0 ? stepsPerBar / 4 : 4;
-            return stepsPerBeat > 1 ? stepInBar % stepsPerBeat != 0 : inGroup != 0;
-        }
+        case ArpRhythm::KickGap:       return inGroup != 0;
         case ArpRhythm::Skip2nd:       return inGroup != 1;
         case ArpRhythm::Skip3rd:       return inGroup != 2;
         case ArpRhythm::Breath:        return stepsPerBar <= 0 || stepInBar != stepsPerBar - 1;

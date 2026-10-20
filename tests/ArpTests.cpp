@@ -477,28 +477,30 @@ TEST_CASE ("arp: rhythm masks silence the right steps and never skip a tone")
     CHECK_EQ (late[15].note, 60);
 }
 
-TEST_CASE ("arp: Kick gap rests on the steps that start a beat at every rate")
+TEST_CASE ("arp: Kick gap keeps WP0's mask - rest on step % 4 == 0 at every rate")
 {
-    // 1/16: 0, 4, 8, 12 (unchanged); 1/8: the on-beat 8ths; 1/8T: the triplets 0, 3, 6, 9; 1/4 has no gap to offer (every
-    // step starts a beat), so it keeps resting on the bar's first step only.
+    // The frozen '. x x x' group: 1/16 rests on 0, 4, 8, 12; 1/8 on 0, 4; 1/8T on 0, 4, 8; 1/4 on the bar's first step.
     struct Case { int stepsPerBar; std::vector<int> silent; };
-    const Case cases[] = { { 16, { 0, 4, 8, 12 } }, { 8, { 0, 2, 4, 6 } }, { 12, { 0, 3, 6, 9 } }, { 4, { 0 } } };
+    const Case cases[] = { { 16, { 0, 4, 8, 12 } }, { 8, { 0, 4 } }, { 12, { 0, 4, 8 } }, { 4, { 0 } } };
     for (const auto& c : cases)
         for (int step = 0; step < c.stepsPerBar; ++step)
             CHECK_EQ (arpStepSounds (ArpRhythm::KickGap, step, c.stepsPerBar),
                       std::find (c.silent.begin(), c.silent.end(), step) == c.silent.end());
 
-    // Rendered: at 1/8 over one bar the arp plays the offbeat 8ths only, at 1/8T the two triplets after each beat.
+    // Rendered over one bar: 1/8 plays steps 1, 2, 3, 5, 6, 7 (beats 0.5, 1, 1.5, 2.5, 3, 3.5).
     const auto bar = makeProgression ({ chordOf (0) }, { 4 });
     const auto eighths = render (bar, arpOf (ArpShape::Up3, RateDivision::Eighth, ArpRhythm::KickGap));
-    REQUIRE (eighths.size() == 4);
+    REQUIRE (eighths.size() == 6);
+    const double eighthStarts[] = { 0.5, 1.0, 1.5, 2.5, 3.0, 3.5 };
     for (size_t i = 0; i < eighths.size(); ++i)
-        CHECK (near (eighths[i].startBeat, (double) i + 0.5));
+        CHECK (near (eighths[i].startBeat, eighthStarts[i]));
 
+    // 1/8T: the rest follows the same group of 4 steps as every other group mask (steps 0, 4, 8 of 12).
     const auto triplets = render (bar, arpOf (ArpShape::Up3, RateDivision::EighthTriplet, ArpRhythm::KickGap));
-    REQUIRE (triplets.size() == 8);
-    for (size_t i = 0; i < triplets.size(); ++i)
-        CHECK (near (triplets[i].startBeat, (double) (i / 2) + (double) (i % 2 + 1) / 3.0));
+    REQUIRE (triplets.size() == 9);
+    for (const auto& n : triplets)
+        for (int silent : { 0, 4, 8 })
+            CHECK (! near (n.startBeat, (double) silent / 3.0));
 
     // The other rhythms keep their 16th-group definition at every rate.
     CHECK (! arpStepSounds (ArpRhythm::Skip2nd, 1, 8));
