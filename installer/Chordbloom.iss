@@ -29,6 +29,8 @@ WizardStyle=modern
 Compression=lzma2/max
 SolidCompression=yes
 CloseApplications=yes
+; The default filter (*.exe,*.dll,*.chm) would not notice a DAW that has the plugin binaries loaded.
+CloseApplicationsFilter=*.exe,*.dll,*.chm,*.vst3,*.clap
 
 [Messages]
 WelcomeLabel2=This will install [name/ver] - a chord progression plugin for FL Studio and other DAWs.%n%nPlease close FL Studio before continuing.
