@@ -29,6 +29,13 @@
 //    Root uses the held release above; Pulse uses rate steps. Root+5th alternates the slot's bass note with the
 //    chord's fifth (b5/#5 of dim/aug), or the chord root for slash chords, chosen by the same rule from that note.
 //    Octaves alternates with an upper/lower octave in range; the last played bass note carries into the next slot.
+//  - Pattern bass modes (phase 2, isBassPattern): bassPatternSteps on the absolute 16th grid from beat 0 (step g =
+//    beat * 4, pattern step g % 16), so the groove runs through chord changes and restarts with the loop. R = the same
+//    chooser as every mode; the 'o' steps play the Octaves partner of R. Onsets are warped by swingWarp on the shared
+//    groove grid (the same swung times as the chord renderer's odd steps) and jittered by humanize; each note lasts
+//    lengthSteps * 0.25 * gate / 0.9 beats, cut at the next bass onset's actual time and the slot end. On-beat
+//    patterns strike R at the slot start when no onset lies in the first half beat of the slot (tested on the straight
+//    grid, so swing never adds or removes a strike); the offbeat family never strikes.
 //  - Safety: a note never overlaps another instance of the same note on the same channel (an earlier one is
 //    shortened), so hosts never see a second note-on before the note-off.
 // Output is sorted by (startBeat, channel, note).
@@ -346,6 +353,36 @@ struct SlotRenderer
         e.channel = channel;
         out.push_back (e);
     }
+
+    // The humanized start of a note whose straight (absolute) start is `start`, never before the slot start.
+    double jitteredStart (double start, int step, int voice, int channel) const
+    {
+        if (humanize > 0.0)
+            start += jitter (slotIndex, step, voice, channel, 0) * kHumanizeTiming * humanize;
+        return std::max (start, std::max (slotStart, 0.0));
+    }
+
+    // Emits a note at an already humanized start (jitteredStart); only the velocity jitter is applied here.
+    // Returns false when the slot end leaves less than kMinLength.
+    bool emitAt (int note, double start, double length, int channel, int step, int voice) const
+    {
+        float vel = velocity;
+        if (humanize > 0.0)
+            vel += (float) (jitter (slotIndex, step, voice, channel, 1) * (double) kHumanizeVelocity * humanize);
+
+        const double end = std::min (start + length, slotEnd);
+        if (end - start < kMinLength)
+            return false;
+
+        NoteEvent e;
+        e.note = std::clamp (note, 0, 127);
+        e.velocity = std::clamp (vel, kMinVelocity, 1.0f);
+        e.startBeat = start;
+        e.lengthBeats = end - start;
+        e.channel = channel;
+        out.push_back (e);
+        return true;
+    }
 };
 
 // Separation from the chord first (tier 0: at least 5 below its lowest note, 1: below, 2: unison, 3: above), then
@@ -468,6 +505,80 @@ void renderChords (const SlotRenderer& r, const std::vector<int>& notes, const R
     }
 }
 
+// Phase 2 pattern bass (final-spec 4.2). `root` is the slot's chooser result (previous = the last emitted pitch).
+void renderBassPattern (const SlotRenderer& r, int root, int lowestVoicingNote, int& previousBass,
+                        const RenderSettings& s, double gate, double swing)
+{
+    const auto& steps = bassPatternSteps (s.bass);
+    if (steps.empty())
+        return;
+
+    // The Octaves mode's partner of R.
+    int partner = root + 12;
+    if (partner > kBassHigh || (partner > lowestVoicingNote - 5 && root - 12 >= kBassLow))
+        partner = root - 12;
+
+    struct Onset
+    {
+        int g;            // absolute 16th index
+        int note;
+        int voice;        // 0 = R, 1 = O (humanize hash)
+        double start;     // actual (swung, jittered) start
+        double length;    // at this gate, before the cuts
+    };
+
+    const double grid = grooveGridBeats (s);
+    const int firstStep = (int) std::lround (r.slotStart * 4.0);
+    const int endStep = (int) std::lround (r.slotEnd * 4.0);
+
+    std::vector<Onset> onsets;
+    for (int g = firstStep; g < endStep; ++g)
+        for (const auto& st : steps)
+            if (st.step == g % 16)
+            {
+                const bool octave = st.role == BassRole::Octave;
+                const int voice = octave ? 1 : 0;
+                const double start = r.jitteredStart (swingWarp ((double) g * 0.25, grid, swing), g, voice, kBassChannel);
+                onsets.push_back ({ g, octave ? partner : root, voice, start,
+                                    (double) st.lengthSteps * 0.25 * gate / 0.9 });
+                break;
+            }
+
+    // On-beat patterns: strike R at the slot start unless an onset lies in the first half beat (straight grid).
+    bool strike = false;
+    if (! bassPatternAvoidsKick (s.bass))
+    {
+        strike = true;
+        for (const auto& o : onsets)
+            if (o.g - firstStep <= 2)
+                strike = false;
+    }
+
+    int last = root;
+
+    if (strike)
+    {
+        const double start = r.jitteredStart (r.slotStart, firstStep, 0, kBassChannel);
+        const double firstOnset = onsets.empty() ? r.slotEnd : onsets.front().start;
+        double length = (firstOnset - r.slotStart) * std::min (1.0, gate / 0.9);
+        length = std::min (length, firstOnset - start);
+        if (r.emitAt (root, start, length, kBassChannel, firstStep, 0))
+            last = root;
+    }
+
+    for (size_t i = 0; i < onsets.size(); ++i)
+    {
+        const auto& o = onsets[i];
+        double length = o.length;
+        if (i + 1 < onsets.size())
+            length = std::min (length, onsets[i + 1].start - o.start);
+        if (r.emitAt (o.note, o.start, length, kBassChannel, o.g, o.voice))
+            last = o.note;
+    }
+
+    previousBass = last;
+}
+
 void renderBass (const SlotRenderer& r, int rootPc, int bassPc, int fifthPc, int lowestVoicingNote, int& previousBass,
                  const RenderSettings& s, double slotLength, double gate, double swing)
 {
@@ -480,10 +591,13 @@ void renderBass (const SlotRenderer& r, int rootPc, int bassPc, int fifthPc, int
     const double rate = rateInBeats (s.rate);
     const double swingDelay = s.rate == RateDivision::EighthTriplet ? 0.0 : swing * rate / 3.0;
 
-    // WP0 STUB (WP2 renders the phase-2 pattern modes): every pattern mode plays exactly like Root for now.
-    const BassMode mode = isBassPattern (s.bass) ? BassMode::Root : s.bass;
+    if (isBassPattern (s.bass))
+    {
+        renderBassPattern (r, root, lowestVoicingNote, previousBass, s, gate, swing);
+        return;
+    }
 
-    switch (mode)
+    switch (s.bass)
     {
         case BassMode::Root:
             r.emit (root, 0.0, heldLength (slotLength, gate), kBassChannel, 0, 0);
