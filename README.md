@@ -136,7 +136,8 @@ project, otherwise you'll hear the chords twice. Chordbloom shows a reminder aft
   parameters move by their normalised value, so in old projects they can land on other choices: re-draw such clips.
   An older Chordbloom build opening a newer project plays a bass pattern as *Pulse* and ignores the arp.
 - **Bass on / off**: the Bass tab's dot mutes the bass without changing its mode; the mode *Off* also silences it (old
-  automation keeps working). The Bass chip exports the bass even while it is muted, unless the mode is *Off*.
+  automation keeps working). The Bass chip exports the bass even while it is muted; with the mode *Off* it has
+  nothing to export unless you edited the bass (an edited bass exports your notes).
 - `ChordbloomDev demos <dir>` writes 36 multi-track listening demos (3 progressions x 4 styles x 3 seeds, 138 BPM) plus
   `report.txt` with melody statistics, for checking the generator by ear in FL.
 

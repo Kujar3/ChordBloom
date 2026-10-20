@@ -468,7 +468,9 @@ struct ExportPanel::Impl : public juce::Component,
 
         const juce::String noChords ("Add some chords to the progression first");
         const juce::String mutedHere (", muted in Chordbloom");
-        const bool bassOn = paramOn (cb::ParamIDs::bassOn, true);
+        // Audible bass (final-spec 2.3): bassOn and a mode other than Off. An edited bass with the mode Off is silent
+        // too, but still exports its custom notes, so its chip stays enabled with the muted note.
+        const bool bassAudible = processor.isLayerOn (cb::Layer::Bass);
         const bool arpOn = paramOn (cb::ParamIDs::arpOn, false);
         const bool bassEmpty = bassContentEmpty();
 
@@ -483,7 +485,7 @@ struct ExportPanel::Impl : public juce::Component,
             bass.setState (false, "Drag the bass (" + juce::String (processor.isLayerCustom (cb::Layer::Bass) ? "edited"
                                                         : cb::bassModeName ((cb::BassMode) juce::jlimit (0, cb::numBassModes - 1,
                                                             paramInt (cb::ParamIDs::bassMode, 1))))
-                                  + ", MIDI ch 2) into FL Studio" + (bassOn ? juce::String() : mutedHere));
+                                  + ", MIDI ch 2) into FL Studio" + (bassAudible ? juce::String() : mutedHere));
 
         melody.setState (false, ! hasChords ? noChords
                                             : (melodyReady ? juce::String ("Drag the melody (one loop, MIDI ch 3) into FL Studio")

@@ -649,6 +649,39 @@ void testRollToolbarLayout()
         }
     }
 
+    // The tab strip keeps its geometry when the tab changes (laid out from the width alone), at every budget width.
+    {
+        resetAll();
+        makeCustom (p, cb::Layer::Arp);
+        makeCustom (p, cb::Layer::Bass);
+
+        for (const int width : { 700, 750, 782, 800, 860, 918, 1000 })
+        {
+            tb.setSize (width, width < 900 ? 24 : 26);
+            std::array<juce::Rectangle<int>, 4> first {};
+            bool same = true;
+            std::string levels;
+
+            for (auto layer : { cb::Layer::Melody, cb::Layer::Arp, cb::Layer::Bass })
+            {
+                tb.setLayer (layer);
+                tb.refresh();
+                const std::array<juce::Rectangle<int>, 4> now { tb.getItemBounds (TI::Tabs), tb.getItemBounds (TI::TabMelody),
+                                                                tb.getItemBounds (TI::TabArp), tb.getItemBounds (TI::TabBass) };
+                levels += str (cb::layerName (layer), " L", tb.getLayoutLevel(), " ");
+
+                if (layer == cb::Layer::Melody)
+                    first = now;
+                else
+                    same = same && now == first;
+            }
+
+            check (same, str ("toolbar: switching tabs never moves the tabs (", width, " px, arp + bass custom)"), levels);
+        }
+
+        resetAll();
+    }
+
     // Wider is never worse; 1400 px is level 0 for every tab.
     {
         resetAll();
@@ -1159,6 +1192,28 @@ void testExportPanel()
     pumpMessages (120);
     check (tip (chip ("Bass")).contains ("Bass is Off") && ! p.writeMidiToTempFile (Part::Bass).existsAsFile(),
            "export: the Bass chip refuses with bassMode Off", tip (chip ("Bass")).toStdString());
+
+    // An edited bass with the mode Off is silent (2.3) but still exports its notes: enabled, tooltip says muted.
+    {
+        setParam (p, cb::ParamIDs::bassMode, 1.0f);
+        pumpMessages (60);
+        auto bass = p.getLayerNotes (cb::Layer::Bass);
+
+        if (! bass.notes.empty())
+            bass.notes.erase (bass.notes.begin());
+
+        p.setLayerNotes (cb::Layer::Bass, bass);
+        setParam (p, cb::ParamIDs::bassMode, 0.0f);
+        pumpMessages (120);
+        const auto t = tip (chip ("Bass"));
+        check (p.isLayerCustom (cb::Layer::Bass) && ! p.isLayerOn (cb::Layer::Bass) && chip ("Bass")->isEnabled()
+                   && t.contains ("edited") && t.contains (", muted in Chordbloom")
+                   && p.writeMidiToTempFile (Part::Bass).existsAsFile(),
+               "export: an edited bass with mode Off exports, and its tooltip says muted", t.toStdString());
+        p.resetLayer (cb::Layer::Bass);
+        setParam (p, cb::ParamIDs::bassMode, 0.0f);
+        pumpMessages (60);
+    }
 
     // Menus
     {

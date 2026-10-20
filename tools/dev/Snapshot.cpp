@@ -620,6 +620,92 @@ bool renderPhase2Snapshots (ChordbloomProcessor& processor, ChordbloomEditor& ed
         ok &= writeImage (sheet, outputDir.getChildFile ("14p_toolbar_and_save_menus.png"));
     }
 
+    // A standalone toolbar at the design widths (final-spec 7.1 / 7.2), each strip labelled with its width, tab and
+    // level: 14q the shrink levels (Melody, Arp custom, Bass custom at 918 / 782 / 750 / 700), 14r the off states at
+    // 782 (LED rings, bass Off in the browser, Generate disabled without chords).
+    {
+        RollToolbar strip (processor);
+        auto makeCustom = [&processor] (cb::Layer layer)
+        {
+            if (processor.isLayerCustom (layer))
+                return;
+
+            auto notes = processor.getLayerNotes (layer);
+
+            if (notes.notes.size() > 2)
+                notes.notes.erase (notes.notes.begin() + 1);
+
+            processor.setLayerNotes (layer, notes);
+        };
+
+        auto labelled = [&strip] (const juce::String& label)
+        {
+            const auto shot = strip.createComponentSnapshot (strip.getLocalBounds(), true, 2.0f);
+            const int labelW = 2 * 150;
+            juce::Image image (juce::Image::ARGB, labelW + shot.getWidth() + 40, shot.getHeight() + 20, true);
+            {
+                juce::Graphics g (image);   // scoped: the drawing is committed when the context ends
+                g.fillAll (cb::ui::Colours::panel.brighter (0.02f));
+                g.setColour (cb::ui::Colours::textDim);
+                g.setFont (cb::ui::font (22.0f));
+                g.drawText (label, juce::Rectangle<int> (16, 0, labelW - 24, image.getHeight()), juce::Justification::centredLeft, true);
+                g.drawImageAt (shot, labelW, 10);
+            }
+            return image;
+        };
+
+        auto row = [&] (cb::Layer layer, int width, const juce::String& what)
+        {
+            strip.setSize (width, width >= 900 ? 26 : 24);
+            strip.setLayer (layer);
+            pumpMessages (10);
+            strip.refresh();
+            const auto label = juce::String (width) + " px  " + what + "  L" + juce::String (strip.getLayoutLevel());
+            std::cout << "  strip " << label << "\n";
+            return labelled (label);
+        };
+
+        setParam (processor, cb::ParamIDs::arpOn, 1.0f);
+        setParam (processor, cb::ParamIDs::bassOn, 1.0f);
+        setParam (processor, cb::ParamIDs::bassMode, (float) cb::BassMode::Offbeat8);
+        settle (processor, editor);
+        makeCustom (cb::Layer::Arp);
+        makeCustom (cb::Layer::Bass);
+        settle (processor, editor);
+        std::vector<juce::Image> levels;
+
+        for (const int width : { 918, 782, 750, 700 })
+        {
+            levels.push_back (row (cb::Layer::Melody, width, "Melody"));
+            levels.push_back (row (cb::Layer::Arp, width, "Arp custom"));
+            levels.push_back (row (cb::Layer::Bass, width, "Bass custom"));
+        }
+
+        ok &= writeImage (stackImages (levels, 4), outputDir.getChildFile ("14q_roll_toolbar_levels_2x.png"));
+
+        // Off states at 782: auto layers, the arp and the bass muted, then bass mode Off, then no chords at all.
+        processor.resetLayer (cb::Layer::Arp);
+        processor.resetLayer (cb::Layer::Bass);
+        setParam (processor, cb::ParamIDs::arpOn, 0.0f);
+        setParam (processor, cb::ParamIDs::bassOn, 0.0f);
+        settle (processor, editor);
+        std::vector<juce::Image> states;
+        states.push_back (row (cb::Layer::Arp, 782, "Arp off"));
+        states.push_back (row (cb::Layer::Bass, 782, "Bass off (dot)"));
+        setParam (processor, cb::ParamIDs::bassOn, 1.0f);
+        setParam (processor, cb::ParamIDs::bassMode, 0.0f);
+        settle (processor, editor);
+        states.push_back (row (cb::Layer::Bass, 782, "Bass mode Off"));
+        const auto progression = processor.getProgression();
+        processor.setProgression (cb::Progression {});
+        settle (processor, editor);
+        states.push_back (row (cb::Layer::Melody, 782, "no chords"));
+        states.push_back (row (cb::Layer::Arp, 782, "Arp, no chords"));
+        ok &= writeImage (stackImages (states, 4), outputDir.getChildFile ("14r_roll_toolbar_off_states_782_2x.png"));
+        processor.setProgression (progression);
+        settle (processor, editor);
+    }
+
     // Back to the state the following checks expect: chords view, default size.
     resetLayers();
     editor.setMelodyViewVisible (false);

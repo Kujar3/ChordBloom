@@ -494,28 +494,26 @@ void drawPencilGlyph (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour 
     g.fillPath (body);
 }
 
+// An outline speaker with one slash through the whole glyph: legible at 8 px and 1x, like the header's sound-off icon.
 void drawMutedGlyph (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour colour)
 {
     const float s = juce::jmin (r.getWidth(), r.getHeight());
     const auto c = r.getCentre();
     juce::Path speaker;
-    speaker.startNewSubPath (c.x - s * 0.50f, c.y - s * 0.17f);
-    speaker.lineTo (c.x - s * 0.28f, c.y - s * 0.17f);
-    speaker.lineTo (c.x - s * 0.02f, c.y - s * 0.44f);
-    speaker.lineTo (c.x - s * 0.02f, c.y + s * 0.44f);
-    speaker.lineTo (c.x - s * 0.28f, c.y + s * 0.17f);
-    speaker.lineTo (c.x - s * 0.50f, c.y + s * 0.17f);
+    speaker.startNewSubPath (c.x - s * 0.36f, c.y - s * 0.16f);
+    speaker.lineTo (c.x - s * 0.12f, c.y - s * 0.16f);
+    speaker.lineTo (c.x + s * 0.20f, c.y - s * 0.42f);
+    speaker.lineTo (c.x + s * 0.20f, c.y + s * 0.42f);
+    speaker.lineTo (c.x - s * 0.12f, c.y + s * 0.16f);
+    speaker.lineTo (c.x - s * 0.36f, c.y + s * 0.16f);
     speaker.closeSubPath();
     g.setColour (colour);
-    g.fillPath (speaker);
+    g.strokePath (speaker, juce::PathStrokeType (1.0f, juce::PathStrokeType::mitered, juce::PathStrokeType::butt));
 
-    juce::Path cross;
-    const float x0 = c.x + s * 0.14f, x1 = c.x + s * 0.50f, y0 = c.y - s * 0.18f, y1 = c.y + s * 0.18f;
-    cross.startNewSubPath (x0, y0);
-    cross.lineTo (x1, y1);
-    cross.startNewSubPath (x1, y0);
-    cross.lineTo (x0, y1);
-    g.strokePath (cross, juce::PathStrokeType (1.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    juce::Path slash;
+    slash.startNewSubPath (c.x - s * 0.46f, c.y - s * 0.46f);
+    slash.lineTo (c.x + s * 0.46f, c.y + s * 0.46f);
+    g.strokePath (slash, juce::PathStrokeType (1.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
 }
 } // namespace
 
@@ -769,8 +767,9 @@ void ControlsPanel::paint (juce::Graphics& g)
         // Bass: a pencil while the bass layer is custom, a crossed speaker while bassOn is off.
         if (c.text == "Bass" && (d.bassEdited || d.bassMuted))
         {
-            // 7 px glyphs on an 8 px pitch: "Bass" + both glyphs fit the narrowest caption column (42 px).
-            const float glyphsW = (d.bassEdited ? 8.0f : 0.0f) + (d.bassMuted ? 8.0f : 0.0f);
+            // A 7 px pencil on an 8.5 px pitch and an 8 px speaker: "Bass" (about 25 px) + 2.5 + 8.5 + 8 fits the caption
+            // column (45 px at 960x560; clamped to its right edge below that).
+            const float glyphsW = (d.bassEdited ? 8.5f : 0.0f) + (d.bassMuted ? 8.0f : 0.0f);
             float x = juce::jmin ((float) c.area.getX() + cb::ui::textWidth (cb::ui::font (12.0f), c.text) + 2.5f,
                                   (float) c.area.getRight() - glyphsW - 1.0f);
             const float cy = (float) c.area.getCentreY();
@@ -778,11 +777,11 @@ void ControlsPanel::paint (juce::Graphics& g)
             if (d.bassEdited)
             {
                 drawPencilGlyph (g, { x, cy - 3.5f, 7.0f, 7.0f }, Col::textDim);
-                x += 8.0f;
+                x += 8.5f;
             }
 
             if (d.bassMuted)
-                drawMutedGlyph (g, { x, cy - 3.5f, 7.0f, 7.0f }, Col::subdominant.withAlpha (0.85f));
+                drawMutedGlyph (g, { x, cy - 4.0f, 8.0f, 8.0f }, Col::textDim);
         }
     }
 

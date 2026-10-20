@@ -750,7 +750,7 @@ struct RollToolbar::Impl final : public ToolbarHooks,
     juce::Rectangle<int>& at (Item i) { return bounds[(size_t) index (i)]; }
     const juce::Rectangle<int>& at (Item i) const { return bounds[(size_t) index (i)]; }
 
-    bool showsReset() const { return layer != cb::Layer::Melody && state.custom[(size_t) layer]; }
+    bool showsReset (cb::Layer l) const { return l != cb::Layer::Melody && state.custom[(size_t) l]; }
 
     State readState() const
     {
@@ -801,18 +801,20 @@ struct RollToolbar::Impl final : public ToolbarHooks,
         }
     };
 
-    Widths widthsFor (int lv) const
+    // Widths of level `lv` for the tab `l`; `compact` forces the compact tabs below level 3 (see layout()).
+    Widths widthsFor (int lv, cb::Layer l, bool compact) const
     {
         Widths w;
-        const auto& tabs = lv >= 3 ? tabCompact : tabFull;
-        w.tabs = (int) std::ceil (tabs[0] + tabs[1] + tabs[2]) + (lv >= 3 ? 2 : 4);
+        const bool small = compact || lv >= 3;
+        const auto& tabs = small ? tabCompact : tabFull;
+        w.tabs = (int) std::ceil (tabs[0] + tabs[1] + tabs[2]) + (small ? 2 : 4);
 
-        if (layer == cb::Layer::Melody)
+        if (l == cb::Layer::Melody)
             w.main = lv <= 3 ? generateBodyW + stylePartW : (lv == 4 ? generateBodyW + 26 : 64);
         else
             w.main = lv <= 2 ? 168 : 140;
 
-        w.reset = showsReset() ? (lv == 0 ? resetFullW : 30) : 0;
+        w.reset = showsReset (l) ? (lv == 0 ? resetFullW : 30) : 0;
         w.snapCap = lv <= 1 ? 36 : 0;
         w.gridCap = lv <= 1 ? 34 : 0;
         w.snap = lv <= 3 ? 144 : 120;
@@ -833,19 +835,30 @@ struct RollToolbar::Impl final : public ToolbarHooks,
         if (width <= 0 || h <= 0)
             return;
 
-        level = 5;
-
-        for (int lv = 0; lv <= 5; ++lv)
+        // The first level that fits wins.
+        const auto levelFor = [this, width] (cb::Layer l, bool compact)
         {
-            if (widthsFor (lv).total() <= width)
-            {
-                level = lv;
-                break;
-            }
-        }
+            for (int lv = 0; lv < 5; ++lv)
+                if (widthsFor (lv, l, compact).total() <= width)
+                    return lv;
 
-        const auto w = widthsFor (level);
-        compactTabs = level >= 3;
+            return 5;
+        };
+
+        // The tab strip is laid out from the width alone: compact as soon as any of the three tabs (in its current
+        // custom state) needs level 3 or more here, so switching tabs never moves the tabs under the mouse. Only the
+        // main control, Reset and the right group vary per tab. (Measured: the compact Arp / Bass tabs stay at their full
+        // 54 / 60 px, as the pencil needs 20 + text + 11 + 6, so a custom Arp / Bass at level 3 needs about 759 px.)
+        bool compact = false;
+
+        for (int i = 0; i < 3; ++i)
+            compact = compact || levelFor ((cb::Layer) i, false) >= 3;
+
+        // With the tabs compact a tab never takes level 0 or 1 (captions, 12 px gaps): keeps the level monotonic in the
+        // width when the compact flag drops off.
+        level = compact ? std::max (2, levelFor (layer, true)) : levelFor (layer, false);
+        const auto w = widthsFor (level, layer, compact);
+        compactTabs = compact;
         browserCompact = level >= 3;
         resetIconOnly = level >= 1;
         styleText = level <= 3;
@@ -1474,25 +1487,37 @@ struct RollToolbar::Impl final : public ToolbarHooks,
         const bool hotMenu = hoverItem == index (Item::GenerateMenu);
         const bool down = pressedItem == index (Item::Generate);
 
-        // Spark styling: raised surface with a mint tint and outline, the sparkle in mint.
+        // Spark styling: raised surface with a mint tint and outline, the sparkle in mint. Without chords only the body
+        // is disabled (the style menu still stores settings), so the tint and outline are dimmed in the body zone only
+        // and the two halves read as two states.
         g.setGradientFill (juce::ColourGradient::vertical (Col::panelRaised, r.getY(), Col::panelRaised.darker (0.08f), r.getBottom()));
         g.fillRoundedRectangle (r, radius);
-        g.setColour (Col::accent.withAlpha ((down ? 0.24f : (hotBody || hotMenu ? 0.17f : 0.10f)) * alpha));
-        g.fillRoundedRectangle (r, radius);
-
-        if (hotBody || hotMenu)
-        {
-            juce::Graphics::ScopedSaveState save (g);
-            juce::Path clip;
-            clip.addRoundedRectangle (r, radius);
-            g.reduceClipRegion (clip);
-            g.setColour (juce::Colours::white.withAlpha (0.05f));
-            g.fillRect (hotBody ? body : menuZone);
-        }
 
         const auto edge = Col::accent.withAlpha (hotBody || hotMenu ? 0.75f : 0.45f);
-        g.setColour (edge.withMultipliedAlpha (enabled ? 1.0f : 0.6f));
-        g.drawRoundedRectangle (r.reduced (0.5f), radius - 0.5f, 1.0f);
+        const float tint = down ? 0.24f : (hotBody || hotMenu ? 0.17f : 0.10f);
+
+        for (const bool bodyZone : { true, false })
+        {
+            juce::Graphics::ScopedSaveState save (g);
+            const auto zone = bodyZone ? body : menuZone;
+            const bool hot = bodyZone ? hotBody : hotMenu;
+            const float zoneAlpha = bodyZone ? alpha : 1.0f;
+            g.reduceClipRegion (zone.withY (r.getY() - 1.0f).withBottom (r.getBottom() + 1.0f).getSmallestIntegerContainer());
+            g.setColour (Col::accent.withAlpha (tint * zoneAlpha));
+            g.fillRoundedRectangle (r, radius);
+            g.setColour (edge.withMultipliedAlpha (bodyZone && ! enabled ? 0.6f : 1.0f));
+            g.drawRoundedRectangle (r.reduced (0.5f), radius - 0.5f, 1.0f);
+
+            if (hot)
+            {
+                juce::Path clip;
+                clip.addRoundedRectangle (r, radius);
+                g.reduceClipRegion (clip);
+                g.setColour (juce::Colours::white.withAlpha (0.05f));
+                g.fillRect (zone);
+            }
+        }
+
         g.setColour (edge.withMultipliedAlpha (0.6f));
         g.fillRect (juce::Rectangle<float> (menuZone.getX(), r.getY() + 5.0f, 1.0f, r.getHeight() - 10.0f));
 

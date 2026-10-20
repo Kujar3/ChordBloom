@@ -531,8 +531,9 @@ public:
             "(**7ths** for seventh chords).",
             "**Roll** (switch at the top right): the **Melody**, **Arp** and **Bass** layers over the chords. A tab's dot "
             "plays or mutes it; **Generate** writes a melody, the arrows browse arp and bass patterns. Edit a note and "
-            "the layer is edited (pencil); **Reset** follows the chords again. **Ctrl**+drag selects, **Shift**+drag "
-            "duplicates, **Alt** = no grid, right-click deletes."
+            "the layer is edited (pencil); **Reset** follows the chords again.",
+            "**Roll gestures**: **Ctrl** (Cmd on Mac)+drag selects, **Shift**+drag duplicates, **Alt** = no grid, "
+            "right-click deletes."
         };
 
         setSize (width > 0 ? width : kDefaultWidth, 100);
