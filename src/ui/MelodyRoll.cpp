@@ -351,66 +351,111 @@ struct MelodyRoll::Impl final : public juce::Component,
 
     //==============================================================================
     // Data
+    // Pulls everything from the processor. The surface is laid out and repainted only when something it shows
+    // changed: the layer serial also moves on parameter-only changes (a Swing or Gate knob drag, host automation),
+    // which must not repaint the whole roll at 30 Hz.
     void syncAll()
     {
+        const auto oldViews = views;
+        const auto oldLayer = layer;
+        const bool oldGhosts = showGhosts, oldVelLane = velLane;
+        const auto oldGhostSerial = ghostSerial;
         loadSettings();   // a loaded project state may bring other roll settings
-        progression = processor.getProgression();
-        key = processor.getKey();
-        total = progression.totalBeats();
 
-        slotNames.clear();
-        slotColours.clear();
+        auto newProgression = processor.getProgression();
+        const auto newKey = processor.getKey();
+        bool changed = ! synced || layer != oldLayer || showGhosts != oldGhosts || velLane != oldVelLane
+                    || ! (newProgression == progression) || ! (newKey == key);
 
-        for (const auto& slot : progression.slots)
+        for (size_t i = 0; i < views.size(); ++i)
+            changed = changed || views[i].snap != oldViews[i].snap || views[i].grid != oldViews[i].grid
+                   || views[i].top != oldViews[i].top;
+
+        if (! synced || ! (newProgression == progression) || ! (newKey == key))
         {
-            juce::String name;
-            try
+            progression = std::move (newProgression);
+            key = newKey;
+            total = progression.totalBeats();
+            slotNames.clear();
+            slotColours.clear();
+
+            for (const auto& slot : progression.slots)
             {
-                name = toJuce (slot.chord.name (key));
+                juce::String name;
+                try
+                {
+                    name = toJuce (slot.chord.name (key));
+                }
+                catch (...)
+                {
+                    name = "?";
+                }
+                slotNames.add (name);
+                slotColours.push_back (cb::ui::functionColour (functionOf (slot.chord, key)));
             }
-            catch (...)
-            {
-                name = "?";
-            }
-            slotNames.add (name);
-            slotColours.push_back (cb::ui::functionColour (functionOf (slot.chord, key)));
         }
 
-        syncLayers (true);
-        ghosts = processor.getGhostMelodies();
+        changed = syncLayers (true) || changed;
         ghostSerial = processor.getGhostSerial();
+
+        if (! synced || ghostSerial != oldGhostSerial)
+        {
+            ghosts = processor.getGhostMelodies();
+            changed = true;
+        }
+
+        synced = true;
         rollToolbar->setLayer (layer);
         rollToolbar->setSnap (view().snap);
         rollToolbar->setGrid (view().grid);
         rollToolbar->setVelocityLaneOn (velLane);
         rollToolbar->refresh();
+
+        if (! changed)
+            return;
+
         layout();
         repaint();
     }
 
     // Pulls every layer's notes and flags. clearOnChange: the selection goes when the current layer's notes changed
     // from outside a gesture (never in the middle of one: the gesture's working copy wins at mouse-up).
-    void syncLayers (bool clearOnChange)
+    // Returns true when anything the surface shows from the layers changed.
+    bool syncLayers (bool clearOnChange)
     {
         serial = processor.getLayerSerial();
+        bool changed = false;
 
         for (int i = 0; i < cb::numLayers; ++i)
         {
             auto notes = processor.getLayerNotes (kLayers[i]);
+            const bool on = processor.isLayerOn (kLayers[i]);
+            const bool custom = processor.isLayerCustom (kLayers[i]);
 
-            if (i == cur() && clearOnChange && ! inGridGesture() && notes != layerNotes[(size_t) i])
-                selection.clear();
+            if (notes != layerNotes[(size_t) i])
+            {
+                changed = true;
 
-            layerNotes[(size_t) i] = std::move (notes);
-            layerOn[(size_t) i] = processor.isLayerOn (kLayers[i]);
-            layerCustom[(size_t) i] = processor.isLayerCustom (kLayers[i]);
+                if (i == cur() && clearOnChange && ! inGridGesture())
+                    selection.clear();
+
+                layerNotes[(size_t) i] = std::move (notes);
+            }
+
+            changed = changed || on != layerOn[(size_t) i] || custom != layerCustom[(size_t) i];
+            layerOn[(size_t) i] = on;
+            layerCustom[(size_t) i] = custom;
         }
 
-        editedSlots = processor.getEditedSlots (layer);
-        editedSlots.resize (progression.slots.size(), false);
+        auto edited = processor.getEditedSlots (layer);
+        edited.resize (progression.slots.size(), false);
+        changed = changed || edited != editedSlots;
+        editedSlots = std::move (edited);
 
         if (! inGridGesture())
             selection = cb::validSelection (layerNotes[(size_t) cur()], selection);
+
+        return changed;
     }
 
     const cb::Melody& notes() const { return layerNotes[(size_t) cur()]; }
@@ -444,12 +489,15 @@ struct MelodyRoll::Impl final : public juce::Component,
     void commitEdit (const cb::Melody& edited, const std::vector<int>& editedSelection, const cb::Melody& before)
     {
         const auto wanted = notesAt (edited, editedSelection);
+        // Nothing to commit, but the layer's notes changed from outside meanwhile (undo, an automation re-render):
+        // the selection goes (2.2), as for a marquee, instead of landing on whatever the new notes hold there.
+        const bool changedOutside = edited == before && processor.getLayerNotes (layer) != before;
 
         if (edited != before)
             processor.setLayerNotes (layer, edited);
 
         syncLayers (false);
-        selection = cb::findNotes (notes(), wanted);
+        selection = changedOutside ? std::vector<int>() : cb::findNotes (notes(), wanted);
         rollToolbar->refresh();
         repaint();
     }
@@ -578,6 +626,12 @@ struct MelodyRoll::Impl final : public juce::Component,
     }
 
     juce::Rectangle<float> laneInner() const { return laneArea.reduced (0.0f, 4.0f); }
+    // A note's stalk in the velocity lane: at its start, kept 4 px inside the lane so a beat-0 dot draws whole.
+    float stalkX (const cb::MelodyNote& n) const
+    {
+        return juce::jlimit (laneArea.getX() + 4.0f, std::max (laneArea.getX() + 4.0f, laneArea.getRight() - 4.0f),
+                             std::round (beatToX (n.startBeat)) + 1.0f);
+    }
     float velocityToY (float v) const { const auto r = laneInner(); return r.getBottom() - v * r.getHeight(); }
     float yToVelocity (float y) const
     {
@@ -918,7 +972,11 @@ struct MelodyRoll::Impl final : public juce::Component,
             }
         }
 
-        for (int b = 1; b < visibleBeats; ++b)
+        // Long progressions: beat lines only while a beat is at least 7 px wide, below that bar lines only, and below
+        // 2.5 px per beat every 4th bar (no dense comb fighting with the notes).
+        const int lineEvery = pxPerBeat >= 7.0f ? 1 : (pxPerBeat >= 2.5f ? 4 : 16);
+
+        for (int b = lineEvery; b < visibleBeats; b += lineEvery)
         {
             const bool bar = b % 4 == 0;
             g.setColour (bar ? Col::textFaint.withAlpha (0.42f) : Col::outline.withAlpha (0.45f));
@@ -1077,17 +1135,65 @@ struct MelodyRoll::Impl final : public juce::Component,
         });
     }
 
+    // Narrow outlines (a dense layer over a long loop) that touch or overlap on the same row are merged into one run,
+    // painted once: stacked 45% outlines would otherwise add up to solid bars louder than the current layer.
     void paintOtherLayers (juce::Graphics& g) const
     {
-        forEachVisibleOtherLayerNote ([&] (cb::Layer l, const cb::MelodyNote& n)
+        constexpr float kNarrow = 6.0f;
+        std::array<juce::Rectangle<float>, 128> runs;
+        cb::Layer runLayer = cb::Layer::Melody;
+
+        auto paintOne = [&g] (cb::Layer l, juce::Rectangle<float> r)
         {
             const auto colour = cb::ui::layerColour (l);
-            const auto r = noteRect (n);
             g.setColour (colour.withAlpha (0.06f));
             g.fillRect (r);
             g.setColour (colour.withAlpha (0.45f));
             g.drawRect (r, 1.0f);
+        };
+
+        auto flushRuns = [&]
+        {
+            for (auto& run : runs)
+            {
+                if (! run.isEmpty())
+                    paintOne (runLayer, run);
+
+                run = {};
+            }
+        };
+
+        forEachVisibleOtherLayerNote ([&] (cb::Layer l, const cb::MelodyNote& n)
+        {
+            if (l != runLayer)
+            {
+                flushRuns();
+                runLayer = l;
+            }
+
+            const auto r = noteRect (n);
+
+            if (r.getWidth() >= kNarrow)
+            {
+                paintOne (l, r);
+                return;
+            }
+
+            auto& run = runs[(size_t) juce::jlimit (0, 127, n.note)];
+
+            if (! run.isEmpty() && r.getX() <= run.getRight() + 1.0f && r.getRight() >= run.getX() - 1.0f)
+            {
+                run = run.getUnion (r);
+                return;
+            }
+
+            if (! run.isEmpty())
+                paintOne (l, run);
+
+            run = r;
         });
+
+        flushRuns();
     }
 
     // Where a click would put a new note (hovering empty space).
@@ -1134,8 +1240,7 @@ struct MelodyRoll::Impl final : public juce::Component,
 
                 const bool parked = total <= 0 || n.startBeat >= (double) total;
                 const bool active = (inEditingGesture() && i == activeIndex) || (gesture == Gesture::none && i == hoverIndex);
-                const double end = std::min (n.startBeat + n.lengthBeats, (double) total);
-                const bool sounding = playing && on && ! parked && playBeat >= n.startBeat && playBeat < end;
+                const bool sounding = isSounding (n, playBeat);
                 const auto colour = noteColour (n);
                 const float alpha = (0.55f + 0.45f * n.velocity) * (parked ? 0.45f : 1.0f) * layerAlpha;
 
@@ -1166,8 +1271,12 @@ struct MelodyRoll::Impl final : public juce::Component,
 
                 if (selected)
                 {
+                    // A dark gap ring, then the accent ring outside it: reads on every function colour (the tonic
+                    // mint is close to the accent), not only by hue.
+                    g.setColour (Col::background.withAlpha (0.95f));
+                    g.drawRoundedRectangle (r.expanded (0.75f), 3.2f, 1.5f);
                     g.setColour (Col::accent);
-                    g.drawRoundedRectangle (r.expanded (0.3f), 2.8f, 1.6f);
+                    g.drawRoundedRectangle (r.expanded (2.25f), 4.5f, 1.5f);
                     g.setColour (juce::Colours::white.withAlpha (0.75f));
                     g.fillRect (juce::Rectangle<float> (r.getX() + 2.0f, r.getY() + 1.0f, std::max (0.0f, r.getWidth() - 4.0f), 1.0f));
                 }
@@ -1363,11 +1472,6 @@ struct MelodyRoll::Impl final : public juce::Component,
         g.setColour (Col::outline.withAlpha (0.55f));
         g.fillRect (juce::Rectangle<float> (area.getX() + 1.0f, std::round (velocityToY (0.5f)), area.getWidth() - 2.0f, 1.0f));
 
-        g.setFont (cb::ui::font (9.5f, 600).withExtraKerningFactor (0.08f));
-        g.setColour (Col::textFaint);
-        g.drawText ("VEL", juce::Rectangle<float> (area.getX() + 5.0f, area.getY() + 2.0f, 30.0f, 11.0f),
-                    juce::Justification::centredLeft, false);
-
         juce::Graphics::ScopedSaveState save (g);
         g.reduceClipRegion (area.toNearestInt());
 
@@ -1376,30 +1480,71 @@ struct MelodyRoll::Impl final : public juce::Component,
         const bool isAuto = isGenerated (layer) && ! layerCustom[(size_t) cur()];
         const float layerAlpha = (isAuto ? 0.7f : 1.0f) * (on ? 1.0f : 0.55f);
 
-        for (int pass = 0; pass < 2; ++pass)
+        // stalk == false: the dot only (redrawn over the label).
+        auto paintStalk = [&] (const cb::MelodyNote& n, bool selected, bool stalk)
         {
-            for (int i = 0; i < (int) m.notes.size(); ++i)
+            const float x = stalkX (n);
+            const float y = velocityToY (n.velocity);
+
+            if (selected)
             {
-                const auto& n = m.notes[(size_t) i];
-                const bool selected = isSelected (i);
+                // Wider stalk and a white-ringed dot: tells a selected stalk from a tonic chord tone's (mint).
+                if (stalk)
+                {
+                    g.setColour (Col::accent.withMultipliedAlpha (0.9f));
+                    g.fillRect (juce::Rectangle<float> (x - 1.5f, y, 3.0f, inner.getBottom() - y));
+                }
 
-                if (selected != (pass == 1) || n.startBeat >= (double) visibleBeats)
-                    continue;
+                g.setColour (Col::accent);
+                g.fillEllipse (juce::Rectangle<float> (7.0f, 7.0f).withCentre ({ x, y }));
+                g.setColour (juce::Colours::white.withAlpha (0.9f));
+                g.drawEllipse (juce::Rectangle<float> (7.0f, 7.0f).withCentre ({ x, y }), 1.5f);
+                return;
+            }
 
-                const float x = std::round (beatToX (n.startBeat)) + 1.0f;
-                const float y = velocityToY (n.velocity);
-                const auto colour = selected ? Col::accent : noteColour (n).withMultipliedAlpha (layerAlpha);
+            const auto colour = noteColour (n).withMultipliedAlpha (layerAlpha);
+
+            if (stalk)
+            {
                 g.setColour (colour.withMultipliedAlpha (0.85f));
                 g.fillRect (juce::Rectangle<float> (x - 1.0f, y, 2.0f, inner.getBottom() - y));
-                g.setColour (colour);
-                g.fillEllipse (juce::Rectangle<float> (5.0f, 5.0f).withCentre ({ x, y }));
             }
+
+            g.setColour (colour);
+            g.fillEllipse (juce::Rectangle<float> (5.0f, 5.0f).withCentre ({ x, y }));
+        };
+
+        for (int pass = 0; pass < 2; ++pass)
+            for (int i = 0; i < (int) m.notes.size(); ++i)
+                if (const bool selected = isSelected (i); selected == (pass == 1) && m.notes[(size_t) i].startBeat < (double) visibleBeats)
+                    paintStalk (m.notes[(size_t) i], selected, true);
+
+        // The label last, on a small backing, so dense layers never cover it; it starts right of the beat-0 stalk,
+        // and a few dots under it (sparse notes) are drawn again on top, so they are never hidden either.
+        {
+            const auto labelFont = cb::ui::font (9.5f, 600).withExtraKerningFactor (0.08f);
+            const auto label = juce::Rectangle<float> (area.getX() + 8.0f, area.getY() + 2.0f, widthOf (labelFont, "VEL") + 6.0f, 11.0f);
+            g.setColour (Col::background.darker (0.06f).withAlpha (0.85f));
+            g.fillRoundedRectangle (label, 3.0f);
+            g.setFont (labelFont);
+            g.setColour (Col::textFaint);
+            g.drawText ("VEL", label.withTrimmedLeft (2.0f), juce::Justification::centredLeft, false);
+
+            std::vector<int> under;
+
+            for (int i = 0; i < (int) m.notes.size() && under.size() <= 2; ++i)
+                if (label.expanded (4.0f).contains (stalkX (m.notes[(size_t) i]), velocityToY (m.notes[(size_t) i].velocity)))
+                    under.push_back (i);
+
+            if (under.size() <= 2)
+                for (int i : under)
+                    paintStalk (m.notes[(size_t) i], isSelected (i), false);
         }
 
         if (gesture == Gesture::velocity && activeIndex >= 0 && activeIndex < (int) m.notes.size())
         {
             const auto& n = m.notes[(size_t) activeIndex];
-            const float x = std::round (beatToX (n.startBeat)) + 1.0f;
+            const float x = stalkX (n);
             const auto text = juce::String (juce::jlimit (1, 127, juce::roundToInt (n.velocity * 127.0f)));
             const auto f = cb::ui::font (10.5f, 600);
             const float w = widthOf (f, text) + 10.0f;
@@ -1583,13 +1728,26 @@ struct MelodyRoll::Impl final : public juce::Component,
         workingSel = selection;
     }
 
+    // Adding `adding` notes would pass the layer's note cap (sanitising would then silently evict other notes):
+    // refused with a hint.
+    bool wouldExceedCap (int adding) const { return (int) notes().notes.size() + adding > limits().maxNotes; }
+
+    bool refuseOverCap (int adding)
+    {
+        if (! wouldExceedCap (adding))
+            return false;
+
+        showHint (layerTitle (layer) + " is full (" + juce::String (limits().maxNotes) + " notes)");
+        return true;
+    }
+
+    // 1 = the selection pill, 2 = the off pill. The transient hint has no action: clicks pass through it to the grid.
     int pillAt (juce::Point<float> pos) const
     {
         const auto p = pills();
 
         if (p.selection.contains (pos)) return 1;
         if (p.off.contains (pos))       return 2;
-        if (p.hint.contains (pos))      return 3;
         return 0;
     }
 
@@ -1605,7 +1763,7 @@ struct MelodyRoll::Impl final : public juce::Component,
         for (int i = 0; i < (int) m.notes.size(); ++i)
         {
             const auto& n = m.notes[(size_t) i];
-            const float x = std::round (beatToX (n.startBeat)) + 1.0f;
+            const float x = stalkX (n);
 
             if (std::abs (x - pos.x) <= kStalkReach)
             {
@@ -1736,8 +1894,16 @@ struct MelodyRoll::Impl final : public juce::Component,
 
             if (e.mods.isShiftDown())
             {
+                const auto toCopy = wasSelected ? selection : std::vector<int> { hit.index };
+
+                if (refuseOverCap ((int) toCopy.size()))
+                {
+                    gesture = Gesture::swallow;
+                    return;
+                }
+
                 startGridGesture (Gesture::duplicate);
-                group = wasSelected ? selection : std::vector<int> { hit.index };
+                group = toCopy;
                 duplicateSelects = wasSelected;
                 anchorNote = base.notes[(size_t) hit.index];
                 activeIndex = -1;
@@ -1778,6 +1944,12 @@ struct MelodyRoll::Impl final : public juce::Component,
         }
         else if (auto n = noteToDraw (pos, fine))
         {
+            if (refuseOverCap (1))
+            {
+                gesture = Gesture::swallow;
+                return;
+            }
+
             startGridGesture (Gesture::move);
             auto drawn = base;
             drawn.notes.push_back (*n);
@@ -1899,9 +2071,54 @@ struct MelodyRoll::Impl final : public juce::Component,
     void dragResize (juce::Point<float> pos, bool fine)
     {
         const double anchorEnd = anchorNote.startBeat + anchorNote.lengthBeats;
-        const double newEnd = std::abs (pos.x - downPos.x) < 1.0f ? anchorEnd : gridBeat (xToBeat (pos.x), fine, true);
-        const double minLength = fine ? cb::kMinMelodyNoteBeats : std::max (gridStep(), cb::kMinMelodyNoteBeats);
-        const auto r = cb::resizeNotes (base, group, newEnd - anchorEnd, minLength, limits());
+        const double pressEnd = gridBeat (xToBeat (downPos.x), fine, true);
+        const double mouseEnd = gridBeat (xToBeat (pos.x), fine, true);
+
+        // Until the mouse reaches another grid line than the one nearest to the press (jitter, a vertical wobble,
+        // or dragged back), nothing changes: no note gets lengthened to the minimum, so the click commits nothing.
+        if (std::abs (pos.x - downPos.x) < 1.0f || std::abs (mouseEnd - pressEnd) < 1.0e-9)
+        {
+            if (working != base)
+            {
+                working = base;
+                workingSel = groupSelected ? selection : std::vector<int>();
+                const auto found = cb::findNotes (working, { anchorNote });
+                activeIndex = found.empty() ? -1 : found.front();
+                repaint();
+            }
+            return;
+        }
+
+        // At least one grid step (Alt: one tick), but notes that are already shorter than that (a 1/16 arp at gate
+        // 0.9 on the 1/16 grid) are never lengthened by the clamp: they are resized in a second pass whose minimum
+        // is the shortest of them. Resizing keeps every (pitch, start), so the notes are found again by those.
+        const double delta = mouseEnd - anchorEnd;
+        const double gridMin = fine ? cb::kMinMelodyNoteBeats : std::max (gridStep(), cb::kMinMelodyNoteBeats);
+        std::vector<cb::MelodyNote> longOnes, shortOnes;
+        double shortest = gridMin;
+
+        for (int i : cb::validSelection (base, group))
+        {
+            const auto& n = base.notes[(size_t) i];
+
+            if (n.lengthBeats < gridMin - 1.0e-9)
+            {
+                shortOnes.push_back (n);
+                shortest = std::min (shortest, n.lengthBeats);
+            }
+            else
+            {
+                longOnes.push_back (n);
+            }
+        }
+
+        auto r = cb::resizeNotes (base, cb::findNotes (base, longOnes), delta, gridMin, limits());
+
+        if (! shortOnes.empty())
+            r = cb::resizeNotes (r.notes, cb::findNotes (r.notes, shortOnes), delta,
+                                 std::max (cb::kMinMelodyNoteBeats, shortest), limits());
+
+        r.selection = cb::findNotes (r.notes, notesAt (base, group));
 
         if (r.notes == working)
             return;
@@ -1917,14 +2134,31 @@ struct MelodyRoll::Impl final : public juce::Component,
     {
         const auto [delta, rows] = clampGroupDelta (base, group, roundDelta (xToBeat (pos.x) - xToBeat (downPos.x), fine),
                                                     yToNote (pos.y) - yToNote (downPos.y));
-        cb::NoteEditResult r { base, {} };
+        // Back where it started: nothing changes and the selection stays as it was at mouse-down.
+        cb::NoteEditResult r { base, selection };
 
         if (delta != 0.0 || rows != 0)
         {
-            r = cb::duplicateNotes (base, group, delta, limits());
+            // The copies are shifted on their own and only merged at the end: a straight vertical drag (delta 0)
+            // must not let a copy collapse into its original before it is moved.
+            cb::Melody copies;
+
+            for (int i : cb::validSelection (base, group))
+            {
+                auto c = base.notes[(size_t) i];
+                c.startBeat += delta;
+                copies.notes.push_back (c);
+            }
+
+            copies = cb::sanitiseMelody (copies, limits());
 
             if (rows != 0)
-                r = cb::moveNotes (r.notes, r.selection, 0.0, rows, editContext());
+                copies = cb::moveNotes (copies, cb::allNoteIndices (copies), 0.0, rows, editContext()).notes;
+
+            auto merged = base;
+            merged.notes.insert (merged.notes.end(), copies.notes.begin(), copies.notes.end());
+            r.notes = cb::sanitiseMelody (merged, limits());
+            r.selection = cb::findNotes (r.notes, copies.notes);
         }
 
         if (r.notes == working && r.selection == workingSel)
@@ -2005,7 +2239,8 @@ struct MelodyRoll::Impl final : public juce::Component,
             }
 
             case Gesture::duplicate:
-                commitEdit (working, duplicateSelects ? workingSel : std::vector<int>(), snapshot);
+                // A cancelled duplicate (dragged back) keeps the selection exactly as it was.
+                commitEdit (working, working == base ? selection : (duplicateSelects ? workingSel : std::vector<int>()), snapshot);
                 break;
 
             case Gesture::velocity:
@@ -2350,7 +2585,8 @@ struct MelodyRoll::Impl final : public juce::Component,
             case Command::Paste:
             case Command::PasteHere:
             {
-                if (clipboard().empty() || (command == Command::PasteHere && atBeat < 0.0))
+                if (clipboard().empty() || (command == Command::PasteHere && atBeat < 0.0)
+                    || wouldExceedCap ((int) clipboard().notes.notes.size()))
                     return false;
 
                 const double at = command == Command::Paste ? clipboard().sourceBeat
@@ -2361,7 +2597,7 @@ struct MelodyRoll::Impl final : public juce::Component,
             }
 
             case Command::Duplicate:
-                if (targets.empty())
+                if (targets.empty() || wouldExceedCap ((int) targets.size()))
                     return false;
                 r = cb::duplicateNotes (m, targets, cb::defaultDuplicateOffset (m, targets, grid), lim);
                 keepSelection = false;   // the copies become the selection
@@ -2567,14 +2803,85 @@ struct MelodyRoll::Impl final : public juce::Component,
         return menu;
     }
 
-    void menuChosen (int result, cb::Layer target, double atBeat)
+    // What a menu showed when it opened: its item is resolved later (async), when the layer's notes may have changed
+    // (an automation re-render clears the selection), so a note command must not fall back to every note.
+    struct MenuScope
+    {
+        cb::Layer layer = cb::Layer::Melody;
+        bool hadSelection = false;
+        std::vector<cb::MelodyNote> selected;
+    };
+
+    static bool actsOnSelection (Command c)
+    {
+        switch (c)
+        {
+            case Command::SelectNone: case Command::Copy: case Command::Cut: case Command::Duplicate: case Command::Delete:
+            case Command::Quantize: case Command::Legato:
+            case Command::VelocitySoft: case Command::VelocityMedium: case Command::VelocityDefault: case Command::VelocityHard:
+            case Command::VelocityUp: case Command::VelocityDown:
+            case Command::StepUp: case Command::StepDown: case Command::SemitoneUp: case Command::SemitoneDown:
+            case Command::OctaveUp: case Command::OctaveDown:
+                return true;
+
+            case Command::SelectAll: case Command::Paste: case Command::PasteHere:
+            case Command::ResetLayer: case Command::ResetChord: case Command::ClearMelody: case Command::ToggleLayerOn:
+            case Command::ToggleVelocityLane: case Command::ToggleOtherLayers:
+            default:
+                return false;
+        }
+    }
+
+    void menuChosen (int result, cb::Layer target, double atBeat, const MenuScope& scope)
     {
         if (result >= kSnapIdBase && result < kSnapIdBase + cb::numMelodySnapModes)
+        {
             setSnap ((cb::MelodySnap) (result - kSnapIdBase));
-        else if (result >= kGridIdBase && result < kGridIdBase + cb::numRateDivisions)
+            return;
+        }
+
+        if (result >= kGridIdBase && result < kGridIdBase + cb::numRateDivisions)
+        {
             setGrid ((cb::RateDivision) (result - kGridIdBase));
-        else if (result >= kCommandIdBase && result < kCommandIdBase + kNumCommands)
-            perform (target, (Command) (result - kCommandIdBase), atBeat, false);
+            return;
+        }
+
+        if (result < kCommandIdBase || result >= kCommandIdBase + kNumCommands)
+            return;
+
+        const auto command = (Command) (result - kCommandIdBase);
+
+        if (actsOnSelection (command))
+        {
+            dropGesture();
+            syncLayers (true);
+
+            if (layer != scope.layer)
+                return;
+
+            if (scope.hadSelection)
+            {
+                // Act on exactly the notes the menu was opened for, found again by (pitch, start); refused when
+                // any of them is gone.
+                const auto found = cb::findNotes (notes(), scope.selected);
+
+                if (found.size() != scope.selected.size())
+                {
+                    selection.clear();
+                    showHint ("The notes changed: select them again");
+                    repaint();
+                    return;
+                }
+
+                selection = found;
+            }
+            else
+            {
+                selection.clear();   // the menu offered "All notes"
+            }
+        }
+
+        perform (target, command, atBeat, false);
     }
 
     void showMenu (MenuSection section, double atBeat, std::optional<cb::Layer> forLayer, juce::Rectangle<int> screenArea)
@@ -2584,19 +2891,53 @@ struct MelodyRoll::Impl final : public juce::Component,
         auto menu = createMenu (section, atBeat, target);
         lastMenu = section;
 
+        MenuScope scope;
+        scope.layer = layer;
+        scope.selected = notesAt (notes(), selection);
+        scope.hadSelection = ! scope.selected.empty();
+
         if (screenArea.isEmpty())
             screenArea = { juce::Desktop::getMousePosition(), juce::Point<int> (1, 1) + juce::Desktop::getMousePosition() };
 
         juce::Component::SafePointer<Impl> safe (this);
         menu.showMenuAsync (juce::PopupMenu::Options().withTargetScreenArea (screenArea),
-                            [safe, target, atBeat] (int result)
+                            [safe, target, atBeat, scope] (int result)
                             {
                                 if (safe != nullptr && result != 0)
-                                    safe->menuChosen (result, target, atBeat);
+                                    safe->menuChosen (result, target, atBeat, scope);
                             });
     }
 
     //==============================================================================
+    // Playback display
+    bool isSounding (const cb::MelodyNote& n, double atBeat) const
+    {
+        if (! playing || ! layerOn[(size_t) cur()] || total <= 0 || n.startBeat >= (double) total)
+            return false;
+
+        return atBeat >= n.startBeat && atBeat < std::min (n.startBeat + n.lengthBeats, (double) total);
+    }
+
+    void repaintPlayheadColumn (double beat)
+    {
+        const float x = beatToX (beat);
+        repaint (juce::Rectangle<float> (x - 6.0f, stripArea.getY() - 1.0f, 12.0f, gridArea.getBottom() - stripArea.getY() + 2.0f)
+                     .getSmallestIntegerContainer());
+    }
+
+    void repaintSoundingChanges (double from, double to)
+    {
+        const int hi = topNote(), lo = lowestPaintedRow();
+
+        for (const auto& n : shown().notes)
+        {
+            if (n.note < lo || n.note > hi || isSounding (n, from) == isSounding (n, to))
+                continue;
+
+            repaint (noteRect (n).expanded (3.0f).getIntersection (gridArea).getSmallestIntegerContainer());
+        }
+    }
+
     void timerCallback() override
     {
         if (! isVisible())
@@ -2605,11 +2946,21 @@ struct MelodyRoll::Impl final : public juce::Component,
         const bool playingNow = processor.getPlayingSlot() >= 0;
         const double beat = playingNow ? processor.getPlaybackBeat() : 0.0;
 
-        if (playingNow != playing || (playingNow && std::abs (beat - playBeat) > 1.0e-4))
+        if (playingNow != playing)
         {
             playing = playingNow;
             playBeat = beat;
-            repaint (stripArea.getUnion (gridArea).getUnion (laneArea).expanded (4.0f).getSmallestIntegerContainer());
+            repaint (stripArea.getUnion (gridArea).expanded (4.0f).getSmallestIntegerContainer());
+        }
+        else if (playingNow && std::abs (beat - playBeat) > 1.0e-4)
+        {
+            // Only the old and new playhead columns and the notes that started or stopped sounding (the velocity
+            // lane shows neither).
+            const double old = playBeat;
+            playBeat = beat;
+            repaintPlayheadColumn (old);
+            repaintPlayheadColumn (beat);
+            repaintSoundingChanges (old, beat);
         }
 
         if (const auto s = processor.getGhostSerial(); s != ghostSerial)
@@ -2648,6 +2999,7 @@ struct MelodyRoll::Impl final : public juce::Component,
     std::array<bool, (size_t) cb::numLayers> layerOn {}, layerCustom {};
     std::vector<bool> editedSlots;
     uint64_t serial = 0;
+    bool synced = false;          // syncAll ran once (the cached data below is valid)
     juce::StringArray slotNames;
     std::vector<juce::Colour> slotColours;
     std::vector<ChordbloomProcessor::GhostMelody> ghosts;

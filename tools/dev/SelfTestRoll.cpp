@@ -1,5 +1,7 @@
 #include "SelfTestUtil.h"
 
+#include <typeinfo>
+
 // Roll selftests (owner: WP5; final-spec 8.2 / 9 WP5): the roll canvas, layers, selection, commands, velocity lane.
 // Registered in runSelfTest (SelfTest.cpp) by WP0.
 
@@ -1288,6 +1290,252 @@ void testRollPaintPerformance()
     check (undoDepth (p) == depth + 1 && p.getLayerNotes (Layer::Arp).notes.size() == 2048,
            "roll2: a drag in the dense arp is one undo step and keeps every note");
 }
+
+//==============================================================================
+// Review fixes: vertical Shift+drag duplicates, edge-click jitter, cancelled duplicates, outside changes during a
+// no-op gesture, the note cap, clicks through the hint pill, and async menus acting on the notes they showed.
+bool hasNote (const cb::Melody& m, int note, double start)
+{
+    for (auto& n : m.notes)
+        if (n.note == note && std::abs (n.startBeat - start) < 1e-9)
+            return true;
+    return false;
+}
+
+int indexOfNote (const cb::Melody& m, int note, double start)
+{
+    for (int i = 0; i < (int) m.notes.size(); ++i)
+        if (m.notes[(size_t) i].note == note && std::abs (m.notes[(size_t) i].startBeat - start) < 1e-9)
+            return i;
+    return -1;
+}
+
+// The open PopupMenu window (async menus are resolved by its key handling: down arrow + return pick the first item).
+juce::Component* openMenuWindow()
+{
+    auto& desktop = juce::Desktop::getInstance();
+
+    for (int i = desktop.getNumComponents(); --i >= 0;)
+        if (auto* c = desktop.getComponent (i))
+            if (juce::String (typeid (*c).name()).contains ("MenuWindow") && c->isVisible())
+                return c;
+
+    return nullptr;
+}
+
+void testRollReviewFixes()
+{
+    RollRig rig;
+    if (! rig.ok())
+        return;
+
+    auto& roll = *rig.roll;
+    auto& p = rig.p;
+    roll.setSnap (cb::MelodySnap::Off);
+    roll.setGrid (cb::RateDivision::Eighth);
+    p.setMelody (fourNotes());
+    pumpMessages (40);
+    roll.setTopNote (75);
+    auto melody = [&p] { return p.getMelody(); };
+    const float fourRows = roll.getCellCentre (0.0, 60).y - roll.getCellCentre (0.0, 64).y;
+
+    // Shift+drag straight up (same beat): a copy four rows above, the original stays
+    {
+        roll.setSelection ({});
+        const int depth = undoDepth (p);
+        const auto from = rig.noteBody (0);
+        rig.drag (from, from.translated (0.0f, -fourRows), kShift);
+        const auto m = melody();
+        check (m.notes.size() == 5 && hasNote (m, 60, 0.0) && hasNote (m, 64, 0.0) && undoDepth (p) == depth + 1
+                   && roll.getSelection().empty(),
+               "roll3: Shift+drag straight up duplicates an unselected note (the original stays, nothing selected)",
+               layerText (m) + selText (roll.getSelection()));
+    }
+    {
+        p.setMelody (fourNotes());
+        pumpMessages (30);
+        roll.setSelection ({ 1 });   // 64 @ 2
+        const auto from = rig.noteBody (1);
+        rig.drag (from, from.translated (0.0f, -fourRows), kShift);
+        const auto m = melody();
+        const int copy = indexOfNote (m, 68, 2.0);
+        check (m.notes.size() == 5 && hasNote (m, 64, 2.0) && copy >= 0 && roll.getSelection() == std::vector<int> { copy },
+               "roll3: Shift+drag straight up of a selected note: the original stays, the copy is selected",
+               layerText (m) + selText (roll.getSelection()));
+    }
+
+    // A Shift+drag that ends where it started (dragged back, or jitter below half a grid step) keeps the selection
+    {
+        p.setMelody (fourNotes());
+        pumpMessages (30);
+        roll.setSelection ({ 1, 2 });
+        const int depth = undoDepth (p);
+        const auto from = rig.noteBody (1);
+        rig.down (from, kShift);
+        rig.move (from + (rig.cell (4.0, 64) - rig.cell (2.0, 64)), kShift);
+        rig.move (from.translated (1.5f, 1.0f), kShift);
+        rig.up (from.translated (1.5f, 1.0f), kShift);
+        check (melody() == fourNotes() && undoDepth (p) == depth && roll.getSelection() == std::vector<int> { 1, 2 },
+               "roll3: a cancelled Shift+drag changes nothing and keeps the selection", selText (roll.getSelection()));
+    }
+
+    // An outside change during a no-op press (here: the melody replaced) clears the selection at mouse-up
+    {
+        p.setMelody (fourNotes());
+        pumpMessages (30);
+        roll.setSelection ({ 1, 2 });
+        const auto replaced = makeMelody ({ melodyNote (64, 2.0, 1.0), melodyNote (67, 4.0, 1.0), melodyNote (71, 6.0, 1.0) });
+        const auto at = rig.noteBody (1);
+        rig.down (at, kLeft);
+        p.setMelody (replaced);
+        pumpMessages (60);
+        rig.up (at, kLeft);
+        check (melody() == replaced && roll.getSelection().empty(),
+               "roll3: a no-op press during which the notes changed from outside commits nothing and clears the selection",
+               layerText (melody()) + selText (roll.getSelection()));
+    }
+
+    // Clicks pass through the transient hint pill (it has no action): a right-click under it deletes the note
+    {
+        const int top = roll.getTopNote();
+        p.setMelody (makeMelody ({ melodyNote (top, 15.0, 0.75) }));
+        pumpMessages (30);
+        roll.setSelection ({});
+        roll.getToolbar().onHint ("A long transient hint over the top right corner of the grid, for the test");
+        rig.click (rig.noteBody (0), kRight);
+        check (melody().empty(), "roll3: a right-click on a note under the hint pill deletes it", layerText (melody()));
+    }
+
+    // At the note cap nothing is evicted: drawing, Shift+drag, Duplicate and Paste are refused
+    {
+        cb::Melody full;
+        for (int i = 0; i < 512; ++i)
+            full.notes.push_back (melodyNote (64 + i % 8, i * 0.125, 0.125));
+        p.setMelody (full);
+        pumpMessages (30);
+        roll.setTopNote (80);
+        roll.setSelection ({});
+        const auto atCap = melody();
+        const int depth = undoDepth (p);
+        rig.click (rig.cell (3.3, 77), kLeft);
+        rig.drag (rig.noteBody (0), rig.noteBody (0) + (rig.cell (2.0, 64) - rig.cell (0.0, 64)), kShift);
+        roll.setSelection ({ 0 });
+        const bool dup = roll.performCommand (Command::Duplicate);
+        const bool copied = roll.performCommand (Command::Copy);
+        const bool pasted = roll.performCommand (Command::Paste);
+        const auto menu = menuEntries (roll.createMenu (Section::Selection));
+        const auto* dupItem = findEntry (menu, "Duplicate");
+        const auto* pasteItem = findEntry (menu, "Paste");
+        check (atCap.notes.size() == 512 && melody() == atCap && undoDepth (p) == depth && ! dup && copied && ! pasted
+                   && dupItem != nullptr && ! dupItem->enabled && pasteItem != nullptr && ! pasteItem->enabled,
+               "roll3: a full melody (512 notes) refuses draw, Shift+drag, Duplicate and Paste instead of evicting notes",
+               str (melody().notes.size(), " dup ", dup, " paste ", pasted));
+        roll.setSelection ({});
+        roll.setTopNote (75);
+    }
+
+    // Async menus: the command acts on the notes the menu was opened for, never on every note of the layer
+    {
+        roll.setVelocityLaneVisible (true);
+        pumpMessages (20);
+        auto chooseFirstItem = [&] (const cb::Melody& changeTo)
+        {
+            const auto lane = roll.getVelocityLaneArea();
+            // The window opens synchronously; it is driven at once (a menu of a background process may be dismissed
+            // by its own timer). The outside change lands before the item is resolved, as an automation re-render
+            // while the menu is open would; resolving it re-syncs the layer, which used to clear the selection.
+            rig.click ({ lane.getRight() - 30.0f, lane.getCentreY() }, kRight);   // the Velocity section, "Soft 40%" first
+            juce::Component::SafePointer<juce::Component> window (openMenuWindow());
+
+            if (window == nullptr)
+                return false;
+
+            p.setMelody (changeTo);
+            window->keyPressed (juce::KeyPress (juce::KeyPress::downKey));
+
+            if (window != nullptr)
+                window->keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
+
+            pumpMessages (40);
+            return true;
+        };
+
+        // Velocity 0.5 everywhere: whichever velocity item the menu highlights first, it changes the notes it acts on.
+        auto atHalf = [] (cb::Melody m)
+        {
+            for (auto& n : m.notes)
+                n.velocity = 0.5f;
+            return m;
+        };
+
+        p.setMelody (atHalf (fourNotes()));
+        pumpMessages (30);
+        roll.setSelection ({ 1, 2 });
+        const auto gone = atHalf (makeMelody ({ melodyNote (60, 0.0, 1.0), melodyNote (65, 2.0, 1.0), melodyNote (72, 8.0, 1.0) }));
+        const bool shown1 = chooseFirstItem (gone);
+        check (shown1 && melody() == gone && roll.getSelection().empty(),
+               "roll3: a menu command whose selected notes are gone is refused (it does not act on every note)",
+               str (shown1, " ", layerText (melody())));
+
+        p.setMelody (atHalf (fourNotes()));
+        pumpMessages (30);
+        roll.setSelection ({ 1, 2 });
+        auto added = fourNotes();
+        added.notes.push_back (melodyNote (70, 12.0, 1.0));
+        const bool shown2 = chooseFirstItem (atHalf (added));
+        const auto m = melody();
+        bool onlyThose = m.notes.size() == 5;
+        for (auto& n : m.notes)
+            onlyThose = onlyThose && (std::abs (n.velocity - 0.5f) > 1e-6f) == ((n.note == 64 && n.startBeat == 2.0) || (n.note == 67 && n.startBeat == 4.0));
+        check (shown2 && onlyThose, "roll3: a menu command acts on the notes the menu showed, found again after an outside change",
+               str (shown2, " ", layerText (m)));
+        juce::PopupMenu::dismissAllActiveMenus();
+        roll.setVelocityLaneVisible (false);
+        pumpMessages (20);
+    }
+
+    // Edge-click jitter on the auto arp (1/16 notes at gate 0.9 on the 1/16 grid) commits nothing
+    {
+        roll.setLayer (Layer::Arp);
+        pumpMessages (60);
+        const auto arp = p.getLayerNotes (Layer::Arp);
+        int index = -1;
+        for (int i = 0; i < (int) arp.notes.size() && index < 0; ++i)
+        {
+            const auto& n = arp.notes[(size_t) i];
+            if (n.lengthBeats < 0.25 - 1e-9 && n.note > roll.getBottomNote() && n.note < roll.getTopNote() && n.startBeat < 12.0)
+                index = i;
+        }
+
+        if (index >= 0 && roll.getGrid() == cb::RateDivision::Sixteenth)
+        {
+            const int depth = undoDepth (p);
+            const auto e = rig.noteEdge (index);
+            rig.down (e, kLeft);
+            rig.move (e.translated (0.0f, 2.0f), kLeft);
+            rig.move (e.translated (1.0f, 2.0f), kLeft);
+            rig.up (e.translated (1.0f, 2.0f), kLeft);
+            check (! p.isLayerCustom (Layer::Arp) && undoDepth (p) == depth && p.getLayerNotes (Layer::Arp) == arp,
+                   "roll3: a shaky click on a short auto arp note's edge commits nothing (the arp stays auto)",
+                   str (p.isLayerCustom (Layer::Arp), " ", undoDepth (p) - depth));
+
+            // A real resize by one grid step still works
+            const auto grabbed = arp.notes[(size_t) index];
+            const auto e2 = rig.noteEdge (index);
+            rig.drag (e2, e2 + (rig.cell (grabbed.startBeat + 0.5, grabbed.note) - rig.cell (grabbed.startBeat + 0.25, grabbed.note)), kLeft);
+            const auto now = p.getLayerNotes (Layer::Arp);
+            const int at = indexOfNote (now, grabbed.note, grabbed.startBeat);
+            check (p.isLayerCustom (Layer::Arp) && at >= 0 && std::abs (now.notes[(size_t) at].lengthBeats - 0.5) < 1e-9,
+                   "roll3: dragging a short note's edge one grid step on resizes it to the grid", layerText (now));
+            p.resetLayer (Layer::Arp);
+        }
+        else
+        {
+            check (false, "roll3: a short auto arp note in view on the 1/16 grid", str (index, " grid ", (int) roll.getGrid()));
+        }
+        roll.setLayer (Layer::Melody);
+    }
+}
 } // namespace
 
 void cbtest::runRollSelfTests()
@@ -1301,4 +1549,5 @@ void cbtest::runRollSelfTests()
     testRollMenus();
     testRollEmptyCardAndLane();
     testRollPaintPerformance();
+    testRollReviewFixes();
 }
