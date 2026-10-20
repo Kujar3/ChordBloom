@@ -1,5 +1,6 @@
 #include "plugin/PreviewSynth.h"
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 
@@ -29,7 +30,10 @@ struct PreviewSynth::Impl
         float residualLeft = 0.0f, residualRight = 0.0f;
         int residualRemaining = 0;
     };
-    std::array<Slot, 24> slots {};
+    // (Phase 2, final-spec 6.5) 48 fixed slots: a held pad chord plus a 1/16 arp and a rolling bass with their release
+    // tails fit without stealing a held voice.
+    std::array<Slot, 48> slots {};
+    std::atomic<int> heldSteals { 0 };   // voices stolen while still held (no note-off yet), since prepare()
     std::array<bool, 17> sustainDown {};   // per MIDI channel 1..16 (index 0 unused)
     juce::AudioBuffer<float> scratch;
     juce::Reverb reverb;
@@ -73,19 +77,41 @@ struct PreviewSynth::Impl
             voice.fadeRemaining = stealSamples;
         }
     }
-    void noteOn (int note, int channel, float velocity)
+    static bool isReleasing (const Voice& v) noexcept { return v.released || v.fadeRemaining > 0; }
+
+    // Voice choice (final-spec 6.5): (1) an inactive slot; (2) the voice of the same channel and note (re-strike);
+    // (3) the oldest released voice (pedal-sustained ones after the released ones); (4) the oldest held voice.
+    Slot& chooseSlot (int note, int channel) noexcept
     {
-        auto* chosen = &slots.front();
+        for (auto& slot : slots)
+            if (! slot.voice.active)
+                return slot;
+
+        for (auto& slot : slots)
+            if (slot.voice.channel == channel && slot.voice.note == note)
+                return slot;
+
+        Slot* best = nullptr;
+        int bestRank = 3;
         for (auto& slot : slots)
         {
-            if (! slot.voice.active)
+            const auto& v = slot.voice;
+            const int rank = isReleasing (v) ? 0 : (v.sustained ? 1 : 2);
+            if (best == nullptr || rank < bestRank || (rank == bestRank && v.age < best->voice.age))
             {
-                chosen = &slot;
-                break;
+                best = &slot;
+                bestRank = rank;
             }
-            if (slot.voice.age < chosen->voice.age)
-                chosen = &slot;
         }
+
+        if (bestRank == 2)
+            heldSteals.fetch_add (1, std::memory_order_relaxed);
+        return *best;
+    }
+
+    void noteOn (int note, int channel, float velocity)
+    {
+        auto* chosen = &chooseSlot (note, channel);
         if (chosen->voice.active)
         {
             // Repeated stealing within 3 ms retains the interrupted tail's
@@ -282,6 +308,7 @@ PreviewSynth::~PreviewSynth() = default;
 
 void PreviewSynth::prepare (double sampleRate, int maxBlockSize)
 {
+    impl->heldSteals.store (0);
     impl->sampleRate = std::isfinite (sampleRate) && sampleRate > 0.0 ? sampleRate : 44100.0;
     impl->capacity = juce::jmax (1, maxBlockSize);
     impl->scratch.setSize (2, impl->capacity);
@@ -360,5 +387,4 @@ void PreviewSynth::allNotesOff (bool allowTailOff)
     impl->stopNotes (allowTailOff);
 }
 
-// WP0 STUB (WP4 adds the counter with the 48-slot voice stealing of final-spec 6.5).
-int PreviewSynth::getHeldVoiceSteals() const noexcept { return 0; }
+int PreviewSynth::getHeldVoiceSteals() const noexcept { return impl->heldSteals.load (std::memory_order_relaxed); }
