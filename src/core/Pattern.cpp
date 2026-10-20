@@ -31,9 +31,11 @@
 //    Octaves alternates with an upper/lower octave in range; the last played bass note carries into the next slot.
 //  - Pattern bass modes (phase 2, isBassPattern): bassPatternSteps on the absolute 16th grid from beat 0 (step g =
 //    beat * 4, pattern step g % 16), so the groove runs through chord changes and restarts with the loop. R = the same
-//    chooser as every mode; the 'o' steps play the Octaves partner of R. Onsets are warped by swingWarp on the shared
-//    groove grid (the same swung times as the chord renderer's odd steps) and jittered by humanize; each note lasts
-//    lengthSteps * 0.25 * gate / 0.9 beats, cut at the next bass onset's actual time and the slot end. On-beat
+//    chooser as every mode; the 'o' steps play the octave above R (R + 12; R - 12 only when R + 12 would leave the
+//    range). Onsets are warped by swingWarp on the shared
+//    groove grid (the same swung times as the chord renderer's odd steps) and jittered by humanize; each note's end is
+//    warped the same way (start + lengthSteps * 0.25 * gate / 0.9 beats, so an offbeat 8th ends on the next beat under
+//    swing), cut at the next bass onset's actual time and the slot end. On-beat
 //    patterns strike R at the slot start when no onset lies in the first half beat of the slot (tested on the straight
 //    grid, so swing never adds or removes a strike); the offbeat family never strikes.
 //  - Safety: a note never overlaps another instance of the same note on the same channel (an earlier one is
@@ -506,17 +508,18 @@ void renderChords (const SlotRenderer& r, const std::vector<int>& notes, const R
 }
 
 // Phase 2 pattern bass (final-spec 4.2). `root` is the slot's chooser result (previous = the last emitted pitch).
-void renderBassPattern (const SlotRenderer& r, int root, int lowestVoicingNote, int& previousBass,
+void renderBassPattern (const SlotRenderer& r, int root, int& previousBass,
                         const RenderSettings& s, double gate, double swing)
 {
     const auto& steps = bassPatternSteps (s.bass);
     if (steps.empty())
         return;
 
-    // The Octaves mode's partner of R.
-    int partner = root + 12;
-    if (partner > kBassHigh || (partner > lowestVoicingNote - 5 && root - 12 >= kBassLow))
-        partner = root - 12;
+    // The 'o' steps play the octave partner of R: an octave above it (R + 12), so the octave rises on the 'and'. Only
+    // when R + 12 would leave the bass range (R >= 44, which keeps R - 12 >= 32 in range) does it drop to R - 12.
+    // There is no voicing-proximity clause (that is the classic Octaves mode's rule). The 'x' steps always play R, so
+    // the slot entry stays the chooser's note.
+    const int partner = root + 12 <= kBassHigh ? root + 12 : root - 12;
 
     struct Onset
     {
@@ -539,8 +542,12 @@ void renderBassPattern (const SlotRenderer& r, int root, int lowestVoicingNote, 
                 const bool octave = st.role == BassRole::Octave;
                 const int voice = octave ? 1 : 0;
                 const double start = r.jitteredStart (swingWarp ((double) g * 0.25, grid, swing), g, voice, kBassChannel);
-                onsets.push_back ({ g, octave ? partner : root, voice, start,
-                                    (double) st.lengthSteps * 0.25 * gate / 0.9 });
+                // The note end goes through the same swing warp as the start (as the arp), so an offbeat 8th ends
+                // exactly on the next beat and the short 16ths keep their ratio under swing.
+                const double straightStart = (double) g * 0.25;
+                const double length = swingWarp (straightStart + (double) st.lengthSteps * 0.25 * gate / 0.9, grid, swing)
+                                    - swingWarp (straightStart, grid, swing);
+                onsets.push_back ({ g, octave ? partner : root, voice, start, length });
                 break;
             }
 
@@ -593,7 +600,7 @@ void renderBass (const SlotRenderer& r, int rootPc, int bassPc, int fifthPc, int
 
     if (isBassPattern (s.bass))
     {
-        renderBassPattern (r, root, lowestVoicingNote, previousBass, s, gate, swing);
+        renderBassPattern (r, root, previousBass, s, gate, swing);
         return;
     }
 

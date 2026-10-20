@@ -147,12 +147,11 @@ int referenceRoot (int bassPc, int lowest, int previous)
     return best;
 }
 
-int referencePartner (int root, int lowest)
+// The 'o' steps' partner of R in the pattern modes: R + 12 (the octave rises on the 'and'), R - 12 only when R + 12
+// would leave the bass range. No voicing-proximity clause.
+int referencePartner (int root)
 {
-    int other = root + 12;
-    if (other > 55 || (other > lowest - 5 && root - 12 >= 28))
-        other = root - 12;
-    return other;
+    return root + 12 <= 55 ? root + 12 : root - 12;
 }
 
 bool patternHasStep (BassMode mode, int step)
@@ -198,7 +197,7 @@ std::vector<Expected> expectedBass (const Progression& prog, const std::vector<s
         const double slotEnd = slotStart + slot.lengthBeats;
         const int lowest = voicings[i].front();
         const int root = referenceRoot (slotBassPitchClass (slot, voicings[i]), lowest, previous);
-        const int partner = referencePartner (root, lowest);
+        const int partner = referencePartner (root);
 
         std::vector<Expected> notes;
         const int g0 = (int) std::lround (slotStart * 4.0);
@@ -209,7 +208,8 @@ std::vector<Expected> expectedBass (const Progression& prog, const std::vector<s
                 {
                     Expected e;
                     e.start = swingWarp ((double) g * 0.25, grid, swing);
-                    e.length = (double) st.lengthSteps * 0.25 * gate / 0.9;
+                    // The note end is warped like the start (as the arp): length = warped end - warped start.
+                    e.length = swingWarp ((double) g * 0.25 + (double) st.lengthSteps * 0.25 * gate / 0.9, grid, swing) - e.start;
                     e.note = st.role == BassRole::Octave ? partner : root;
                     notes.push_back (e);
                 }
@@ -275,7 +275,7 @@ TEST_CASE ("bass patterns: each pattern on C-Am-F-G plays exactly its grid")
                 const auto& slot = prog.slots[(size_t) bar];
                 const int lowest = voicings[(size_t) bar].front();
                 const int root = referenceRoot (pc (slot.chord.root), lowest, previous);
-                const int partner = referencePartner (root, lowest);
+                const int partner = referencePartner (root);
 
                 std::string grid (16, '-');
                 for (const auto& e : ev)
@@ -340,6 +340,97 @@ TEST_CASE ("bass patterns: lengths follow lengthSteps, the gate and the cuts")
     CHECK (near (ev[1].startBeat, 1.5));
     CHECK (nearLen (ev[1].lengthBeats, 0.5));
     CHECK (near (ev[3].startBeat, 4.0));
+}
+
+TEST_CASE ("bass patterns: the octave partner rises on the 'and' and drops only when R + 12 leaves the range")
+{
+    // i-VI-III-VII in all 12 keys at the default voicing: the voicing-proximity clause of the classic Octaves mode must
+    // not send the partner below R (F2 under an A3 pad still bounces up to F3).
+    int rises = 0;
+    int drops = 0;
+    for (int key = 0; key < 12; ++key)
+    {
+        const auto prog = makeProgression ({ chordOf ((9 + key) % 12, ChordQuality::Minor), chordOf ((5 + key) % 12),
+                                             chordOf (key), chordOf ((7 + key) % 12) });
+        const auto voicings = voiced (prog);
+
+        for (auto mode : { BassMode::OctaveBounce8, BassMode::RollingKickGap })
+        {
+            const auto ev = bassOf (prog, voicings, bassSettings (mode));
+            const auto grid = bassPatternGrid (mode);
+            REQUIRE (! ev.empty());
+
+            for (int bar = 0; bar < 4; ++bar)
+            {
+                int root = -1;
+                for (const auto& e : ev)
+                {
+                    const int step = (int) std::lround (e.startBeat * 4.0) - 16 * bar;
+                    if (step < 0 || step > 15 || grid[(size_t) step] != 'x')
+                        continue;
+                    if (root < 0)
+                        root = e.note;
+                    CHECK_EQ (e.note, root);   // every 'x' step of the slot plays R
+                }
+                REQUIRE (root >= 28);
+                REQUIRE (root <= 55);
+
+                for (const auto& e : ev)
+                {
+                    const int step = (int) std::lround (e.startBeat * 4.0) - 16 * bar;
+                    if (step < 0 || step > 15 || grid[(size_t) step] != 'o')
+                        continue;
+                    CHECK_EQ (e.note, referencePartner (root));
+                    CHECK_EQ (pc (e.note), pc (root));
+                    CHECK (e.note >= 28 && e.note <= 55);
+                    (root + 12 <= 55 ? rises : drops) += 1;
+                }
+            }
+        }
+    }
+    CHECK (rises > 0);
+    CHECK (drops > 0);   // the sweep reaches roots at or above A2 (45), where R + 12 does not fit
+    CHECK (rises > 3 * drops);
+
+    // The reported case: F under the default pad bounces up.
+    const auto fProg = makeProgression ({ chordOf (5) });
+    const auto fv = voiced (fProg);
+    const auto fEv = bassOf (fProg, fv, bassSettings (BassMode::OctaveBounce8));
+    REQUIRE (fEv.size() >= 2);
+    CHECK (fEv[1].note > fEv[0].note);
+}
+
+TEST_CASE ("bass patterns: note ends follow the swing like the arp - offbeat 8ths stop on the next beat")
+{
+    const auto prog = makeProgression ({ chordOf (0), chordOf (5) });
+    const auto v = voiced (prog);
+
+    for (float swing : { 0.5f, 1.0f })
+    {
+        // Offbeat8 at gate 0.9 (chord rate 1/8): each note runs from its swung 8th to exactly the next beat.
+        const auto ev = bassOf (prog, v, bassSettings (BassMode::Offbeat8, RateDivision::Eighth, swing));
+        REQUIRE (ev.size() == 8);
+        for (const auto& e : ev)
+        {
+            CHECK (near (e.startBeat, std::floor (e.startBeat) + 0.5 + (double) swing * 0.5 / 3.0));
+            CHECK (nearLen (e.startBeat + e.lengthBeats, std::floor (e.startBeat) + 1.0));
+        }
+
+        // Rolling16 at chord rate 1/16 (grid 0.25): every note keeps its 0.96 share of its own swung span instead of
+        // the long 16th overshooting and the short one running legato.
+        const auto roll = bassOf (prog, v, bassSettings (BassMode::Rolling16, RateDivision::Sixteenth, swing));
+        REQUIRE (roll.size() >= 4);
+        const double longSpan = 0.25 * (1.0 + (double) swing / 3.0);
+        const double shortSpan = 0.5 - longSpan;
+        CHECK (nearLen (roll[0].lengthBeats, 0.96 * longSpan));
+        CHECK (nearLen (roll[1].lengthBeats, 0.96 * shortSpan));
+        CHECK (roll[0].startBeat + roll[0].lengthBeats <= roll[1].startBeat + kTol);
+    }
+
+    // Straight time is unchanged: 2 sixteenths = 0.5 beat.
+    const auto straight = bassOf (prog, v, bassSettings (BassMode::Offbeat8));
+    for (const auto& e : straight)
+        CHECK (nearLen (e.lengthBeats, 0.5));
 }
 
 TEST_CASE ("bass patterns: slot lengths 1, 2, 3, 5 (14 beats) - grid, strikes, entry, ranges, no overlaps")

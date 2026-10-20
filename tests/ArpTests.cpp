@@ -279,6 +279,50 @@ TEST_CASE ("arp: sweep - every chord quality and inversion, every shape and rate
     CHECK (renders > 8000);
 }
 
+TEST_CASE ("arp: sweep - every quality and inversion x 7 rhythms x octaves -2..2 x three progression layouts")
+{
+    // Layouts: 4-beat slots; 1/2/3/5/3-beat slots (14 beats, bar lines inside slots); 3/1/2/5/3-beat slots. Every axis
+    // is crossed completely (with all 17 shapes and 4 rates); each render is checked twice for determinism.
+    const std::vector<std::vector<int>> layouts { { 4, 4, 4, 4 }, { 1, 2, 3, 5, 3 }, { 3, 1, 2, 5, 3 } };
+    const int roots[] = { 7, 2, 9, 4, 11 };
+
+    int renders = 0;
+    int expected = 0;
+    for (int q = 0; q < numChordQualities; ++q)
+    {
+        const int tones = (int) qualityIntervals ((ChordQuality) q).size();
+        for (int inversion = -1; inversion < std::min (tones, 6); ++inversion)
+        {
+            expected += (int) layouts.size() * numArpRhythms * 5 * numArpShapes * 4;
+            for (const auto& lengths : layouts)
+            {
+                std::vector<Chord> chords;
+                for (size_t i = 0; i < lengths.size(); ++i)
+                    chords.push_back (chordOf (roots[i % 5], (ChordQuality) q));
+                auto prog = makeProgression (chords, lengths);
+                for (auto& slot : prog.slots)
+                    slot.inversion = inversion;
+                const auto v = voiced (prog);
+
+                for (int rhythm = 0; rhythm < numArpRhythms; ++rhythm)
+                    for (int octave = -2; octave <= 2; ++octave)
+                        for (int shape = 0; shape < numArpShapes; ++shape)
+                            for (auto rate : kAllRates)
+                            {
+                                const auto a = arpOf ((ArpShape) shape, rate, (ArpRhythm) rhythm, 65 + 12 * octave);
+                                const auto f = feelOf();
+                                const auto ev = renderArp (prog, v, a, f, {});
+                                checkInvariants (prog, ev, a, true, f.velocity);
+                                CHECK (ev == renderArp (prog, v, a, f, {}));
+                                ++renders;
+                            }
+            }
+        }
+    }
+    CHECK_EQ (renders, expected);
+    CHECK (renders > 800000);
+}
+
 TEST_CASE ("arp: sweep - swing, humanize and gate never drop a sounding step, never overlap a pitch, never leave the slot")
 {
     const std::vector<Progression> progressions { cAmFG(), oddSlots() };
@@ -431,6 +475,34 @@ TEST_CASE ("arp: rhythm masks silence the right steps and never skip a tone")
     CHECK_EQ (late[0].note, 60);
     CHECK (near (late[15].startBeat, 4.25));
     CHECK_EQ (late[15].note, 60);
+}
+
+TEST_CASE ("arp: Kick gap rests on the steps that start a beat at every rate")
+{
+    // 1/16: 0, 4, 8, 12 (unchanged); 1/8: the on-beat 8ths; 1/8T: the triplets 0, 3, 6, 9; 1/4 has no gap to offer (every
+    // step starts a beat), so it keeps resting on the bar's first step only.
+    struct Case { int stepsPerBar; std::vector<int> silent; };
+    const Case cases[] = { { 16, { 0, 4, 8, 12 } }, { 8, { 0, 2, 4, 6 } }, { 12, { 0, 3, 6, 9 } }, { 4, { 0 } } };
+    for (const auto& c : cases)
+        for (int step = 0; step < c.stepsPerBar; ++step)
+            CHECK_EQ (arpStepSounds (ArpRhythm::KickGap, step, c.stepsPerBar),
+                      std::find (c.silent.begin(), c.silent.end(), step) == c.silent.end());
+
+    // Rendered: at 1/8 over one bar the arp plays the offbeat 8ths only, at 1/8T the two triplets after each beat.
+    const auto bar = makeProgression ({ chordOf (0) }, { 4 });
+    const auto eighths = render (bar, arpOf (ArpShape::Up3, RateDivision::Eighth, ArpRhythm::KickGap));
+    REQUIRE (eighths.size() == 4);
+    for (size_t i = 0; i < eighths.size(); ++i)
+        CHECK (near (eighths[i].startBeat, (double) i + 0.5));
+
+    const auto triplets = render (bar, arpOf (ArpShape::Up3, RateDivision::EighthTriplet, ArpRhythm::KickGap));
+    REQUIRE (triplets.size() == 8);
+    for (size_t i = 0; i < triplets.size(); ++i)
+        CHECK (near (triplets[i].startBeat, (double) (i / 2) + (double) (i % 2 + 1) / 3.0));
+
+    // The other rhythms keep their 16th-group definition at every rate.
+    CHECK (! arpStepSounds (ArpRhythm::Skip2nd, 1, 8));
+    CHECK (! arpStepSounds (ArpRhythm::Skip3rd, 6, 12));
 }
 
 TEST_CASE ("arp: the tone stack - slash chords, inversions, 5/6-tone chords, triad tone 3")
@@ -635,10 +707,11 @@ TEST_CASE ("arp: voice-led bases move at most 6 whenever the voice-led option ex
     CHECK_EQ (ev[0].note, 60);
     CHECK_EQ (ev[4].note, 54 + 4);   // free-running position 4 % 3 = 1: the major third of the lower base (58, not 70)
 
-    // On C-Am-F-G a voice-led slot moves at most 6; other slots take the nearest register (which may move more: the
-    // option is only offered while the cycle mean stays within 7 of the centre). The rendered notes follow the model.
+    // On C-Am-F-G a voice-led slot moves at most 6; a move of more than 6 happens only when no voice-led candidate exists
+    // (no base within 6 of the previous one keeps the cycle mean within 7 of the centre), and then the slot takes the
+    // nearest register. The rendered notes follow the model (see the register test above).
     int ledSlots = 0;
-    int jumps = 0;
+    int longMoves = 0;
     for (int shape = 0; shape < numArpShapes; ++shape)
         for (int centre : { 53, 65, 77 })
         {
@@ -647,17 +720,22 @@ TEST_CASE ("arp: voice-led bases move at most 6 whenever the voice-led option ex
             REQUIRE (bases.size() == 4 && led.size() == 4);
             for (size_t s = 1; s < bases.size(); ++s)
             {
+                const int move = std::abs (bases[s] - bases[s - 1]);
                 if (led[s])
                 {
-                    CHECK (std::abs (bases[s] - bases[s - 1]) <= 6);
+                    CHECK (move <= 6);
                     ++ledSlots;
                 }
-                else if (std::abs (bases[s] - bases[s - 1]) > 6)
-                    ++jumps;
+                CHECK (move <= 6 || ! led[s]);
+                longMoves += move > 6 ? 1 : 0;
             }
         }
     CHECK (ledSlots > 0);
-    CHECK (jumps >= 0);
+    CHECK (longMoves > 0);   // the nearest-register fallback really occurs (documented below)
+
+    // Root pulse at the default centre: C4, then A4 (the voice-led A3 would put the mean 8 from the centre, so the
+    // nearest register is used: a move of 9), then F4 and G4.
+    CHECK (modelBases (cAmFG(), ArpShape::RootPulse, 65) == std::vector<int> ({ 60, 69, 65, 67 }));
 }
 
 TEST_CASE ("arp: bass clearance - an octave above the lowest bass note of the slot while the mean allows it")
