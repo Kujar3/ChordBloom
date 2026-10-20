@@ -75,7 +75,7 @@ cb::Progression makeProgression (std::initializer_list<std::pair<cb::Chord, int>
 // Draws look-and-feel pieces that only exist in popup windows (menus, tooltips, value bubbles) onto one sheet.
 juce::Image renderWidgetSheet (juce::LookAndFeel& lf)
 {
-    juce::Image image (juce::Image::ARGB, 900, 470, true);
+    juce::Image image (juce::Image::ARGB, 980, 500, true);
     juce::Graphics g (image);
     g.fillAll (cb::ui::Colours::background);
 
@@ -142,14 +142,14 @@ juce::Image renderWidgetSheet (juce::LookAndFeel& lf)
                              { "Duplicate" }, { "Delete" }, { "Disabled item", Item::normal, false, false, false, false } });
 
     // Key menu: both enharmonic spellings (I27)
-    drawMenu ({ 400, 20 }, { { "C" }, { "C# / Db" }, { "D" }, { "D# / Eb", Item::normal, true, true }, { "E" }, { "F" },
+    drawMenu ({ 480, 20 }, { { "C" }, { "C# / Db" }, { "D" }, { "D# / Eb", Item::normal, true, true }, { "E" }, { "F" },
                              { "F# / Gb" }, { "G" }, { "G# / Ab" }, { "A" }, { "A# / Bb" }, { "B" } });
 
-    // MIDI out part menu (I13; melody parts added with the melody roll)
+    // MIDI out part menu (I13; melody and arp parts added in phase 2, menu order {0, 4, 1, 2, 3, 5})
     {
         Item heading { "MIDI out sends", Item::heading };
         Item all { "All parts", Item::normal, true };
-        all.shortcut = "ch 1-3";
+        all.shortcut = "ch 1-4";
         Item both { "Chords + Bass" };
         both.shortcut = "ch 1 + 2";
         Item chords { "Chords only", Item::normal, false, true };
@@ -158,7 +158,9 @@ juce::Image renderWidgetSheet (juce::LookAndFeel& lf)
         bass.shortcut = "ch 2";
         Item melody { "Melody only" };
         melody.shortcut = "ch 3";
-        drawMenu ({ 580, 20 }, { heading, all, both, chords, bass, melody });
+        Item arp { "Arp only" };
+        arp.shortcut = "ch 4";
+        drawMenu ({ 660, 20 }, { heading, all, both, chords, bass, melody, arp });
     }
 
     auto drawTip = [&] (const juce::String& tip, juce::Point<int> origin)
@@ -169,15 +171,16 @@ juce::Image renderWidgetSheet (juce::LookAndFeel& lf)
         lf.drawTooltip (g, tip, bounds.getWidth(), bounds.getHeight());
     };
 
-    drawTip ("Voice leading: picks inversions automatically so each chord moves smoothly to the next", { 580, 215 });
+    drawTip ("Voice leading: picks inversions automatically so each chord moves smoothly to the next", { 660, 245 });
     drawTip ("Swing: delays every second step for a shuffled groove (double-click to reset)\n\nNo effect right now: Block "
              "holds each chord and the bass is held too. Try Pulse, an Arp or Broken, or the Octaves / Pulse bass.",
-             { 580, 285 });
+             { 660, 315 });
 
-    // Melody roll menu (right-click on empty space)
-    drawMenu ({ 220, 232 }, { { "Melody", Item::heading }, { "Snap", Item::normal, false, true, true },
-                              { "Grid", Item::normal, false, false, true }, { "Play melody", Item::normal, true },
-                              { {}, Item::separator }, { "Octave up" }, { "Octave down" }, { "Clear melody" } });
+    // Roll menu, layer and view sections (final-spec 7.8; the real menu is built by MelodyRoll::createMenu)
+    drawMenu ({ 220, 232 }, { { "Melody  (your lead line)", Item::heading }, { "Play melody", Item::normal, true },
+                              { "Clear melody" }, { "View", Item::heading },
+                              { "Snap", Item::normal, false, true, true }, { "Grid", Item::normal, false, false, true },
+                              { "Velocity lane" }, { "Show other layers and instances", Item::normal, true } });
 
     return image;
 }
@@ -424,7 +427,7 @@ bool renderPhase2Snapshots (ChordbloomProcessor& processor, ChordbloomEditor& ed
     minSize();
     shoot ("14e_roll_arp_on_960x560.png");
 
-    // Bass tab: Offbeat 8ths with one edited slot (slot 2 an octave up) -> strip dot + Reset pill.
+    // Bass tab: Offbeat 8ths with one edited slot (slot 2 a fifth up, so it stays in view) -> strip dot + Reset pill.
     setParam (processor, cb::ParamIDs::bassMode, (float) cb::BassMode::Offbeat8);
     settle (processor, editor);
     {
@@ -432,7 +435,7 @@ bool renderPhase2Snapshots (ChordbloomProcessor& processor, ChordbloomEditor& ed
 
         for (auto& n : bass.notes)
             if (n.startBeat >= 4.0 && n.startBeat < 8.0)
-                n.note = std::min (n.note + 12, 72);
+                n.note = std::min (n.note + 7, 72);
 
         processor.setLayerNotes (cb::Layer::Bass, bass);
     }

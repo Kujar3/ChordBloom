@@ -976,13 +976,20 @@ void testRollToolbarInteraction()
         // Regenerating with the same seed while untouched: the result follows the new setting.
         p.setMelody (cb::Melody());
         check (tb.generateMelody ((std::uint32_t) seed) && p.getMelody() == first, "toolbar: generateMelody (seed) is deterministic");
+
+        // The click above used a random seed; Busy is denser on average but not for every seed, so the density
+        // comparison runs on a fixed seed (the regenerate path is the same).
+        constexpr std::uint32_t fixedSeed = 7;
+        check (tb.generateMelody (fixedSeed), "toolbar: generateMelody (7) succeeds");
+        const auto medium = p.getMelody();
         auto s = tb.getGenerateSettings();
         s.density = 0.85f;
         tb.setGenerateSettings (s);
         const auto busier = p.getMelody();
-        check (busier != first && p.isMelodyFromGenerator() && busier.notes.size() > first.notes.size(),
+        check (busier != medium && p.isMelodyFromGenerator() && busier.notes.size() > medium.notes.size()
+                   && (int) p.getAPVTS().state.getProperty ("cb.gen.seed", 0) == (int) fixedSeed,
                "toolbar: a settings pick regenerates the untouched melody with its seed (Busy has more notes)",
-               str (first.notes.size(), " -> ", busier.notes.size()));
+               str (medium.notes.size(), " -> ", busier.notes.size()));
 
         auto edited = busier;
         edited.notes.pop_back();

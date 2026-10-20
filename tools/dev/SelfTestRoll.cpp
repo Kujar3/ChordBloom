@@ -1147,8 +1147,12 @@ void testRollEmptyCardAndLane()
         pumpMessages (40);
 
         if (realToolbar)
-            check (! p.getMelody().empty() && undoDepth (p) == depth + 1 && p.isMelodyFromGenerator(),
+        {
+            // Read the generator flag first: undoDepth undoes and redoes, which clears it (final-spec 6.2).
+            const bool fromGenerator = p.isMelodyFromGenerator();
+            check (! p.getMelody().empty() && fromGenerator && undoDepth (p) == depth + 1,
                    "roll2: the card's Generate button generates a melody (one undo step)");
+        }
         else
             std::cout << "NOTE roll2: the card button calls RollToolbar::generateNewMelody (a WP0 stub here; checked after WP6)\n";
 
