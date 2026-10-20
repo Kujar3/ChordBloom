@@ -1540,6 +1540,250 @@ void testRollReviewFixes()
         roll.setLayer (Layer::Melody);
     }
 }
+
+//==============================================================================
+// Final review fixes: hidden velocity stalks, async menu toggles and stale layers, full refreshes only for what the
+// roll shows, and no syncing while the roll is hidden.
+void testRollFinalReviewFixes()
+{
+    RollRig rig;
+    if (! rig.ok())
+        return;
+
+    auto& roll = *rig.roll;
+    auto& p = rig.p;
+    roll.setSnap (cb::MelodySnap::Off);
+    roll.setGrid (cb::RateDivision::Eighth);
+    roll.setTopNote (75);
+    pumpMessages (30);
+
+    // Notes past the visible beats (an 8-bar melody under a 4-bar progression) have no stalk: they are neither drawn
+    // nor grabbed, and they never win over a visible stalk at the lane's right edge.
+    {
+        auto parkedMelody = [] (std::initializer_list<cb::MelodyNote> extra)
+        {
+            cb::Melody m = makeMelody (extra);
+            for (int b = 16; b < 32; b += 2)
+                m.notes.push_back (melodyNote (67, (double) b, 1.0, 0.9f));
+            return cb::sanitiseMelody (m);
+        };
+
+        p.setMelody (parkedMelody ({ melodyNote (60, 0.0, 1.0, 0.5f) }));
+        pumpMessages (40);
+        roll.setVelocityLaneVisible (true);
+        pumpMessages (20);
+        const auto lane = roll.getVelocityLaneArea();
+        const auto inner = lane.reduced (0.0f, 4.0f);
+        auto yFor = [&inner] (float v) { return inner.getBottom() - v * inner.getHeight(); };
+        const auto before = p.getMelody();
+        int depth = undoDepth (p);
+        rig.drag ({ lane.getRight() - 4.0f, yFor (0.9f) }, { lane.getRight() - 4.0f, yFor (0.2f) }, kLeft);
+        check (before.notes.size() == 9 && p.getMelody() == before && undoDepth (p) == depth,
+               "roll4: a drag on the empty right edge of the lane never edits a note past the visible beats",
+               layerText (p.getMelody()));
+
+        // A visible note on the last 1/16 of the grid: its stalk sits where the hidden ones would clamp.
+        p.setMelody (parkedMelody ({ melodyNote (64, 15.9375, 0.0625, 0.3f) }));
+        pumpMessages (40);
+        const auto m0 = p.getMelody();
+        const int visible = indexOfNote (m0, 64, 15.9375);
+        const float x = std::min (lane.getRight() - 4.0f, std::round (roll.getCellCentre (15.9375, 60).x) + 1.0f);
+        depth = undoDepth (p);
+        rig.drag ({ x, yFor (0.85f) }, { x, yFor (0.5f) }, kLeft);
+        const auto m1 = p.getMelody();
+        bool hiddenKept = m1.notes.size() == m0.notes.size();
+        for (auto& n : m1.notes)
+            hiddenKept = hiddenKept && (n.startBeat < 16.0 || n.velocity == 0.9f);
+        check (visible >= 0 && hiddenKept && std::abs (m1.notes[(size_t) visible].velocity - 0.5f) < 0.06f
+                   && undoDepth (p) == depth + 1,
+               "roll4: a press on the last beat's stalk edits that visible note, not a hidden one", layerText (m1));
+        roll.setVelocityLaneVisible (false);
+        pumpMessages (20);
+    }
+
+    // Async menu toggles set the opposite of the tick the menu showed, not of a state that changed while it was open
+    {
+        p.setMelody (fourNotes());
+        setParam (p, cb::ParamIDs::arpOn, 0.0f);
+        pumpMessages (60);
+        roll.getToolbar().onTabMenu (Layer::Arp);   // "Play arp" (unticked) first
+        juce::Component::SafePointer<juce::Component> window (openMenuWindow());
+        const bool shown = window != nullptr;
+        setParam (p, cb::ParamIDs::arpOn, 1.0f);    // automation turns the arp on while the menu is open
+        if (window != nullptr)
+            window->keyPressed (juce::KeyPress (juce::KeyPress::downKey));
+        if (window != nullptr)
+            window->keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
+        pumpMessages (60);
+        check (shown && p.isLayerOn (Layer::Arp),
+               "roll4: Play arp picked from an unticked menu turns the arp on, even when automation turned it on meanwhile");
+        juce::PopupMenu::dismissAllActiveMenus();
+        setParam (p, cb::ParamIDs::arpOn, 0.0f);
+        pumpMessages (40);
+
+        roll.setVelocityLaneVisible (true);
+        pumpMessages (20);
+        const auto lane = roll.getVelocityLaneArea();
+        rig.click ({ lane.getRight() - 30.0f, lane.getCentreY() }, kRight);   // Velocity section: "Velocity lane" (ticked) last
+        juce::Component::SafePointer<juce::Component> laneMenu (openMenuWindow());
+        const bool laneShown = laneMenu != nullptr && roll.getLastMenuShown() == Section::Velocity;
+        roll.setVelocityLaneVisible (false);   // e.g. a state load hides the lane while the menu is open
+        if (laneMenu != nullptr)
+            laneMenu->keyPressed (juce::KeyPress (juce::KeyPress::upKey));
+        if (laneMenu != nullptr)
+            laneMenu->keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
+        pumpMessages (40);
+        check (laneShown && ! roll.isVelocityLaneVisible(),
+               "roll4: Velocity lane picked from a ticked menu hides the lane, even when it was hidden meanwhile");
+        juce::PopupMenu::dismissAllActiveMenus();
+        roll.setVelocityLaneVisible (false);
+        pumpMessages (20);
+    }
+
+    // A menu opened on one layer never pastes into another layer that became current meanwhile
+    {
+        p.setMelody (makeMelody ({ melodyNote (88, 2.0, 1.0) }));
+        pumpMessages (30);
+        roll.setLayer (Layer::Melody);
+        roll.setSelection ({ 0 });
+        roll.performCommand (Command::Copy);
+        p.setMelody (fourNotes());
+        roll.setLayer (Layer::Bass);
+        pumpMessages (40);
+
+        // The Selection pill's menu: Select all, Select none, Copy, Cut, Paste (five down-arrow presses).
+        auto pasteFromPill = [&] (bool switchLayer)
+        {
+            roll.setSelection ({ 0 });
+            const auto pill = roll.getSelectionPillArea();
+            if (pill.isEmpty())
+                return false;
+            rig.click (pill.getCentre(), kLeft);
+            juce::Component::SafePointer<juce::Component> menu (openMenuWindow());
+            if (menu == nullptr)
+                return false;
+            if (switchLayer)
+                roll.setLayer (Layer::Melody);   // as a state load or host undo would switch it
+            for (int k = 0; k < 5 && menu != nullptr; ++k)
+                menu->keyPressed (juce::KeyPress (juce::KeyPress::downKey));
+            if (menu != nullptr)
+                menu->keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
+            pumpMessages (40);
+            juce::PopupMenu::dismissAllActiveMenus();
+            return true;
+        };
+
+        const auto melodyBefore = p.getMelody();
+        const int depth = undoDepth (p);
+        const bool shown = pasteFromPill (true);
+        check (shown && p.getMelody() == melodyBefore && ! p.isLayerCustom (Layer::Bass) && undoDepth (p) == depth,
+               "roll4: Paste from a menu opened on Bass is refused once Melody became current (nothing pasted anywhere)",
+               layerText (p.getMelody()));
+
+        roll.setLayer (Layer::Bass);
+        pumpMessages (30);
+        const bool shown2 = pasteFromPill (false);
+        check (shown2 && p.isLayerCustom (Layer::Bass) && p.getMelody() == melodyBefore,
+               "roll4: the same menu pastes into Bass while Bass stays current (control)");
+        p.resetLayer (Layer::Bass);
+        roll.setLayer (Layer::Melody);
+        pumpMessages (30);
+    }
+
+    // Full refreshes only for what the roll shows: a Velocity re-render of the off arp and the out-of-view bass is not
+    // one (it used to repaint the whole roll at 30 Hz during a knob drag); a bass change in view is.
+    {
+        p.setMelody (fourNotes());
+        setParam (p, cb::ParamIDs::arpOn, 0.0f);
+        setParam (p, cb::ParamIDs::bassMode, 1.0f);   // Root
+        pumpMessages (60);
+        roll.setTopNote (96);
+        pumpMessages (40);
+
+        const auto bassBefore = p.getLayerNotes (Layer::Bass);
+        bool outOfView = ! bassBefore.notes.empty();
+        for (auto& n : bassBefore.notes)
+            outOfView = outOfView && n.note < roll.getBottomNote() - 2;
+
+        const int r0 = roll.getNumSurfaceRefreshes();
+        for (float v : { 0.4f, 0.6f, 0.5f })
+        {
+            setParam (p, cb::ParamIDs::velocity, v);
+            pumpMessages (80);
+        }
+        check (outOfView && p.getLayerNotes (Layer::Bass) != bassBefore && roll.getNumSurfaceRefreshes() == r0,
+               "roll4: a Velocity change that re-renders only the off arp and the out-of-view bass refreshes nothing",
+               str (outOfView, " +", roll.getNumSurfaceRefreshes() - r0));
+
+        roll.setTopNote (36);   // clamped: the lowest Melody rows, where the Root bass sits
+        pumpMessages (40);
+        int inView = 0;
+        for (auto& n : p.getLayerNotes (Layer::Bass).notes)
+            inView += n.note <= roll.getTopNote() && n.note >= roll.getBottomNote() ? 1 : 0;
+        const int r1 = roll.getNumSurfaceRefreshes();
+        setParam (p, cb::ParamIDs::velocity, 0.8f);
+        pumpMessages (80);
+        check (inView > 0 && roll.getNumSurfaceRefreshes() == r1,
+               "roll4: a velocity-only re-render of bass outlines in view refreshes nothing (outlines ignore velocity)",
+               str (inView, " +", roll.getNumSurfaceRefreshes() - r1));
+        setParam (p, cb::ParamIDs::bassMode, (float) cb::BassMode::Octaves);
+        pumpMessages (80);
+        check (roll.getNumSurfaceRefreshes() > r1, "roll4: a bass change in view refreshes the roll");
+        const int r2 = roll.getNumSurfaceRefreshes();
+        p.setMelody (makeMelody ({ melodyNote (55, 1.0, 1.0) }));
+        pumpMessages (60);
+        check (roll.getNumSurfaceRefreshes() > r2, "roll4: a change of the current layer refreshes the roll");
+        setParam (p, cb::ParamIDs::bassMode, 1.0f);
+        setParam (p, cb::ParamIDs::velocity, 0.75f);
+        roll.setTopNote (75);
+        pumpMessages (60);
+    }
+
+    // Hidden (the Chords view): nothing is synced; showing the roll again resyncs it
+    {
+        rig.ed->setMelodyViewVisible (false);
+        pumpMessages (40);
+        const int h0 = roll.getNumSurfaceRefreshes();
+        p.setMelody (fourNotes());
+        setParam (p, cb::ParamIDs::bassMode, (float) cb::BassMode::Octaves);
+        pumpMessages (120);
+        const int hidden = roll.getNumSurfaceRefreshes() - h0;
+        rig.ed->setMelodyViewVisible (true);
+        pumpMessages (40);
+        check (hidden == 0 && roll.getNumSurfaceRefreshes() > h0,
+               "roll4: the hidden roll does not sync or repaint; showing it resyncs it", str (hidden));
+        setParam (p, cb::ParamIDs::bassMode, 1.0f);
+        pumpMessages (40);
+    }
+
+    // Final gate: the hover name pill names the note a click would write. With Chord snap the pointer on A4 over
+    // C major previews G4 or C5, and the pill must say that pitch, not the pointer's row.
+    {
+        roll.setLayer (Layer::Melody);
+        p.setMelody ({});
+        roll.setTopNote (75);
+        pumpMessages (40);
+        const auto at = rig.cell (1.0, 69);
+
+        roll.setSnap (cb::MelodySnap::Off);
+        rig.surface->mouseMove (rig.event (at, juce::ModifierKeys(), at));
+        check (roll.getHoverLabelRow() == 69, "roll4: with Snap off the hover pill names the pointer's row",
+               str (roll.getHoverLabelRow()));
+
+        roll.setSnap (cb::MelodySnap::ChordTones);
+        rig.surface->mouseMove (rig.event (at + juce::Point<float> (1.0f, 0.0f), juce::ModifierKeys(), at));
+        const int shown = roll.getHoverLabelRow();
+        rig.click (at + juce::Point<float> (1.0f, 0.0f), kLeft);
+        pumpMessages (20);
+        const auto& m = p.getMelody();
+        const int written = m.notes.size() == 1 ? m.notes[0].note : -1;
+        check ((shown == 67 || shown == 72) && shown == written,
+               "roll4: with Chord snap the hover pill names the snapped pitch a click writes", str (shown, " vs ", written));
+        p.setMelody ({});
+        rig.surface->mouseExit (rig.event (at, juce::ModifierKeys(), at));
+        pumpMessages (20);
+    }
+}
 } // namespace
 
 void cbtest::runRollSelfTests()
@@ -1554,4 +1798,5 @@ void cbtest::runRollSelfTests()
     testRollEmptyCardAndLane();
     testRollPaintPerformance();
     testRollReviewFixes();
+    testRollFinalReviewFixes();
 }

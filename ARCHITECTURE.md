@@ -32,7 +32,7 @@ src/plugin/                 JUCE audio side
 src/ui/                     JUCE editor
   Theme.h/.cpp              colours, Inter fonts, LookAndFeel
   DragPayload.h             internal drag descriptions (done)
-  PluginEditor.h/.cpp       layout + coordination (Chords | Melody view switch; phase 2: "Chords | Roll")
+  PluginEditor.h/.cpp       layout + coordination ("Chords | Roll" view switch)
   HeaderBar, ChordPaletteView, ProgressionLane, ControlsPanel, KeyboardGuide, ExportPanel
   MelodyRoll                "harmonic guide" piano roll of the note layers (shown in place of the palette)
   RollToolbar               (phase 2) the roll's toolbar row: layer tabs + LEDs, Generate, pattern browser, Snap/Grid
@@ -123,8 +123,9 @@ patterns bit-identical) must stay green unchanged.
   channel 3 and count as the melody part. `ExportPart::Melody` writes a one-track melody file.
 - Ghost notes: every processor publishes its melody + loop length to a process-wide registry (src/plugin/GhostRegistry,
   mutex-protected, message thread); `getGhostMelodies()` returns the other instances' melodies for the roll.
-- UI: the editor's "Chords | Melody" switch shows `MelodyRoll` in the palette's place. The roll's beat axis matches
-  the lane's track exactly (same x range and beats per pixel), so chords and notes line up vertically.
+- UI: the editor's "Chords | Roll" switch (`cb.editorView` "melody" = the Roll view; the accessibility value also
+  accepts "Melody") shows `MelodyRoll` in the palette's place. The roll's beat axis matches the lane's track exactly
+  (same x range and beats per pixel), so chords and notes line up vertically.
 
 ## Layers (phase 2)
 
@@ -180,5 +181,5 @@ patterns bit-identical) must stay green unchanged.
 - `build-x\CoreTests.exe [filter]`: core unit tests.
 - `build-x\ChordbloomDev_artefacts\Release\ChordbloomDev.exe selftest`: processor integration tests.
 - `build-x\ChordbloomDev_artefacts\Release\ChordbloomDev.exe snapshot out\snapshots`: editor PNGs (look at them!).
-- `tools\pluginval\pluginval.exe --strictness-level 8 --validate-in-process --skip-gui-tests --validate <path to .vst3>`
+- `tools\pluginval\pluginval.exe --strictness-level 10 --validate <path to .vst3>` (the phase-2 gate, as in README)
 - Standalone: `build-x\Chordbloom_artefacts\Release\Standalone\Chordbloom.exe`

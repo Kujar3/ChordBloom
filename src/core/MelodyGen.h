@@ -36,7 +36,9 @@ struct MelodyGenSettings
     float repetition = 0.5f;     // 0..1 (clamped): 0 through-composed, 0.5 corpus default, 1 loop-like
     int registerShift = 0;       // -12..+12 semitones (clamped) on the register window
     MelodyContour contour = MelodyContour::Auto;
-    bool resolveEnding = true;   // the loop's last phrase ends on a tonic-family tone
+    bool resolveEnding = true;   // leans the loop's last note toward home: 1, 3 or 5 of the key (stronger when the
+                                 // tonic clashes with the last chord); over a chord with none of them, a tone of that
+                                 // chord a step from the first note (it resolves through the seam). A weight, not a rule.
 
     bool operator== (const MelodyGenSettings&) const;
     bool operator!= (const MelodyGenSettings& o) const { return ! (*this == o); }
@@ -68,23 +70,35 @@ std::pair<int, int> melodyRegisterWindow (const Progression&, const MelodyGenCon
 std::string melodyPlanSignature (const Progression&, const Key&, std::uint32_t seed, const MelodyGenSettings&);
 
 // Measurements behind the CoreTests bands and the demos report. Bars = absolute 4-beat bars of the loop; strong =
-// steps 0 and 8 of a bar; a phrase-final note is followed by >= 1 beat without an onset, or is the last note.
+// steps 0 and 8 of a bar; a phrase-final note is followed by >= 1 beat without an onset, or is the last note. Intervals
+// run over the whole note list, so in the Driving pedal mode they measure the pedal and the upper line alternating.
+// A share whose denominator is 0 is 0.0 (the counts below tell such a 0 from a real one).
 struct MelodyStats
 {
     int notes = 0, lowest = 0, highest = 0;
     double notesPerActiveBar = 0.0;            // notes / bars with at least one onset
     double chordToneShare = 0.0;               // pitch class is a tone of chordAtBeat (start), extensions included
     double downbeatChordToneShare = 0.0;       // the same over notes starting on a bar downbeat
-    double phraseFinalChordToneShare = 0.0;
+    double phraseFinalChordToneShare = 0.0;    // the same over phrase-final notes (the chord each one starts on)
     double repeatShare = 0.0;                  // consecutive intervals of 0
     double stepShareMoving = 0.0;              // |interval| 1..2 among non-zero intervals
     double leapShareMoving = 0.0;              // |interval| >= 5 among non-zero intervals
     double reverseAfterLeap = 0.0;             // after a >= 5 leap, the next non-zero interval goes the other way
     double odd16Share = 0.0;                   // onsets on odd 16th steps
     double rhythmRepeatLag4 = 0.0;             // bars b >= 4 whose onset mask equals bar b - 4 (0 for loops < 8 bars)
-    double strongBeatClashShare = 0.0;         // strong-beat non-chord notes a semitone from a sounding accompaniment note
+    double strongBeatClashShare = 0.0;         // strong-beat non-chord notes a semitone (either way) from a sounding
+                                               // accompaniment note (the R4 clash model, not only R2's semitone above)
     double outOfChordScaleShare = 0.0;         // notes on a scale tone that the chord's same-letter out-of-key tone replaces
     int seamInterval = 0;                      // |last note - first note| (the loop plays them in a row)
+    int downbeatNotes = 0;                     // denominator of downbeatChordToneShare
+    int strongNotes = 0;                       // denominator of strongBeatClashShare
+    int phraseFinals = 0;                      // denominator of phraseFinalChordToneShare (>= 1 when notes > 0)
+    // The last note is 1, 3 or 5 of the key, or - over a chord (the one it starts on) with none of them - a tone of that
+    // chord 1-2 semitones from the first note, so it resolves through the seam (resolveEnding's notion of home).
+    bool loopEndHome = false;
+    // The last note is a tone of the chord it starts on, or it starts in the loop's final beat and is a tone of the
+    // first chord (an anticipation of the restart).
+    bool loopEndChordTone = false;
 };
 MelodyStats analyseMelody (const Melody&, const Progression&, const Key&,
                            const std::vector<NoteEvent>& accompaniment = {});

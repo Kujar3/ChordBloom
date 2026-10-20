@@ -634,6 +634,18 @@ void applyGeneratorMenuResult (RollToolbar& toolbar, ChordbloomProcessor& p, int
     toolbar.setGenerateSettings (s);
 }
 
+// Where a hover tip goes: the editor, like the editor's own TooltipWindow. Never the top-level component: in the
+// VST3 wrapper that is JUCE's ContentWrapperComponent, whose childBoundsChanged sends the host a resizeView for any
+// child (so every tip shown would). The top level only without an editor around (a bare toolbar in a test). Also a
+// test hook.
+juce::Component* tipParentFor (juce::Component& c)
+{
+    if (auto* editor = c.findParentComponentOfClass<juce::AudioProcessorEditor>())
+        return editor;
+
+    return c.getTopLevelComponent();
+}
+
 // Test hook: a synthetic mouse event, routed exactly like a real one. kind: 0 down, 1 up, 2 move, 3 exit, 4 drag.
 void sendMouseEvent (RollToolbar& toolbar, const juce::MouseEvent& e, int kind)
 {
@@ -1158,7 +1170,7 @@ struct RollToolbar::Impl final : public ToolbarHooks,
 
     void showTip()
     {
-        auto* top = owner.getTopLevelComponent();
+        auto* top = cb::ui::rolltoolbar::tipParentFor (owner);
         const auto text = tooltipFor (hoverItem);
 
         if (top == nullptr || top == &owner || text.isEmpty())
@@ -1885,18 +1897,14 @@ void RollToolbar::setGenerateSettings (const cb::MelodyGenSettings& s)
     repaint();
 
     // The user hears the change on the same idea, but only while the melody is the untouched last result: hand edits,
-    // undo / redo and loads are never replaced except by an explicit Generate command (final-spec 7.4).
-    if (s != old && p.isMelodyFromGenerator())
+    // undo / redo and loads are never replaced except by an explicit Generate command (final-spec 7.4). The processor
+    // decides after applying a load still pending from another thread (which forgets the generator result).
+    if (s != old && p.regenerateLastIdea (getGenerateSettings()))
     {
-        const auto seed = p.getLastGeneratorSeed();
+        state.setProperty (kGenSeed, (int) p.getLastGeneratorSeed(), nullptr);
 
-        if (seed != 0 && p.generateMelody (getGenerateSettings(), seed))
-        {
-            state.setProperty (kGenSeed, (int) seed, nullptr);
-
-            if (onMelodyGenerated != nullptr)
-                onMelodyGenerated();
-        }
+        if (onMelodyGenerated != nullptr)
+            onMelodyGenerated();
     }
 }
 

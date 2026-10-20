@@ -428,7 +428,10 @@ void ChordbloomEditor::timerCallback()
         lastLayerSerial = serial;
         controls->refresh();
         exportPanel->refresh();
-        melodyRoll->refresh();
+
+        if (melodyView)
+            melodyRoll->refresh();   // hidden in the Chords view: setMelodyViewVisible (true) resyncs it
+
         updateViewSwitch();
     }
 
@@ -563,7 +566,9 @@ void ChordbloomEditor::refreshChildren()
     controls->refresh();
     keyboard->refresh();
     exportPanel->refresh();
-    melodyRoll->refresh();
+
+    if (melodyView)
+        melodyRoll->refresh();   // hidden in the Chords view: setMelodyViewVisible (true) resyncs it
 
     // The view may have changed with a loaded state (the choice is part of it).
     const bool stateSaysMelody = processor.getAPVTS().state.getProperty (kViewProp, "chords").toString() == "melody";

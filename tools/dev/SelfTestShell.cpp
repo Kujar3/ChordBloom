@@ -1,5 +1,7 @@
 #include "SelfTestUtil.h"
 
+#include <thread>
+
 // Shell selftests (owner: WP6; final-spec 8.2 / 9 WP6): editor, roll toolbar, export panel, controls, header.
 // Registered in runSelfTest (SelfTest.cpp) by WP0.
 
@@ -404,6 +406,7 @@ void applyGeneratorMenuResult (RollToolbar&, ChordbloomProcessor&, int result);
 void sendMouseEvent (RollToolbar&, const juce::MouseEvent&, int kind);   // 0 down, 1 up, 2 move, 3 exit, 4 drag
 juce::String getBrowserText (RollToolbar&);
 juce::String getTooltipAt (RollToolbar&, juce::Point<float>);
+juce::Component* tipParentFor (juce::Component&);
 }
 
 namespace cb::ui::exportpanel
@@ -1038,6 +1041,32 @@ void testRollToolbarInteraction()
         check (other.getGenerateSettings() == picked && ! q.isMelodyFromGenerator(),
                "toolbar: cb.gen.* survive a state round trip (and a loaded melody is never treated as untouched)");
 
+        // Final review: a settings pick while a load from another thread still waits for its async apply never
+        // regenerates over the loaded melody (the generator result belongs to the previous song).
+        {
+            ChordbloomProcessor r;
+            r.setProgression (makeProgression ({ C_, Am_, F_, G_ }));
+            RollToolbar bar (r);
+            bar.setSize (918, 26);
+            check (bar.generateMelody (fixedSeed) && r.isMelodyFromGenerator(), "toolbar setup: a generated melody");
+
+            ChordbloomProcessor source;
+            source.setProgression (makeProgression ({ C_, Am_, F_, G_ }));
+            const auto loadedMelody = makeMelody ({ melodyNote (64, 0.0, 1.0), melodyNote (67, 4.0, 2.0) });
+            source.setMelody (loadedMelody);
+            juce::MemoryBlock song;
+            source.getStateInformation (song);
+            std::thread loader ([&] { r.setStateInformation (song.getData(), (int) song.getSize()); });
+            loader.join();   // no message dispatched: the load is still pending
+
+            check (! r.isMelodyFromGenerator(), "toolbar: a pending load already counts as a loaded melody");
+            rt::applyGeneratorMenuResult (bar, r, 200);   // a Density pick
+            check (r.getMelody() == loadedMelody && ! r.isMelodyFromGenerator() && ! r.undo(),
+                   "toolbar: a generator pick during a pending load keeps the loaded melody (no regenerate, no undo step)",
+                   str (r.getMelody().notes.size(), " notes"));
+            pumpMessages (40);
+        }
+
         ChordbloomProcessor empty;
         RollToolbar emptyBar (empty);
         emptyBar.setSize (918, 26);
@@ -1327,6 +1356,10 @@ void testControlsPanel()
     {
         check (combo->getNumItems() == cb::numBassModes, "controls: the Bass combo lists the 15 modes",
                str (combo->getNumItems()));
+        // Final review (docs): an edited bass plays its stored notes, so the tooltip says the knobs no longer apply.
+        check (combo->getTooltip().contains ("Velocity, Gate and Humanize no longer change it"),
+               "controls: the edited Bass tooltip says Velocity, Gate and Humanize no longer apply",
+               combo->getTooltip().toStdString());
         const int modeBefore = paramInt (p, cb::ParamIDs::bassMode);
         combo->showPopup();
         pumpMessages (60);
@@ -1343,6 +1376,13 @@ void testControlsPanel()
     {
         check (false, "controls: the Bass combo found by its title");
     }
+
+    if (auto* humanizeSlider = dynamic_cast<juce::Slider*> (findComponentByTitle (*ed, "Humanize")))
+        check (humanizeSlider->getTooltip().contains ("an edited arp or bass in the Roll plays as drawn"),
+               "controls: the Humanize tooltip says edited Roll layers are not humanized",
+               humanizeSlider->getTooltip().toStdString());
+    else
+        check (false, "controls: the Humanize knob found by its title");
 
     // Rate / Swing dimming (final-spec 7.11): arp on + Block chords + held bass: neither dimmed; 1/8T: swing dimmed.
     auto* rate = findComponentByTitle (*ed, "Rate");
@@ -1370,11 +1410,87 @@ void testControlsPanel()
         setParam (p, cb::ParamIDs::rate, 2.0f);
         pumpMessages (120);
         check (rate->getAlpha() == 1.0f && swing->getAlpha() == 1.0f, "controls: a bass pattern un-dims Rate and Swing too");
+
+        // Final review: only an audible auto layer follows Rate / Swing (an edited layer plays its own notes, a muted
+        // bass plays nothing).
+        setParam (p, cb::ParamIDs::bassOn, 0.0f);
+        pumpMessages (120);
+        check (rate->getAlpha() < 1.0f && swing->getAlpha() < 1.0f, "controls: a muted bass pattern dims Rate and Swing");
+        setParam (p, cb::ParamIDs::bassOn, 1.0f);
+        check (makeCustom (p, cb::Layer::Bass), "controls setup: custom pattern bass");
+        pumpMessages (120);
+        check (rate->getAlpha() < 1.0f && swing->getAlpha() < 1.0f, "controls: an edited bass pattern dims Rate and Swing");
+        p.resetLayer (cb::Layer::Bass);
+        pumpMessages (120);
+        check (rate->getAlpha() == 1.0f && swing->getAlpha() == 1.0f, "controls: the auto bass pattern lights them again");
+
+        setParam (p, cb::ParamIDs::bassMode, (float) cb::BassMode::Octaves);
+        setParam (p, cb::ParamIDs::bassOn, 0.0f);
+        pumpMessages (120);
+        check (rate->getAlpha() < 1.0f, "controls: a muted Octaves bass dims Rate (like an arp that is off)");
+        setParam (p, cb::ParamIDs::bassOn, 1.0f);
+        setParam (p, cb::ParamIDs::bassMode, 1.0f);   // Root: held
+        setParam (p, cb::ParamIDs::arpOn, 1.0f);
+        check (makeCustom (p, cb::Layer::Arp), "controls setup: custom arp");
+        pumpMessages (120);
+        check (rate->getAlpha() < 1.0f && swing->getAlpha() < 1.0f, "controls: Block + held bass + an edited arp: Rate and Swing dimmed");
+        p.resetLayer (cb::Layer::Arp);
+        pumpMessages (120);
+        check (rate->getAlpha() == 1.0f && swing->getAlpha() == 1.0f, "controls: the auto arp lights them again");
+
+        // A timing-only re-render (Velocity / Gate / Humanize knob, automation) moves the layer serial: the panel is
+        // refreshed but repaints nothing; the Rate caption repaints only when it flips.
+        const int captionRepaints = controls.getNumRateCaptionRepaints();
+        const auto serialBefore = p.getLayerSerial();
+        for (float v : { 0.3f, 0.5f, 0.7f, 0.9f })
+        {
+            setParam (p, cb::ParamIDs::velocity, v);
+            setParam (p, cb::ParamIDs::gate, v);
+            setParam (p, cb::ParamIDs::humanize, v * 0.5f);
+            pumpMessages (60);
+        }
+        check (p.getLayerSerial() != serialBefore && controls.getNumRateCaptionRepaints() == captionRepaints,
+               "controls: Velocity / Gate / Humanize changes repaint no Rate caption",
+               str (controls.getNumRateCaptionRepaints() - captionRepaints));
+        setParam (p, cb::ParamIDs::arpOn, 0.0f);
+        pumpMessages (120);
+        check (rate->getAlpha() < 1.0f && controls.getNumRateCaptionRepaints() == captionRepaints + 1,
+               "controls: the Rate caption repaints once when it dims", str (controls.getNumRateCaptionRepaints() - captionRepaints));
     }
     else
     {
         check (false, "controls: Rate and Swing found by their titles");
     }
+}
+
+//==============================================================================
+// Final review: the roll toolbar's hover tip goes to the editor (like its TooltipWindow), never to the component
+// above it (in the VST3 build JUCE's ContentWrapperComponent, which asks the host to resize for any child's bounds).
+void testToolbarTipParent()
+{
+    ChordbloomProcessor p;
+    std::unique_ptr<juce::AudioProcessorEditor> holder (p.createEditor());
+    auto* ed = dynamic_cast<ChordbloomEditor*> (holder.get());
+
+    if (ed == nullptr)
+    {
+        check (false, "toolbar tip: editor");
+        return;
+    }
+
+    juce::Component wrapper;   // stands in for the host wrapper around the editor
+    wrapper.addAndMakeVisible (*ed);
+    pumpMessages (30);
+    auto& tb = ed->getMelodyRoll().getToolbar();
+    check (rt::tipParentFor (tb) == ed && tb.getTopLevelComponent() == &wrapper,
+           "toolbar: the hover tip is parented to the editor, not to the host wrapper above it");
+
+    RollToolbar bare (p);
+    juce::Component box;
+    box.addAndMakeVisible (bare);
+    check (rt::tipParentFor (bare) == &box, "toolbar: without an editor the hover tip goes to the top level");
+    box.removeChildComponent (&bare);
+    wrapper.removeChildComponent (ed);
 }
 
 //==============================================================================
@@ -1501,5 +1617,6 @@ void cbtest::runShellSelfTests()
     testBrowserPickWhilePlaying();
     testExportPanel();
     testControlsPanel();
+    testToolbarTipParent();
     testShellViewAndFocus();
 }

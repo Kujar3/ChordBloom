@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <tuple>
 
 // The roll canvas (final-spec 7.2-7.9; owner WP5). Child 0 is the grid surface (Impl, which paints the whole card,
 // the chord strip, the grid, the pills and the velocity lane), child 1 the RollToolbar (WP6) in the toolbar row.
@@ -414,13 +415,35 @@ struct MelodyRoll::Impl final : public juce::Component,
         if (! changed)
             return;
 
+        ++numSurfaceRefreshes;
         layout();
         repaint();
     }
 
+    // What the surface draws of another layer: its outlines in view (pitch, start, length; never velocity), only while
+    // it is on and the other layers are shown (forEachVisibleOtherLayerNote).
+    std::vector<std::tuple<int, double, double>> otherLayerOutline (const cb::Melody& m, bool on) const
+    {
+        std::vector<std::tuple<int, double, double>> out;
+
+        if (! showGhosts || ! on)
+            return out;
+
+        const int hi = topNote();
+        const int lo = lowestPaintedRow();
+
+        for (const auto& n : m.notes)
+            if (n.note >= lo && n.note <= hi && n.startBeat < (double) visibleBeats)
+                out.emplace_back (n.note, n.startBeat, n.lengthBeats);
+
+        return out;
+    }
+
     // Pulls every layer's notes and flags. clearOnChange: the selection goes when the current layer's notes changed
     // from outside a gesture (never in the middle of one: the gesture's working copy wins at mouse-up).
-    // Returns true when anything the surface shows from the layers changed.
+    // Returns true when anything the surface shows from the layers changed: any change of the current layer, but of
+    // another layer only a change of its outlines in view (a Velocity or Gate knob drag re-renders the auto arp and
+    // bass; with the arp off and the bass out of view that must not repaint the whole roll at 30 Hz).
     bool syncLayers (bool clearOnChange)
     {
         serial = processor.getLayerSerial();
@@ -431,18 +454,28 @@ struct MelodyRoll::Impl final : public juce::Component,
             auto notes = processor.getLayerNotes (kLayers[i]);
             const bool on = processor.isLayerOn (kLayers[i]);
             const bool custom = processor.isLayerCustom (kLayers[i]);
+            auto& old = layerNotes[(size_t) i];
 
-            if (notes != layerNotes[(size_t) i])
+            if (i == cur())
             {
-                changed = true;
+                if (notes != old)
+                {
+                    changed = true;
 
-                if (i == cur() && clearOnChange && ! inGridGesture())
-                    selection.clear();
+                    if (clearOnChange && ! inGridGesture())
+                        selection.clear();
+                }
 
-                layerNotes[(size_t) i] = std::move (notes);
+                changed = changed || on != layerOn[(size_t) i] || custom != layerCustom[(size_t) i];
+            }
+            else if ((notes != old || on != layerOn[(size_t) i]) && ! changed)
+            {
+                changed = otherLayerOutline (notes, on) != otherLayerOutline (old, layerOn[(size_t) i]);
             }
 
-            changed = changed || on != layerOn[(size_t) i] || custom != layerCustom[(size_t) i];
+            if (notes != old)
+                old = std::move (notes);
+
             layerOn[(size_t) i] = on;
             layerCustom[(size_t) i] = custom;
         }
@@ -632,6 +665,9 @@ struct MelodyRoll::Impl final : public juce::Component,
         return juce::jlimit (laneArea.getX() + 4.0f, std::max (laneArea.getX() + 4.0f, laneArea.getRight() - 4.0f),
                              std::round (beatToX (n.startBeat)) + 1.0f);
     }
+    // A note has a stalk in the velocity lane only while it starts inside the visible beats (parked notes past the
+    // visible range would clamp onto the lane's right edge): paint and hit testing share this one rule.
+    bool inLane (const cb::MelodyNote& n) const { return n.startBeat < (double) visibleBeats; }
     float velocityToY (float v) const { const auto r = laneInner(); return r.getBottom() - v * r.getHeight(); }
     float yToVelocity (float y) const
     {
@@ -999,13 +1035,16 @@ struct MelodyRoll::Impl final : public juce::Component,
             g.fillRect (juce::Rectangle<float> (x, area.getY(), 1.0f, area.getHeight()));
         }
 
-        // C labels (and the hovered row's name) at the left edge
+        // C labels (and the hovered row's name) at the left edge. While a draw preview shows, the
+        // label and row highlight follow the pitch a click would write (Snap may move it off the
+        // pointer's row), so the name always matches the preview.
         const auto labelFont = cb::ui::font (juce::jlimit (8.5f, 10.5f, rowH * 0.8f), 600);
         g.setFont (labelFont);
+        const int labelRow = hoverLabelRow();
 
         for (int n = hi; n >= lo; --n)
         {
-            if (cb::pc (n) != 0 || n == hoverRow || rowH < 8.5f)
+            if (cb::pc (n) != 0 || n == labelRow || rowH < 8.5f)
                 continue;
 
             g.setColour (Col::textFaint.withAlpha (0.95f));
@@ -1013,10 +1052,10 @@ struct MelodyRoll::Impl final : public juce::Component,
                         juce::Justification::centredLeft, false);
         }
 
-        if (hoverRow >= lo && hoverRow <= hi && gesture == Gesture::none)
+        if (labelRow >= lo && labelRow <= hi && gesture == Gesture::none)
         {
             g.setColour (juce::Colours::white.withAlpha (0.035f));
-            g.fillRect (juce::Rectangle<float> (area.getX(), rowTop (hoverRow), area.getWidth(), rowH));
+            g.fillRect (juce::Rectangle<float> (area.getX(), rowTop (labelRow), area.getWidth(), rowH));
         }
 
         paintGhosts (g);
@@ -1025,11 +1064,11 @@ struct MelodyRoll::Impl final : public juce::Component,
         paintNotes (g, lo, hi);
         paintParkedLabel (g);
 
-        if (hoverRow >= lo && hoverRow <= hi)
+        if (labelRow >= lo && labelRow <= hi)
         {
-            const auto name = noteName (hoverRow, key);
+            const auto name = noteName (labelRow, key);
             const float w = widthOf (labelFont, name) + 10.0f;
-            const auto pill = juce::Rectangle<float> (area.getX() + 2.0f, rowTop (hoverRow) + 0.5f, w, rowH - 1.0f);
+            const auto pill = juce::Rectangle<float> (area.getX() + 2.0f, rowTop (labelRow) + 0.5f, w, rowH - 1.0f);
             g.setColour (Col::panelHover.withAlpha (0.95f));
             g.fillRoundedRectangle (pill, 3.0f);
             g.setColour (Col::text);
@@ -1194,6 +1233,13 @@ struct MelodyRoll::Impl final : public juce::Component,
         });
 
         flushRuns();
+    }
+
+    // The row the hover name pill and row highlight mark: the pitch a click would write while a draw preview shows
+    // (Snap may move it off the pointer's row), otherwise the pointer's row; -1 when the pointer is off the grid.
+    int hoverLabelRow() const noexcept
+    {
+        return (gesture == Gesture::none && hoverDraw.has_value()) ? hoverDraw->note : hoverRow;
     }
 
     // Where a click would put a new note (hovering empty space).
@@ -1516,7 +1562,7 @@ struct MelodyRoll::Impl final : public juce::Component,
 
         for (int pass = 0; pass < 2; ++pass)
             for (int i = 0; i < (int) m.notes.size(); ++i)
-                if (const bool selected = isSelected (i); selected == (pass == 1) && m.notes[(size_t) i].startBeat < (double) visibleBeats)
+                if (const bool selected = isSelected (i); selected == (pass == 1) && inLane (m.notes[(size_t) i]))
                     paintStalk (m.notes[(size_t) i], selected, true);
 
         // The label last, on a small backing, so dense layers never cover it; it starts right of the beat-0 stalk,
@@ -1533,7 +1579,8 @@ struct MelodyRoll::Impl final : public juce::Component,
             std::vector<int> under;
 
             for (int i = 0; i < (int) m.notes.size() && under.size() <= 2; ++i)
-                if (label.expanded (4.0f).contains (stalkX (m.notes[(size_t) i]), velocityToY (m.notes[(size_t) i].velocity)))
+                if (inLane (m.notes[(size_t) i])
+                    && label.expanded (4.0f).contains (stalkX (m.notes[(size_t) i]), velocityToY (m.notes[(size_t) i].velocity)))
                     under.push_back (i);
 
             if (under.size() <= 2)
@@ -1763,6 +1810,10 @@ struct MelodyRoll::Impl final : public juce::Component,
         for (int i = 0; i < (int) m.notes.size(); ++i)
         {
             const auto& n = m.notes[(size_t) i];
+
+            if (! inLane (n))
+                continue;   // not drawn: never grabbed (and never wins over a visible stalk at the right edge)
+
             const float x = stalkX (n);
 
             if (std::abs (x - pos.x) <= kStalkReach)
@@ -2804,12 +2855,15 @@ struct MelodyRoll::Impl final : public juce::Component,
     }
 
     // What a menu showed when it opened: its item is resolved later (async), when the layer's notes may have changed
-    // (an automation re-render clears the selection), so a note command must not fall back to every note.
+    // (an automation re-render clears the selection), so a note command must not fall back to every note; the
+    // current layer may have changed (a state load), so a command on the current layer is refused then; and a ticked
+    // toggle may have flipped (automation, a state load), so a toggle sets the opposite of the tick the user saw.
     struct MenuScope
     {
         cb::Layer layer = cb::Layer::Melody;
         bool hadSelection = false;
         std::vector<cb::MelodyNote> selected;
+        bool layerWasOn = false, velLaneWas = false, ghostsWas = false;
     };
 
     static bool actsOnSelection (Command c)
@@ -2832,32 +2886,66 @@ struct MelodyRoll::Impl final : public juce::Component,
         }
     }
 
+    // Commands that act on whatever layer is current (its notes, selection or view), not on an explicit target.
+    static bool actsOnCurrentLayer (Command c)
+    {
+        return actsOnSelection (c) || c == Command::SelectAll || c == Command::Paste || c == Command::PasteHere;
+    }
+
     void menuChosen (int result, cb::Layer target, double atBeat, const MenuScope& scope)
     {
-        if (result >= kSnapIdBase && result < kSnapIdBase + cb::numMelodySnapModes)
+        const bool isSnap = result >= kSnapIdBase && result < kSnapIdBase + cb::numMelodySnapModes;
+        const bool isGrid = result >= kGridIdBase && result < kGridIdBase + cb::numRateDivisions;
+        const bool isCommand = result >= kCommandIdBase && result < kCommandIdBase + kNumCommands;
+
+        if (! isSnap && ! isGrid && ! isCommand)
+            return;
+
+        const auto command = (Command) (result - kCommandIdBase);
+
+        // Snap, Grid and the note / selection commands go to the current layer: refused when it is no longer the
+        // layer the menu was opened on (a state load or host undo switched it while the menu was open).
+        if ((isSnap || isGrid || actsOnCurrentLayer (command)) && layer != scope.layer)
+            return;
+
+        if (isSnap)
         {
             setSnap ((cb::MelodySnap) (result - kSnapIdBase));
             return;
         }
 
-        if (result >= kGridIdBase && result < kGridIdBase + cb::numRateDivisions)
+        if (isGrid)
         {
             setGrid ((cb::RateDivision) (result - kGridIdBase));
             return;
         }
 
-        if (result < kCommandIdBase || result >= kCommandIdBase + kNumCommands)
+        // Toggles: the opposite of the tick the menu showed, never of a state that changed while it was open.
+        if (command == Command::ToggleLayerOn)
+        {
+            dropGesture();
+            syncLayers (true);
+            processor.setLayerOn (target, ! scope.layerWasOn);
+            finishLayerCommand (false);
             return;
+        }
 
-        const auto command = (Command) (result - kCommandIdBase);
+        if (command == Command::ToggleVelocityLane)
+        {
+            setVelocityLane (! scope.velLaneWas);
+            return;
+        }
+
+        if (command == Command::ToggleOtherLayers)
+        {
+            setOtherLayersShown (! scope.ghostsWas);
+            return;
+        }
 
         if (actsOnSelection (command))
         {
             dropGesture();
             syncLayers (true);
-
-            if (layer != scope.layer)
-                return;
 
             if (scope.hadSelection)
             {
@@ -2895,6 +2983,9 @@ struct MelodyRoll::Impl final : public juce::Component,
         scope.layer = layer;
         scope.selected = notesAt (notes(), selection);
         scope.hadSelection = ! scope.selected.empty();
+        scope.layerWasOn = processor.isLayerOn (target);
+        scope.velLaneWas = velLane;
+        scope.ghostsWas = showGhosts;
 
         if (screenArea.isEmpty())
             screenArea = { juce::Desktop::getMousePosition(), juce::Point<int> (1, 1) + juce::Desktop::getMousePosition() };
@@ -2938,9 +3029,26 @@ struct MelodyRoll::Impl final : public juce::Component,
         }
     }
 
+    // The surface is always visible itself (child 0): the editor hides the MelodyRoll in the Chords view, and a
+    // minimised window has a peer that is not showing. Offscreen (selftests, snapshots: no peer) only the hidden
+    // components inside the editor count.
+    bool rollShown() const
+    {
+        if (getPeer() != nullptr)
+            return isShowing();
+
+        for (auto* c = (const juce::Component*) this; c != nullptr && c->getParentComponent() != nullptr; c = c->getParentComponent())
+            if (! c->isVisible())
+                return false;
+
+        return true;
+    }
+
     void timerCallback() override
     {
-        if (! isVisible())
+        // Hidden (the Chords view, a minimised window): no polling at all; MelodyRoll::refresh() on show resyncs, and
+        // the playhead and ghost serial are compared with what was last shown.
+        if (! rollShown())
             return;
 
         const bool playingNow = processor.getPlayingSlot() >= 0;
@@ -2990,6 +3098,7 @@ struct MelodyRoll::Impl final : public juce::Component,
     cb::Layer layer = cb::Layer::Melody;
     bool showGhosts = true, velLane = false;
     int rightInset = 0;
+    int numSurfaceRefreshes = 0;   // syncAll runs that laid out and repainted the whole surface (test hook)
 
     // Data
     cb::Progression progression;
@@ -3137,6 +3246,8 @@ juce::PopupMenu MelodyRoll::createMenu (MenuSection section, double atBeat, std:
 std::optional<MelodyRoll::MenuSection> MelodyRoll::getLastMenuShown() const noexcept { return impl->lastMenu; }
 juce::Rectangle<float> MelodyRoll::getChordStripArea() const noexcept { return impl->stripArea; }
 int MelodyRoll::getNumOtherLayerNotesShown() const noexcept { return impl->countVisibleOtherLayerNotes(); }
+int MelodyRoll::getNumSurfaceRefreshes() const noexcept { return impl->numSurfaceRefreshes; }
+int MelodyRoll::getHoverLabelRow() const noexcept { return impl->hoverLabelRow(); }
 bool MelodyRoll::isVelocityLaneVisible() const noexcept { return impl->velLane; }
 void MelodyRoll::setVelocityLaneVisible (bool shouldShow) { impl->setVelocityLane (shouldShow); }
 juce::Rectangle<float> MelodyRoll::getVelocityLaneArea() const noexcept { return impl->laneArea; }

@@ -219,6 +219,23 @@ constexpr float kSlotWeights[5][16] = {
 
 constexpr int slotBucket (int k) { return k <= 2 ? 0 : k <= 4 ? 1 : k <= 6 ? 2 : k <= 9 ? 3 : 4; }
 
+// [D] tuned: density above the default (0.5). Sparse's whole-bar templates hold at most 2 onsets and Lyrical's at
+// most 4, so with them a Busy bar cannot reach GP 1.3.1's npbHi: above 0.5 the template share fades by this fraction at
+// density 1 (linearly from 0.5) and the slot / cell draws, which follow the target, carry Busy. A gain on the target's
+// distance above npbDef makes up for the gap / copy losses there (Driving saturates near 16 onsets a bar and
+// overshoots at gain 1). Density 0.5 and below are unchanged.
+constexpr float kTemplateFadeBusy[kStyles] = { 0.0f, 1.0f, 0.0f, 1.0f };
+constexpr float kNpbGainBusy[kStyles] = { 1.0f, 1.4f, 0.85f, 1.25f };
+
+// [D] Short loops (<= 2 bars): a gap takes at most a quarter of its unit (at least 1 beat), and a new Sparse / Lyrical
+// unit keeps at least this many onsets in its sounding part (missing ones are added on the 8th grid; 3 when the unit
+// is the whole loop, so a note sits between the phrase start and the loop end, which the seam and resolveEnding pull
+// back to the first note). Otherwise most short Sparse loops were one held note or a repeated tonic, a few dozen
+// outcomes in all, and seed + 1 often gave the same melody (final-spec 9 WP1 determinism: >= 95% differ).
+constexpr int kShortLoopMaxBeats = 8;
+constexpr int kShortLoopMinOnsets = 2;
+constexpr int kShortLoopMinOnsetsOneUnit = 3;
+
 constexpr float kOddCapSlack = 0.05f;     // GP 1.3.5: reject a draw that pushes the running share above cap + 0.05
 constexpr float kOddPriorOnsets = 8.0f;   // [D] pseudo-onsets (at the cap share) that start each unit's running share
 constexpr double kDensityTiltRange = 4.0; // GP 1.3.3: g in [-4, 4]
@@ -418,16 +435,24 @@ constexpr float kFirstMinor[7] = { .46f, .04f, .17f, .06f, .18f, .04f, .04f };
 constexpr float kFirstMajor[7] = { .28f, .08f, .15f, .06f, .22f, .13f, .07f };
 constexpr float kResolveTonic = 2.0f;        // GP 1.5.6: the tonic x2 on the loop's final note
 constexpr float kResolveFamily = 1.5f;       // [D] tuned: ... and the tonic family (1, 3, 5) x1.5 (the clash cut costs
-                                             // the tonic over V / bVII, final-spec 9 WP1 wants >= 60% tonic family)
+                                             // the tonic over V / bVII; final-spec 9 WP1 wants the loop end home in
+                                             // >= 65% of seeds, MelodyStats::loopEndHome)
 constexpr float kResolveChordTone = 2.0f;    // [D] tuned: the final note also leans to a tone of the last chord
 constexpr float kResolveClash = 0.01f;       // [D] ... and avoids a non-chord tone a semitone from a tone of that chord
                                              // (or a b9 above its bass); a pickup into the loop start also uses it
 // [D] When no tonic-family tone (1, 3, 5) is a tone of the last chord (VII in minor, V or IV in major), a chord tone
 // 1-2 semitones from the melody's first note counts as "home" (at least the tonic's row weight x2 x this): it resolves
-// through the seam. Tuned so the tonic family keeps >= 60% of loop ends (final-spec 9 WP1) without a clash.
-constexpr float kResolveHome = 0.25f;
+// through the seam. Tuned toward chord fit: these seam endings count as home (MelodyStats::loopEndHome, final-spec 9
+// WP1), so the loop end no longer has to land on a non-chord tonic over such a chord to pass (0.25 did, for the old
+// "tonic family in >= 60%" rule: about half of all loop ends were non-chord tonic-family tones).
+constexpr float kResolveHome = 0.7f;
+// [D] tuned: when the tonic itself clashes with the last chord but the chord holds another tonic-family tone (V or iii
+// in major), the clash-free tonic-family candidates get this extra factor, so resolveEnding changes V-ending loops too.
+constexpr float kResolveFamilyStrong = 5.0f;
 
-// R3 open / closed cadence factors by key degree 1..7.
+// R3 open / closed cadence factors by key degree 1..7. [D] A closed factor above 1 lifts chord tones only (a non-chord
+// tone gets at most x1.0), except at a resolveEnding loop end, which keeps its own tuning above; otherwise a closed
+// block end over V / bVII favoured the non-chord tonic over its own chord tones.
 constexpr float kOpenFactor[7] = { 0.6f, 1.4f, 0.9f, 1.0f, 1.4f, 1.0f, 1.2f };
 constexpr float kClosedFactor[7] = { 1.6f, 0.6f, 1.3f, 1.0f, 1.0f, 1.0f, 0.5f };
 

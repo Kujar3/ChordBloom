@@ -534,7 +534,8 @@ struct ControlsPanel::Impl
                     [] (double v) { return juce::String (juce::jlimit (1, 127, juce::roundToInt (v * 127.0))); },
                     "Velocity of the generated notes (shown as MIDI velocity 1-127)"),
           humanize (param (apvts, cb::ParamIDs::humanize), "Humanize", percent,
-                    "Humanize: subtle, repeatable timing and velocity variation so the part feels played")
+                    "Humanize: subtle, repeatable timing and velocity variation so the part feels played "
+                    "(an edited arp or bass in the Roll plays as drawn)")
     {
         namespace id = cb::ParamIDs;
 
@@ -617,14 +618,37 @@ struct ControlsPanel::Impl
         const auto bassMode = (B) juce::jlimit (0, cb::numBassModes - 1, bass.getSelectedItemIndex());
         const auto rateDiv = (cb::RateDivision) juce::jlimit (0, cb::numRateDivisions - 1, rate.getSelectedIndex());
 
+        // Only an audible auto layer follows Rate / Swing: an edited (custom) arp or bass plays its own notes at their
+        // baked times, and a muted bass (bassOn off) plays nothing, like an arp that is off.
+        const auto* bassOnParam = apvts.getRawParameterValue (cb::ParamIDs::bassOn);
+        const bool bassOff = bassOnParam != nullptr && bassOnParam->load() < 0.5f;
+        const bool bassCustom = processor.isLayerCustom (cb::Layer::Bass);
+        const bool bassFollows = ! bassOff && ! bassCustom;
+        const bool bassGridMode = bassMode == B::Octaves || bassMode == B::Pulse || cb::isBassPattern (bassMode);
+
         const bool patternOnGrid = ! (pat == P::Block || pat == P::Strum || pat == P::Offbeat);
-        const bool bassOnGrid = bassMode == B::Octaves || bassMode == B::Pulse;
+        const bool bassOnGrid = (bassMode == B::Octaves || bassMode == B::Pulse) && bassFollows;
         const bool triplet = rateDiv == cb::RateDivision::EighthTriplet;
 
-        // Phase 2 (final-spec 7.11): the chord Rate is the groove grid the arp and the pattern basses swing on.
+        // Phase 2 (final-spec 7.11): the chord Rate is the groove grid the auto arp and the auto pattern basses swing on.
         const auto* arpParam = apvts.getRawParameterValue (cb::ParamIDs::arpOn);
         const bool arpOn = arpParam != nullptr && arpParam->load() >= 0.5f;
-        const bool groove = arpOn || cb::isBassPattern (bassMode);
+        const bool arpCustom = arpOn && processor.isLayerCustom (cb::Layer::Arp);
+        const bool groove = (arpOn && ! arpCustom) || (cb::isBassPattern (bassMode) && bassFollows);
+
+        // Why nothing runs on the grid right now (the chords hold, and the bass is held, muted or edited).
+        juce::String quiet (cb::rhythmPatternName (pat));
+        quiet << " holds each chord";
+
+        if (bassGridMode && bassOff)
+            quiet << ", the bass is muted";
+        else if (bassGridMode && bassCustom)
+            quiet << ", the edited bass plays its own notes";
+        else
+            quiet << (arpCustom ? ", the bass is held" : " and the bass is held too");
+
+        if (arpCustom)
+            quiet << " and the edited arp plays its own notes";
 
         const bool rateActive = patternOnGrid || bassOnGrid || groove;
         const bool swingActive = ((patternOnGrid || bassOnGrid) && ! triplet)
@@ -637,9 +661,7 @@ struct ControlsPanel::Impl
         {
             rateNote = pat == P::Offbeat
                          ? "No effect with Offbeat (it always plays on the \"&\"), except that swing needs 1/8."
-                         : "No effect right now: " + juce::String (cb::rhythmPatternName (pat))
-                               + " holds each chord and the bass is held too. Try Pulse, an Arp or Broken, "
-                                 "or the Octaves / Pulse bass.";
+                         : "No effect right now: " + quiet + ". Try Pulse, an Arp or Broken, or the Octaves / Pulse bass.";
         }
 
         if (! swingActive)
@@ -649,18 +671,27 @@ struct ControlsPanel::Impl
             else if (pat == P::Offbeat && ! bassOnGrid)
                 swingNote = "With Offbeat, swing only works at rate 1/8.";
             else
-                swingNote = "No effect right now: " + juce::String (cb::rhythmPatternName (pat))
-                              + " holds each chord and the bass is held too. Try Pulse, an Arp or Broken, "
-                                "or the Octaves / Pulse bass.";
+                swingNote = "No effect right now: " + quiet + ". Try Pulse, an Arp or Broken, or the Octaves / Pulse bass.";
         }
 
-        rate.setTooltip (juce::String (rateTip) + "\n" + grooveTip + (rateNote.isNotEmpty() ? "\n\n" + rateNote : juce::String()));
+        // Called on every layer-serial move (a Velocity or Gate knob drag too): only what changed is touched.
+        // setAlpha repaints a control only when its alpha changes; the panel itself only draws the dimmed caption.
+        const auto rateTipText = juce::String (rateTip) + "\n" + grooveTip + (rateNote.isNotEmpty() ? "\n\n" + rateNote : juce::String());
+
+        if (rate.getTooltip() != rateTipText)
+            rate.setTooltip (rateTipText);
+
         swing.setTooltipText (swingTip, swingNote);
 
         rate.setAlpha (rateActive ? 1.0f : kInactiveAlpha);
         swing.setAlpha (swingActive ? 1.0f : kInactiveAlpha);
-        rateInactive = ! rateActive;
-        owner.repaint();   // the "Rate" caption dims with the control
+
+        if (rateInactive != ! rateActive)
+        {
+            rateInactive = ! rateActive;
+            ++numCaptionRepaints;
+            owner.repaint (rateCaption);   // the "Rate" caption dims with the control
+        }
     }
 
     // Caption glyphs and the combo's tooltip words (final-spec 7.11).
@@ -677,8 +708,8 @@ struct ControlsPanel::Impl
             tip << "\n\nBass: " << stateText << ".";
 
             if (bassEdited)
-                tip << " Your notes in the Roll play instead of the pattern; picking a mode here resets them (Undo brings "
-                       "them back).";
+                tip << " Your notes in the Roll play instead of the pattern, so Velocity, Gate and Humanize no longer "
+                       "change it; picking a mode here resets them (Undo brings them back).";
             if (bassMuted)
                 tip << " Muted: turn it on with the dot on the Roll's Bass tab.";
         }
@@ -708,7 +739,8 @@ struct ControlsPanel::Impl
     }
 
     bool bassEdited = false, bassMuted = false, shownEdited = false, shownMuted = false;
-    juce::Rectangle<int> bassCaption;
+    juce::Rectangle<int> bassCaption, rateCaption;
+    int numCaptionRepaints = 0;   // Rate caption repaints (test hook: getNumRateCaptionRepaints)
 
     static constexpr float kInactiveAlpha = 0.45f;
     static constexpr const char* grooveTip = "Rate also sets the swing grid of the arp and the bass patterns.";
@@ -865,6 +897,7 @@ void ControlsPanel::resized()
         auto rows = rowsFor (groups[0]);
         d.pattern.setBounds (withCaption (rows.a, "Pattern"));
         d.rate.setBounds (withCaption (rows.b, "Rate"));
+        d.rateCaption = d.captions.back().area;
         auto c = rows.c;
         d.swing.setBounds (c.removeFromLeft (c.getWidth() / 2));
         d.gate.setBounds (c);
@@ -938,3 +971,4 @@ void ControlsPanel::pickBassModeAsUser (cb::BassMode mode)
 }
 
 juce::String ControlsPanel::getBassStateText() const { return impl->bassStateText(); }
+int ControlsPanel::getNumRateCaptionRepaints() const { return impl->numCaptionRepaints; }

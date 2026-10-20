@@ -232,8 +232,12 @@ public:
     // false (nothing changes, no undo step) without chords or when the result equals the current melody.
     bool generateMelody (const cb::MelodyGenSettings&, std::uint32_t seed);
     // True when the last successful generateMelody result is remembered and the melody still equals it. Any other melody
-    // commit, undo, redo and every state load forget it (false afterwards, also for a loaded generated melody).
+    // commit, undo, redo and every state load forget it (false afterwards, also for a loaded generated melody, and
+    // already while a load made off the message thread waits to be applied).
     bool isMelodyFromGenerator() const;
+    // A generator setting changed: applies a pending load first, then, only while isMelodyFromGenerator, regenerates
+    // with getLastGeneratorSeed (generateMelody: one undo step). false when the melody is not the untouched result.
+    bool regenerateLastIdea (const cb::MelodyGenSettings&);
     std::uint32_t getLastGeneratorSeed() const;   // seed of the last successful generateMelody; 0 before one (not saved)
     // voicings = getProgressionVoicings(); accompaniment = one loop of what plays besides the melody: the chords, the
     // bass when isLayerOn (Bass) (custom notes included), the arp when arpOn.

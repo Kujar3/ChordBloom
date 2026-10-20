@@ -29,6 +29,7 @@ public:
     void refresh();                           // (phase 2) processor changed: Bass glyphs "edited" / "muted"
     void pickBassModeAsUser (cb::BassMode);   // (phase 2) test hook: exactly what choosing it in the Bass popup does
     juce::String getBassStateText() const;    // (phase 2) test hook: "", "edited", "muted" or "edited, muted"
+    int getNumRateCaptionRepaints() const;    // test hook: panel repaints for the dimmed "Rate" caption (only when it flips)
 
 private:
     struct Impl;

@@ -630,27 +630,44 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         return k;
     }
 
-    cb::VoicingSettings voicingFromParams() const
+    // The settings are derived from one RenderSnapshot (readSnapshot reads every parameter once, the stepped ones
+    // already clamped), so everything built from the same snapshot agrees even while a host automates.
+    static cb::VoicingSettings voicingFrom (const RenderSnapshot& s) noexcept
     {
         cb::VoicingSettings vs;
-        vs.style = (cb::VoicingStyle) intValue (prm.voicing, 0, cb::numVoicingStyles - 1);
-        vs.centerNote = 60 + 12 * intValue (prm.octave, -3, 3);
-        vs.voiceLeading = boolValue (prm.voiceLeading);
+        vs.style = (cb::VoicingStyle) s.voicing;
+        vs.centerNote = 60 + 12 * s.octave;
+        vs.voiceLeading = s.voiceLeading;
         return vs;
     }
 
-    cb::RenderSettings renderFromParams() const
+    static cb::RenderSettings renderFrom (const RenderSnapshot& s) noexcept
     {
         cb::RenderSettings rs;
-        rs.pattern = (cb::RhythmPattern) intValue (prm.pattern, 0, cb::numRhythmPatterns - 1);
-        rs.rate = (cb::RateDivision) intValue (prm.rate, 0, cb::numRateDivisions - 1, 1);
-        rs.bass = (cb::BassMode) intValue (prm.bassMode, 0, cb::numBassModes - 1, 1);
-        rs.velocity = juce::jlimit (0.05f, 1.0f, rawValue (prm.velocity, 0.75f));
-        rs.gate = juce::jlimit (0.05f, 1.0f, rawValue (prm.gate, 0.9f));
-        rs.swing = juce::jlimit (0.0f, 1.0f, rawValue (prm.swing, 0.0f));
-        rs.humanize = juce::jlimit (0.0f, 1.0f, rawValue (prm.humanize, 0.0f));
+        rs.pattern = (cb::RhythmPattern) s.pattern;
+        rs.rate = (cb::RateDivision) s.rate;
+        rs.bass = (cb::BassMode) s.bass;
+        rs.velocity = juce::jlimit (0.05f, 1.0f, s.velocity);
+        rs.gate = juce::jlimit (0.05f, 1.0f, s.gate);
+        rs.swing = juce::jlimit (0.0f, 1.0f, s.swing);
+        rs.humanize = juce::jlimit (0.0f, 1.0f, s.humanize);
         return rs;
     }
+
+    // Phase 2: the arp parameters (final-spec 4.3 / 6.1); centre = voicing centre + 5 + 12 * arpOctave, clamped 40..96.
+    static cb::ArpSettings arpFrom (const RenderSnapshot& s) noexcept
+    {
+        cb::ArpSettings a;
+        a.shape = (cb::ArpShape) s.arpShape;
+        a.rate = (cb::RateDivision) s.arpRate;
+        a.rhythm = (cb::ArpRhythm) s.arpRhythm;
+        a.centreNote = juce::jlimit (40, 96, voicingFrom (s).centerNote + 5 + 12 * s.arpOctave);
+        a.gate = juce::jlimit (0.05f, 1.0f, s.arpGate);
+        return a;
+    }
+
+    cb::VoicingSettings voicingFromParams() const { return voicingFrom (readSnapshot()); }
+    cb::RenderSettings renderFromParams() const { return renderFrom (readSnapshot()); }
 
     RenderSnapshot readSnapshot() const
     {
@@ -678,17 +695,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         return s;
     }
 
-    // Phase 2: the arp parameters (final-spec 4.3 / 6.1); centre = voicing centre + 5 + 12 * arpOctave, clamped 40..96.
-    cb::ArpSettings arpFromParams() const
-    {
-        cb::ArpSettings a;
-        a.shape = (cb::ArpShape) intValue (prm.arpShape, 0, cb::numArpShapes - 1);
-        a.rate = (cb::RateDivision) intValue (prm.arpRate, 0, cb::numRateDivisions - 1, 2);
-        a.rhythm = (cb::ArpRhythm) intValue (prm.arpRhythm, 0, cb::numArpRhythms - 1);
-        a.centreNote = juce::jlimit (40, 96, voicingFromParams().centerNote + 5 + 12 * intValue (prm.arpOctave, -2, 2));
-        a.gate = juce::jlimit (0.05f, 1.0f, rawValue (prm.arpGate, 0.9f));
-        return a;
-    }
+    cb::ArpSettings arpFromParams() const { return arpFrom (readSnapshot()); }
 
     //==============================================================================
     // Message thread: parameter change handling
@@ -874,10 +881,9 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         }
     }
 
-    // Voicings of any progression with the current settings (the cache for the current one, a fresh voicing otherwise).
-    std::vector<std::vector<int>> voicingsOf (const cb::Progression& p) const
+    // Voicings of any progression with the given settings (the cache for the current one, a fresh voicing otherwise).
+    std::vector<std::vector<int>> voicingsOf (const cb::Progression& p, const cb::VoicingSettings& vs) const
     {
-        const auto vs = voicingFromParams();
         if (p == progression)
             return voicingsFor (vs);
 
@@ -894,17 +900,19 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         return v;
     }
 
-    // The humanize-free auto notes of both generated layers for a progression with the current parameters (swing
-    // kept; the arp's bass clearance reads the humanize-free auto bass of the current bassMode). Two-entry memo keyed
-    // by (progression, parameter snapshot): commits ask for the current and the next progression.
-    AutoNotes computeAutoNotes (const cb::Progression& p) const
+    // The humanize-free auto notes of both generated layers for a progression with the parameters of one snapshot
+    // (swing kept; the arp's bass clearance reads the humanize-free auto bass of the snapshot's bassMode). Two-entry
+    // memo keyed by (progression, parameter snapshot): commits ask for the current and the next progression. Every
+    // setting comes from the snapshot that becomes the memo key, never from another read of the parameters, so a host
+    // automating during the compute cannot store notes of newer values under an older key.
+    AutoNotes computeAutoNotes (const cb::Progression& p, const RenderSnapshot& snap) const
     {
         AutoNotes result;
         if (p.empty())
             return result;
 
-        const auto voicings = voicingsOf (p);
-        auto rs = renderFromParams();
+        const auto voicings = voicingsOf (p, voicingFrom (snap));
+        auto rs = renderFrom (snap);
         rs.humanize = 0.0f;
 
         std::vector<cb::NoteEvent> rendered;
@@ -918,7 +926,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         }
 
         const auto bass = channelEvents (rendered, ChordbloomProcessor::kBassChannel, true);
-        const auto arp = renderArpSafe (p, voicings, arpFromParams(), rs, bass);
+        const auto arp = renderArpSafe (p, voicings, arpFrom (snap), rs, bass);
         try
         {
             result.bass = cb::notesFromEvents (bass, cb::layerLimits (cb::Layer::Bass));
@@ -943,7 +951,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         slot.valid = true;
         slot.progression = p;
         slot.snap = snap;
-        slot.notes = computeAutoNotes (p);
+        slot.notes = computeAutoNotes (p, snap);
         return slot.notes;
     }
 
@@ -3736,7 +3744,28 @@ bool ChordbloomProcessor::generateMelody (const cb::MelodyGenSettings& settings,
 
 bool ChordbloomProcessor::isMelodyFromGenerator() const
 {
+    {
+        // A load from another thread waiting for its async apply replaces the melody and forgets the result.
+        const std::lock_guard<std::mutex> lock (impl->stateMutex);
+
+        if (impl->pendingSong.has_value())
+            return false;
+    }
+
     return impl->lastGenerated.has_value() && *impl->lastGenerated == impl->melody;
+}
+
+// A generator setting changed (final-spec 7.4): the untouched last result is regenerated with its seed. The pending
+// load (if any) is applied first, so the ownership check sees the loaded melody and never replaces it.
+bool ChordbloomProcessor::regenerateLastIdea (const cb::MelodyGenSettings& settings)
+{
+    auto& i = *impl;
+    i.applyPendingState();
+
+    if (! i.lastGenerated.has_value() || *i.lastGenerated != i.melody || i.lastGeneratorSeed == 0)
+        return false;
+
+    return generateMelody (settings, i.lastGeneratorSeed);
 }
 
 std::uint32_t ChordbloomProcessor::getLastGeneratorSeed() const { return impl->lastGeneratorSeed; }

@@ -1593,6 +1593,74 @@ void testStateConsistencyOffThread()
            "state off-thread: an undo before the async apply finds the loaded song (cleared stacks), nothing reverts it");
 }
 
+// The two-entry auto-notes memo keyed by a parameter snapshot: a host automating a stepped parameter on another
+// thread while the message thread computes auto notes must never leave notes of the newer values under the older
+// key. Each round forces a memo miss (a fresh velocity), computes while a worker flips arpShape 0 <-> 8, then comes
+// back to that round's key with each shape quiet: the memo hits and getLayerNotes (Arp) must equal a direct render.
+void testAutoMemoUnderAutomation()
+{
+    ChordbloomProcessor p;
+    cb::Progression big;
+    for (int i = 0; i < 16; ++i)
+        big.slots.push_back ({ { (i * 5) % 12, i % 2 == 0 ? cb::ChordQuality::Dominant13 : cb::ChordQuality::Minor11 }, 16, -1, 0 });
+    p.setProgression (big);
+    pumpMessages (20);
+
+    std::atomic<int> phase { 0 };   // 0 idle, 1 flipping, 2 quit
+    std::atomic<bool> idle { true };
+    std::atomic<int> flips { 0 };
+    std::thread host ([&]
+    {
+        for (int k = 0;; ++k)
+        {
+            const int ph = phase.load();
+            if (ph == 2)
+                break;
+            if (ph == 1)
+            {
+                idle.store (false);
+                setParam (p, id::arpShape, (k % 2) == 0 ? 0.0f : 8.0f);
+                flips.fetch_add (1);
+            }
+            else
+            {
+                idle.store (true);
+                std::this_thread::yield();
+            }
+        }
+    });
+
+    int stale = 0, lookups = 0;
+    for (int i = 0; i < 150; ++i)
+    {
+        const float vel = 0.1f + 0.004f * (float) i;
+        setParam (p, id::velocity, vel);
+        phase.store (1);
+        p.setMelody (makeMelody ({ melodyNote (60 + i % 12, 0.0, 1.0) }));   // computes while the host flips
+        phase.store (0);
+        while (! idle.load())
+            std::this_thread::yield();
+
+        for (float shape : { 0.0f, 8.0f })
+        {
+            setParam (p, id::velocity, vel);
+            setParam (p, id::arpShape, shape);
+            p.setMelody (makeMelody ({ melodyNote (40 + i % 12, 2.0, 1.0), melodyNote (50, 3.0, shape == 0.0f ? 1.0 : 0.5) }));
+            const auto shown = p.getLayerNotes (Layer::Arp);
+            const auto truth = cb::notesFromEvents (p.renderLayerEvents (Layer::Arp), cb::layerLimits (Layer::Arp));
+            ++lookups;
+            stale += shown != truth ? 1 : 0;
+        }
+    }
+    phase.store (2);
+    host.join();
+    pumpMessages (10);
+
+    check (stale == 0 && flips.load() > 150,
+           "auto memo: notes computed while a host automates arpShape never sit under an older parameter key",
+           str (stale, " of ", lookups, " lookups stale, ", flips.load(), " host flips"));
+}
+
 void scriptedSession (ChordbloomProcessor& p)
 {
     p.setProgression (makeProgression ({ C_, Am_, F_, G_ }));
@@ -2360,6 +2428,7 @@ void cbtest::runEngineSelfTests()
     timed ("testFollow", [&] { testFollow (deps); });
     timed ("testLayerState", [&] { testLayerState (deps); });
     timed ("testStateConsistencyOffThread", [&] { testStateConsistencyOffThread(); });
+    timed ("testAutoMemoUnderAutomation", [&] { testAutoMemoUnderAutomation(); });
     timed ("testDeterminism", [&] { testDeterminism(); });
     timed ("testGenerate", [&] { testGenerate (deps); });
     timed ("testExport", [&] { testExport (deps); });

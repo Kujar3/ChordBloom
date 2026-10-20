@@ -148,6 +148,13 @@ public:
     std::optional<MenuSection> getLastMenuShown() const noexcept;
     juce::Rectangle<float> getChordStripArea() const noexcept;   // the chord names row above the grid
     int getNumOtherLayerNotesShown() const noexcept;             // this instance's other-layer outlines in view
+    // Test hook: how many times refresh() / the serial poll laid out and repainted the whole surface. Only a change the
+    // roll shows counts: of another layer only its outlines in view (not a velocity-only re-render, not a layer that is
+    // off or out of view); nothing is polled or synced while the roll is hidden (the Chords view, a minimised window).
+    int getNumSurfaceRefreshes() const noexcept;
+    // Test hook: the row the hover name pill marks (-1 off the grid). While a draw preview shows it is the preview's
+    // pitch, so with Snap on the name matches the note a click writes, not the pointer's row.
+    int getHoverLabelRow() const noexcept;
 
     bool isVelocityLaneVisible() const noexcept;
     void setVelocityLaneVisible (bool);                               // remembered as cb.rollVelLane

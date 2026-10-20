@@ -93,9 +93,9 @@ struct Column
 };
 
 constexpr Column kColumns[] = {
-    { "file", 28 }, { "notes", 6 }, { "range", 7 }, { "n/bar", 6 }, { "ct", 5 }, { "downCT", 7 }, { "finalCT", 8 },
-    { "repeat", 7 }, { "step", 5 }, { "leap", 5 }, { "revLeap", 8 }, { "odd16", 6 }, { "lag4", 5 }, { "clash", 6 },
-    { "outCS", 6 }, { "seam", 4 }
+    { "file", 28 }, { "notes", 6 }, { "range", 7 }, { "n/bar", 6 }, { "ct", 5 }, { "downCT", 7 }, { "finalCT", 10 },
+    { "endCT", 6 }, { "repeat", 7 }, { "step", 5 }, { "leap", 5 }, { "revLeap", 8 }, { "odd16", 6 }, { "lag4", 5 },
+    { "clash", 6 }, { "outCS", 6 }, { "seam", 4 }
 };
 
 juce::String row (const juce::StringArray& cells)
@@ -108,18 +108,25 @@ juce::String row (const juce::StringArray& cells)
     return line.trimEnd();
 }
 
+// A share over `count` notes: "n/a" when there are none (a 0/0 is not a 0%).
+juce::String pctOf (double share, int count) { return count > 0 ? pct (share) : juce::String ("n/a"); }
+
 juce::StringArray statCells (const juce::String& name, const cb::MelodyStats& s)
 {
     return { name, juce::String (s.notes), juce::String (s.lowest) + "-" + juce::String (s.highest),
-             fixed (s.notesPerActiveBar, 2), pct (s.chordToneShare), pct (s.downbeatChordToneShare),
-             pct (s.phraseFinalChordToneShare), pct (s.repeatShare), pct (s.stepShareMoving), pct (s.leapShareMoving),
-             pct (s.reverseAfterLeap), pct (s.odd16Share), pct (s.rhythmRepeatLag4), pct (s.strongBeatClashShare),
-             pct (s.outOfChordScaleShare), juce::String (s.seamInterval) };
+             fixed (s.notesPerActiveBar, 2), pct (s.chordToneShare), pctOf (s.downbeatChordToneShare, s.downbeatNotes),
+             pctOf (s.phraseFinalChordToneShare, s.phraseFinals) + " (" + juce::String (s.phraseFinals) + ")",
+             juce::String (s.loopEndChordTone ? "yes" : "no"), pct (s.repeatShare), pct (s.stepShareMoving), pct (s.leapShareMoving),
+             pct (s.reverseAfterLeap), pct (s.odd16Share), pct (s.rhythmRepeatLag4),
+             pctOf (s.strongBeatClashShare, s.strongNotes), pct (s.outOfChordScaleShare), juce::String (s.seamInterval) };
 }
 
+// Per-style means: the plain mean of the per-file values, except downCT, finalCT and clash, which pool their notes
+// (a file without downbeat or strong-beat notes adds nothing; a continuous Driving loop has a single phrase-final
+// note, so its finalCT alone would count as a whole file), and endCT, the share of files whose loop end fits.
 struct Sum
 {
-    int files = 0;
+    int files = 0, downNotes = 0, finals = 0, strongNotes = 0, endCt = 0;
     double notes = 0, perBar = 0, ct = 0, downCt = 0, finalCt = 0, repeat = 0, step = 0, leap = 0, reverse = 0,
            odd16 = 0, lag4 = 0, clash = 0, outCs = 0, seam = 0;
 
@@ -129,15 +136,19 @@ struct Sum
         notes += s.notes;
         perBar += s.notesPerActiveBar;
         ct += s.chordToneShare;
-        downCt += s.downbeatChordToneShare;
-        finalCt += s.phraseFinalChordToneShare;
+        downCt += s.downbeatChordToneShare * s.downbeatNotes;
+        downNotes += s.downbeatNotes;
+        finalCt += s.phraseFinalChordToneShare * s.phraseFinals;
+        finals += s.phraseFinals;
+        endCt += s.loopEndChordTone ? 1 : 0;
         repeat += s.repeatShare;
         step += s.stepShareMoving;
         leap += s.leapShareMoving;
         reverse += s.reverseAfterLeap;
         odd16 += s.odd16Share;
         lag4 += s.rhythmRepeatLag4;
-        clash += s.strongBeatClashShare;
+        clash += s.strongBeatClashShare * s.strongNotes;
+        strongNotes += s.strongNotes;
         outCs += s.outOfChordScaleShare;
         seam += s.seamInterval;
     }
@@ -163,8 +174,13 @@ int runDemos (const juce::File& outDir)
            << "minor = A minor Am F C G (4 beats each, twice, Offbeat 8ths bass); pop = C major C G Am F (4 beats, twice, "
               "Driving 8ths bass); slash = G major G D/F# Em C Am7 D7sus4 G/B C (2 beats, twice, Octave bounce bass).\n\n"
            << "Columns (analyseMelody): notes, range, notes per active bar, chord tones overall / on downbeats / at phrase "
-              "ends, repeated-note intervals, steps and leaps among the moving intervals, reversal after a leap, odd-16th "
-              "onsets, lag-4 rhythm repeats, strong-beat clashes, out-of-chord-scale notes, loop seam in semitones.\n\n";
+              "ends (the chord each note starts on; in brackets the number of phrase-final notes: a continuous Driving loop "
+              "has one, so its finalCT has no band), endCT = the loop's last note is a tone of its chord or, in the final "
+              "beat, of the restart chord, repeated-note intervals, steps and leaps among the moving intervals (in the "
+              "Driving pedal mode the pedal and the upper line alternate), reversal after a leap, odd-16th onsets, lag-4 "
+              "rhythm repeats, strong-beat clashes (non-chord tones a semitone either way from a sounding accompaniment "
+              "note), out-of-chord-scale notes, loop seam in semitones. n/a = no such notes. The per-style means pool "
+              "downCT, finalCT and clash over their notes.\n\n";
 
     juce::StringArray header;
 
@@ -256,9 +272,12 @@ int runDemos (const juce::File& outDir)
         const auto& sum = sums[(size_t) st];
         const double n = juce::jmax (1, sum.files);
         report << row ({ juce::String (cb::melodyStyleShortName ((cb::MelodyStyle) st)) + " (" + juce::String (sum.files) + ")",
-                         fixed (sum.notes / n, 1), "", fixed (sum.perBar / n, 2), pct (sum.ct / n), pct (sum.downCt / n),
-                         pct (sum.finalCt / n), pct (sum.repeat / n), pct (sum.step / n), pct (sum.leap / n),
-                         pct (sum.reverse / n), pct (sum.odd16 / n), pct (sum.lag4 / n), pct (sum.clash / n),
+                         fixed (sum.notes / n, 1), "", fixed (sum.perBar / n, 2), pct (sum.ct / n),
+                         pctOf (sum.downCt / juce::jmax (1, sum.downNotes), sum.downNotes),
+                         pctOf (sum.finalCt / juce::jmax (1, sum.finals), sum.finals) + " (" + juce::String (sum.finals) + ")",
+                         pct (sum.endCt / n), pct (sum.repeat / n), pct (sum.step / n), pct (sum.leap / n),
+                         pct (sum.reverse / n), pct (sum.odd16 / n), pct (sum.lag4 / n),
+                         pctOf (sum.clash / juce::jmax (1, sum.strongNotes), sum.strongNotes),
                          pct (sum.outCs / n), fixed (sum.seam / n, 1) })
                << "\n";
     }

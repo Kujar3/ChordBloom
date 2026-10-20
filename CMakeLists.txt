@@ -112,8 +112,11 @@ add_executable(CoreTests
     tests/LayersTests.cpp
     tests/NoteEditTests.cpp
     tests/MelodyGenTests.cpp
+    tests/DocsTests.cpp
     ${CB_CORE_SOURCES})
 target_include_directories(CoreTests PRIVATE src tests)
+# DocsTests reads README.md, ARCHITECTURE.md, installer/QuickStart.txt and docs/screenshot.png from the checkout.
+target_compile_definitions(CoreTests PRIVATE CB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 if(MSVC)
     target_compile_options(CoreTests PRIVATE /W4 /permissive-)
 endif()

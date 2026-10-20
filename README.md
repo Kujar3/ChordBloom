@@ -76,14 +76,16 @@ project, otherwise you'll hear the chords twice. Chordbloom shows a reminder aft
   - Voicings: Close, Open (drop-2) and Spread, with automatic voice leading.
   - Bass line (the *Bass* menu, or the Roll's Bass tab): *Classic* modes Off, Root, Root + 5th, Octaves and Pulse
     (Octaves and Pulse follow Rate), and ten *patterns* (fixed 16th-note grooves that ignore Rate): Offbeat 8ths, Rolling
-    16ths, Rolling kick gap, Offbeat pairs and Gallop (trance), Octave bounce, Driving 8ths, Off-kick, Tresillo 3-3-2 and
-    Dotted quarters. Every mode is voice-led, stays low (MIDI 24-55) and plays the root or the slash-chord bass note.
+    16ths, *Rolling, kick gap*, Offbeat pairs and Gallop (trance), Octave bounce, Driving 8ths, Off-kick, Tresillo 3-3-2
+    and Dotted quarters. Every mode is voice-led, stays low (MIDI 24-55) and plays the root (or the slash-chord bass
+    note), except Root + 5th, which alternates it with the chord's fifth (the chord root on slash chords).
   - Arp (off by default; the Roll's Arp tab): 17 shapes in three families (ladders such as Up 3 / Up-down / 1-3-5-7,
     pedal and octave bounces, two-note alternations), rate 1/4 / 1/8 / 1/16 / 1/8T, rhythm masks (3 on 1 off, kick gap,
     breath, late start ...), gate (Pluck 45% to Legato 100%) and octave. It follows each chord's inversion, keeps clear
     of the bass and plays on MIDI channel 4.
   - One groove: the arp and the bass patterns swing on the chords' Rate grid, so they never flam against swung chord
-    steps (Rate stays lit whenever the arp or a bass pattern is on, and Swing too except at 1/8T).
+    steps (Rate stays lit whenever the auto arp or an auto bass pattern plays, and Swing too except at 1/8T; an edited
+    layer plays its own notes and a muted bass plays nothing, so they do not count).
 - **Live MIDI input**: *Scale lock* snaps your notes to the key. *Chord trigger* turns the white keys C–B into the key's
   chords I–VII (or 7ths).
 - **Keyboard guide**: highlights scale tones, the current chord's notes (spelled correctly) and whatever is sounding.
@@ -131,6 +133,9 @@ project, otherwise you'll hear the chords twice. Chordbloom shows a reminder aft
   of a beat and played straight: it keeps the swing it had then and no longer follows the Swing knob (Reset brings the
   live pattern back). Its swung notes can sit up to half a tick (about 4.5 ms at 138 BPM) off the chords' exact swung
   steps. The melody always plays exactly as drawn (never swung).
+  An edited layer also ignores the Velocity, Gate and Humanize knobs (and an edited arp its own gate): your notes play
+  with the velocities and lengths shown in the roll, without humanize jitter, so the first edit removes any jitter the
+  layer had while it was auto. Reset brings the knobs back.
 - **Old projects** sound the same. Two parameters gained choices at the end of their lists: *Bass* (10 patterns) and
   *MIDI out part* (*Arp only*). Saved values are safe, but FL automation clips or linked controllers of those two
   parameters move by their normalised value, so in old projects they can land on other choices: re-draw such clips.
@@ -154,7 +159,8 @@ scripts\build.bat build Chordbloom_VST3 Chordbloom_CLAP Chordbloom_Standalone Co
 
 `fetch_clap.bat` adds the optional CLAP build. Then run the checks:
 
-- `build\CoreTests.exe`: music-theory, voicing, generator and melody unit tests
+- `build\CoreTests.exe`: music-theory, voicing, generator and melody unit tests, plus wording checks of this README,
+  the installer's Quick Start, `ARCHITECTURE.md` and `docs/screenshot.png`
 - `build\ChordbloomDev_artefacts\Release\ChordbloomDev.exe selftest`: processor and editor integration tests
 - `build\ChordbloomDev_artefacts\Release\ChordbloomDev.exe snapshot out\snaps`: renders the UI to PNGs
 - `build\ChordbloomDev_artefacts\Release\ChordbloomDev.exe demos out\demos`: the melody generator's listening demos
