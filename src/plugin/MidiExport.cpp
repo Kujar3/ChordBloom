@@ -185,9 +185,35 @@ bool writeMidiFile (const juce::MidiFile& midiFile, const juce::File& destinatio
     return destination.replaceWithData (out.getData(), out.getDataSize());
 }
 
-// WP0 STUB (WP4 implements it): an empty file.
-juce::MidiFile buildTracksMidiFile (const std::vector<ExportTrack>&, double, double, int)
+juce::MidiFile buildTracksMidiFile (const std::vector<ExportTrack>& tracks, double bpm, double loopBeats,
+                                    int ticksPerQuarterNote)
 {
-    return {};
+    const int tpq = juce::jlimit (24, 32767, ticksPerQuarterNote);
+    auto tempoTrack = buildTempoTrack (sanitisedBpm (bpm));
+
+    // One loop long even when a part ends early (Late start / Breath arp, a melody with a final gap).
+    const double loopTicks = (std::isfinite (loopBeats) && loopBeats > 0.0) ? std::round (loopBeats * tpq) : 0.0;
+
+    std::vector<juce::MidiMessageSequence> noteTracks;
+    for (const auto& t : tracks)
+    {
+        double lastTick = 0.0;
+        int numNotes = 0;
+        auto track = buildNoteTrack (t.events, tpq, [] (const NoteEvent&) { return true; }, t.name, lastTick, numNotes);
+        if (numNotes == 0)
+            continue;   // entries without events are left out
+
+        track.addEvent (juce::MidiMessage::endOfTrack(), juce::jmax (lastTick, loopTicks));
+        noteTracks.push_back (std::move (track));
+    }
+
+    tempoTrack.addEvent (juce::MidiMessage::endOfTrack(), loopTicks);
+
+    juce::MidiFile file;
+    file.setTicksPerQuarterNote (tpq);
+    file.addTrack (tempoTrack);
+    for (auto& track : noteTracks)
+        file.addTrack (track);
+    return file;
 }
 } // namespace cb::midiexport
