@@ -725,6 +725,9 @@ TEST_CASE ("note limits: a 1024-note arp list keeps every note and 3000 notes ca
     CHECK (std::equal (capped.notes.begin(), capped.notes.end(), all.notes.begin()));
 
     CHECK_EQ (renderMelody (arp, 256.0, 4, limits).size(), (size_t) 1024);
+    CHECK_EQ (transposeMelody (arp, 2, limits).notes.size(), (size_t) 1024);
+    CHECK_EQ (transposeMelody (big, 1, limits).notes.size(), (size_t) kMaxLayerNotes);
+    CHECK_EQ (transposeMelody (arp, 2, layerLimits (Layer::Bass)).notes.size(), (size_t) 1024);
 
     // the follow keeps all of them (those past the old loop end keep their distance to it)
     const auto same = prog ({ { C, 16 } });
@@ -891,6 +894,13 @@ TEST_CASE ("remapPitchToChord: roles, nearest octave, snapping to the key, foldi
     CHECK_EQ (remapPitchToChord (20, C, 0, C, 0, cMajor, bass), 32);
     CHECK_EQ (remapPitchToChord (100, C, 4, C, 4, cMajor, bass), 64);
     CHECK_EQ (remapPitchToChord (100, C, 4, C, 4, cMajor, arp), 100);
+
+    // a bass pitch class that is not a chord tone: rule 1 still maps it, and the tone order stays unrotated
+    CHECK_EQ (remapPitchToChord (62, C, 2, Am, 9, cMajor, arp), 57);   // the bass D goes to the new bass A
+    CHECK_EQ (remapPitchToChord (64, C, 2, Am, 9, cMajor, arp), 60);   // from side C E G: E = tone 1 -> C
+    CHECK_EQ (remapPitchToChord (67, C, 2, Am, 9, cMajor, arp), 64);   // G = tone 2 -> E
+    CHECK_EQ (remapPitchToChord (64, C, 0, Am, 2, cMajor, arp), 60);   // to side A C E unrotated: tone 1 -> C
+    CHECK_EQ (remapPitchToChord (60, C, 0, Am, 2, cMajor, arp), 62);   // the bass C goes to the new bass D
 
     // inversion-aware order: C/E arp E G C -> Am gives A C E; F/A arp A C F -> C gives C E G
     {
