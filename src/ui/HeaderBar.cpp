@@ -512,13 +512,13 @@ public:
             { "2", "Play it on your own synth (MIDI out)", Col::secondary,
               "In Chordbloom's wrapper open **settings (gear) > MIDI** and set **Output port** to a number, e.g. 1. "
               "In your synth's wrapper set **MIDI > Input port** to the same number, then click Chordbloom's "
-              "**speaker** off so you only hear your synth. **MIDI out part** sends all parts (chords, bass, melody on "
-              "channels 1 / 2 / 3) or one of them; for a separate synth per part, clone the Chordbloom channel and set "
-              "each clone's part, on its own port." },
+              "**speaker** off so you only hear your synth. **MIDI out part** sends all parts (chords, bass, melody, arp "
+              "on channels 1 / 2 / 3 / 4) or one of them; for a separate synth per part (e.g. **Arp only** into a pluck), "
+              "clone the Chordbloom channel and set each clone's part, on its own port." },
             { "3", "Drag it into FL", Col::subdominant,
-              "Drag the **Chords**, **Bass**, **Both** or **Melody** chips (bottom right) onto the playlist, a channel or "
-              "the piano roll, or drag a single pad or progression block straight out. Drop the chords into your "
-              "melody's pattern to see them as ghost notes." }
+              "Drag the **Chords**, **Bass**, **Melody**, **Arp** or **All** chips (bottom right) onto the playlist, a "
+              "channel or the piano roll (**All** = one track per playing part), or drag a single pad or progression "
+              "block straight out. **Save** writes the same parts as .mid files." }
         };
 
         tips = {
@@ -529,8 +529,11 @@ public:
             "change its length.",
             "**Chord trigger**: white keys C to B on your MIDI keyboard play the key's chords I to VII "
             "(**7ths** for seventh chords).",
-            "**Melody** (switch at the top right): draw a melody over the chords. The rows light up with the key and "
-            "each chord's tones, and **Snap** keeps notes on them. Right-click a note to delete it."
+            "**Roll** (switch at the top right): the **Melody**, **Arp** and **Bass** layers over the chords. A tab's dot "
+            "plays or mutes it; **Generate** writes a melody, the arrows browse arp and bass patterns. Edit a note and "
+            "the layer is edited (pencil); **Reset** follows the chords again.",
+            "**Roll gestures**: **Ctrl** (Cmd on Mac)+drag selects, **Shift**+drag duplicates, **Alt** = no grid, "
+            "right-click deletes."
         };
 
         setSize (width > 0 ? width : kDefaultWidth, 100);
@@ -905,7 +908,7 @@ struct HeaderBar::Impl
         sync.setTooltip ("Play with FL: while FL Studio plays, Chordbloom loops the progression in time with it "
                          "(built-in sound and MIDI out). Turn it off once you've dragged the chords into FL, "
                          "or you will hear them twice.");
-        undo.setTooltip ("Undo the last edit (chords or melody)");
+        undo.setTooltip ("Undo the last edit (chords, melody, arp or bass notes)");
         redo.setTooltip ("Redo");
         help.setTooltip ("How to use Chordbloom in FL Studio");
 

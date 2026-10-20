@@ -68,8 +68,8 @@ juce::Rectangle<int> primaryUserArea()
 }
 
 //==============================================================================
-// "Chords | Melody" switch at the top-right of the palette card. A small dot after "Melody" says the (hidden) Melody
-// view has notes.
+// "Chords | Roll" switch at the top-right of the palette card. A small dot after "Roll" says the (hidden) roll has user
+// content: melody notes or an edited (custom) arp / bass layer.
 class ViewSwitch final : public juce::Component, public juce::SettableTooltipClient
 {
 public:
@@ -79,12 +79,12 @@ public:
         setMouseClickGrabsKeyboardFocus (false);
         setRepaintsOnMouseActivity (true);
         setTitle ("View");
-        setDescription ("Chords shows the chord palette, Melody the melody piano roll");
-        setTooltip ("Chords: the chord palette.\nMelody: draw a melody over the progression, with the scale and each "
-                    "chord's tones lit up.");
+        setDescription ("Chords shows the chord palette, Roll the piano roll of the melody, arp and bass layers");
+        setTooltip ("Chords: the chord palette.\nRoll: the melody, arp and bass over the progression, with the scale and "
+                    "each chord's tones lit up. Generate a melody, browse arp and bass patterns, edit any note.");
     }
 
-    std::function<void (bool)> onChange;   // true = Melody
+    std::function<void (bool)> onChange;   // true = Roll (cb.editorView "melody")
 
     void setMelody (bool shouldShowMelody, bool hasNotes)
     {
@@ -92,6 +92,7 @@ public:
         {
             melody = shouldShowMelody;
             melodyHasNotes = hasNotes;
+            getProperties().set ("cb.rollHasContent", hasNotes);   // test hook: the dot's state
             repaint();
 
             if (auto* handler = getAccessibilityHandler())
@@ -134,7 +135,7 @@ public:
                 g.fillRoundedRectangle (seg, radius - 1.5f);
             }
 
-            const juce::String label (i == 0 ? "Chords" : "Melody");
+            const juce::String label (i == 0 ? "Chords" : "Roll");
             const bool dot = i == 1 && melodyHasNotes && ! melody;
             const float textW = juce::jmin (cb::ui::textWidth (f, label), seg.getWidth() - (dot ? 12.0f : 4.0f));
             const float contentW = textW + (dot ? 7.0f : 0.0f);
@@ -167,8 +168,11 @@ public:
         {
             explicit Value (ViewSwitch& s) : owner (s) {}
             bool isReadOnly() const override { return false; }
-            juce::String getCurrentValueAsString() const override { return owner.melody ? "Melody" : "Chords"; }
-            void setValueAsString (const juce::String& v) override { owner.choose (v.trim().equalsIgnoreCase ("Melody")); }
+            juce::String getCurrentValueAsString() const override { return owner.melody ? "Roll" : "Chords"; }
+            void setValueAsString (const juce::String& v) override
+            {
+                owner.choose (v.trim().equalsIgnoreCase ("Roll") || v.trim().equalsIgnoreCase ("Melody"));
+            }
             ViewSwitch& owner;
         };
 
@@ -397,8 +401,12 @@ void ChordbloomEditor::layoutViewSwitch()
 
 void ChordbloomEditor::updateViewSwitch()
 {
+    // The dot: the hidden roll has user content (melody notes or a custom arp / bass layer; final-spec 7.12).
+    const bool rollHasContent = ! processor.getMelody().empty() || processor.isLayerCustom (cb::Layer::Arp)
+                             || processor.isLayerCustom (cb::Layer::Bass);
+
     if (auto* s = dynamic_cast<ViewSwitch*> (viewSwitch.get()))
-        s->setMelody (melodyView, ! processor.getMelody().empty());
+        s->setMelody (melodyView, rollHasContent);
 }
 
 //==============================================================================
@@ -412,6 +420,17 @@ void ChordbloomEditor::changeListenerCallback (juce::ChangeBroadcaster*)
 void ChordbloomEditor::timerCallback()
 {
     pushChords (false);
+
+    // Parameter-only changes (automation, LED clicks, Controls picks) send no change message: the layer serial moves
+    // on every re-render, so the layer UI follows it (final-spec 7.12).
+    if (const auto serial = processor.getLayerSerial(); serial != lastLayerSerial)
+    {
+        lastLayerSerial = serial;
+        controls->refresh();
+        exportPanel->refresh();
+        melodyRoll->refresh();
+        updateViewSwitch();
+    }
 
     if (externalDropPending && ! juce::ModifierKeys::getCurrentModifiersRealtime().isAnyMouseButtonDown())
     {
@@ -537,9 +556,11 @@ void ChordbloomEditor::updateChordDisplays()
 
 void ChordbloomEditor::refreshChildren()
 {
+    lastLayerSerial = processor.getLayerSerial();
     header->refresh();
     palette->refresh();
     lane->refresh();
+    controls->refresh();
     keyboard->refresh();
     exportPanel->refresh();
     melodyRoll->refresh();
