@@ -133,13 +133,16 @@ struct ExportPanel::Impl : public juce::Component,
             g.setColour (active ? colour.withAlpha (0.9f) : (over && ! muted ? colour.withAlpha (0.6f) : Col::outline));
             g.drawRoundedRectangle (r.reduced (0.5f), radius - 0.5f, 1.0f);
 
-            const auto font = cb::ui::font (13.0f, 600);
+            // Narrow chips (four of them at the minimum editor width) use a smaller label and a tighter grip gap.
+            const bool narrow = r.getWidth() < 76.0f;
+            const auto font = cb::ui::font (narrow ? 12.0f : 13.0f, 600);
             const auto badgeFont = cb::ui::font (9.0f, 700).withExtraKerningFactor (0.08f);
             const juce::String badge ("OFF");
             const float textW = widthOf (font, label);
             const float badgeW = muted ? widthOf (badgeFont, badge) + 8.0f : 0.0f;
             const float gripW = 8.0f;
-            const float contentW = gripW + 8.0f + textW + (muted ? 6.0f + badgeW : 0.0f);
+            const float gripGap = narrow ? 6.0f : 8.0f;
+            const float contentW = gripW + gripGap + textW + (muted ? 6.0f + badgeW : 0.0f);
             const float x = std::round (r.getCentreX() - contentW * 0.5f);
             const bool lively = enabled && ! muted;
 
@@ -147,12 +150,12 @@ struct ExportPanel::Impl : public juce::Component,
 
             g.setFont (font);
             g.setColour (lively ? Col::text : (enabled ? Col::textDim : Col::textFaint));
-            g.drawText (label, juce::Rectangle<float> (x + gripW + 8.0f, r.getY(), textW + 2.0f, r.getHeight()),
+            g.drawText (label, juce::Rectangle<float> (x + gripW + gripGap, r.getY(), textW + 2.0f, r.getHeight()),
                         juce::Justification::centredLeft, false);
 
             if (muted)
             {
-                const auto b = juce::Rectangle<float> (x + gripW + 8.0f + textW + 6.0f, r.getCentreY() - 7.0f, badgeW, 14.0f);
+                const auto b = juce::Rectangle<float> (x + gripW + gripGap + textW + 6.0f, r.getCentreY() - 7.0f, badgeW, 14.0f);
                 g.setColour (Col::textFaint.withAlpha (enabled ? 0.9f : 0.5f));
                 g.drawRoundedRectangle (b.reduced (0.5f), 4.0f, 1.0f);
                 g.setFont (badgeFont);
@@ -173,7 +176,7 @@ struct ExportPanel::Impl : public juce::Component,
 
         void updateTooltip()
         {
-            setTooltip (! isEnabled() ? juce::String ("Add some chords to the progression first")
+            setTooltip (! isEnabled() ? (disabledTip.isNotEmpty() ? disabledTip : juce::String ("Add some chords to the progression first"))
                                       : (muted ? mutedTooltip : (noteTip.isNotEmpty() ? noteTip : enabledTip)));
             setMouseCursor (isEnabled() && ! muted ? juce::MouseCursor::DraggingHandCursor : juce::MouseCursor::NormalCursor);
         }
@@ -225,7 +228,7 @@ struct ExportPanel::Impl : public juce::Component,
         const juce::String label;
         const juce::Colour colour;
         const juce::String enabledTip;
-        juce::String mutedTooltip, noteTip;
+        juce::String mutedTooltip, noteTip, disabledTip;
         bool pressed = false, dragStarted = false, dragging = false, muted = false;
     };
 
@@ -233,6 +236,8 @@ struct ExportPanel::Impl : public juce::Component,
     class SaveButton : public juce::Button
     {
     public:
+        bool compact = false;   // icon only (narrow panel)
+
         SaveButton() : juce::Button ("Save .mid")
         {
             noFocus (*this);   // Enter in the host must never re-open the save menu
@@ -259,9 +264,12 @@ struct ExportPanel::Impl : public juce::Component,
             const juce::String caption ("Save .mid");
             const float textW = widthOf (font, caption);
             const float iconW = 10.0f;
-            const float x = std::round (r.getCentreX() - (iconW + 7.0f + textW) * 0.5f);
+            const float x = std::round (r.getCentreX() - (compact ? iconW : iconW + 7.0f + textW) * 0.5f);
 
             drawSaveIcon (g, { x, r.getCentreY() - 6.0f, iconW, 12.0f }, Col::accent.withMultipliedAlpha (alpha));
+
+            if (compact)
+                return;
 
             g.setFont (font);
             g.setColour ((enabled ? Col::text : Col::textFaint));
@@ -278,14 +286,17 @@ struct ExportPanel::Impl : public juce::Component,
           bass (*this, Part::Bass, "Bass", Col::secondary, "Drag the bass line as a MIDI clip into your DAW"),
           both (*this, Part::Both, "Both", Col::accent,
                 "Drag chords + bass as one MIDI file with two tracks (Chordbloom Chords, Chordbloom Bass).\n"
-                "Drop it on FL Studio's playlist to get chords and bass on separate channels.")
+                "Drop it on FL Studio's playlist to get chords and bass on separate channels."),
+          melody (*this, Part::Melody, "Melody", Col::borrowed,
+                  "Drag the melody as a MIDI clip into FL Studio (one loop of the progression, channel 3)")
     {
         setOpaque (false);
         noFocus (*this);
         setTitle ("Drag to DAW");
         setDescription ("Drag the progression into your DAW as MIDI, or save it as a .mid file");
 
-        for (auto* c : { (juce::Component*) &chords, (juce::Component*) &bass, (juce::Component*) &both, (juce::Component*) &save })
+        for (auto* c : { (juce::Component*) &chords, (juce::Component*) &bass, (juce::Component*) &both,
+                         (juce::Component*) &melody, (juce::Component*) &save })
             addAndMakeVisible (c);
 
         save.onClick = [this] { showSaveMenu(); };
@@ -312,6 +323,18 @@ struct ExportPanel::Impl : public juce::Component,
         return false;
     }
 
+    // True when a melody note starts inside the progression's loop (what the Melody chip exports).
+    bool hasMelodyInLoop() const
+    {
+        const double total = (double) processor.getProgression().totalBeats();
+
+        for (const auto& n : processor.getMelody().notes)
+            if (n.startBeat < total)
+                return true;
+
+        return false;
+    }
+
     void updateEnablement()
     {
         const bool hasChords = ! processor.getProgression().empty();
@@ -319,6 +342,16 @@ struct ExportPanel::Impl : public juce::Component,
         for (auto* c : { (juce::Component*) &chords, (juce::Component*) &bass, (juce::Component*) &both, (juce::Component*) &save })
             if (c->isEnabled() != hasChords)
                 c->setEnabled (hasChords);
+
+        const bool melodyReady = hasChords && hasMelodyInLoop();
+
+        if (melody.isEnabled() != melodyReady || melody.disabledTip.isEmpty())
+        {
+            melody.disabledTip = hasChords ? juce::String ("Draw a melody first: switch the top panel to Melody")
+                                           : juce::String ("Add some chords to the progression first");
+            melody.setEnabled (melodyReady);
+            melody.updateTooltip();
+        }
 
         const bool off = bassIsOff();
 
@@ -352,7 +385,13 @@ struct ExportPanel::Impl : public juce::Component,
         const int chipH = std::min (r.getHeight(), 34);
         auto row = r.withSizeKeepingCentre (r.getWidth(), chipH);
 
-        save.setBounds (row.removeFromRight (juce::jlimit (84, 104, row.getWidth() / 4)));
+        // Four chips need about 62 px each; below that the Save button shrinks to its icon.
+        const int gap = 6;
+        const int fullSaveW = juce::jlimit (84, 104, row.getWidth() / 5);
+        save.compact = (row.getWidth() - fullSaveW - 8 - 3 * gap) / 4 < 62;
+        save.setTooltip (save.compact ? "Save .mid: save the progression or the melody as a .mid file"
+                                      : "Save the progression or the melody as a .mid file");
+        save.setBounds (row.removeFromRight (save.compact ? chipH : fullSaveW));
         row.removeFromRight (8);
 
         if (! twoRows)
@@ -363,13 +402,14 @@ struct ExportPanel::Impl : public juce::Component,
             row.removeFromLeft (captionW > 0 ? 4 : 0);
         }
 
-        const int gap = 6;
-        const int chipW = (row.getWidth() - 2 * gap) / 3;
+        const int chipW = (row.getWidth() - 3 * gap) / 4;
         chords.setBounds (row.removeFromLeft (chipW));
         row.removeFromLeft (gap);
         bass.setBounds (row.removeFromLeft (chipW));
         row.removeFromLeft (gap);
-        both.setBounds (row);
+        both.setBounds (row.removeFromLeft (chipW));
+        row.removeFromLeft (gap);
+        melody.setBounds (row);
     }
 
     void paint (juce::Graphics& g) override
@@ -638,6 +678,8 @@ struct ExportPanel::Impl : public juce::Component,
         menu.addItem (1, off ? "Chords + bass  (Bass is Off)" : "Chords + bass  (2 tracks)", ! off);
         menu.addItem (2, "Chords only");
         menu.addItem (3, off ? "Bass only  (Bass is Off)" : "Bass only", ! off);
+        menu.addItem (4, hasMelodyInLoop() ? juce::String ("Melody only") : juce::String ("Melody only  (no melody yet)"),
+                      hasMelodyInLoop());
 
         juce::Component::SafePointer<Impl> safe (this);
         menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&save), [safe] (int result)
@@ -645,7 +687,8 @@ struct ExportPanel::Impl : public juce::Component,
             if (safe == nullptr || result == 0)
                 return;
 
-            safe->launchSaveChooser (result == 2 ? Part::Chords : (result == 3 ? Part::Bass : Part::Both));
+            safe->launchSaveChooser (result == 2 ? Part::Chords
+                                                 : (result == 3 ? Part::Bass : (result == 4 ? Part::Melody : Part::Both)));
         });
     }
 
@@ -698,7 +741,7 @@ struct ExportPanel::Impl : public juce::Component,
 
     //==============================================================================
     ChordbloomProcessor& processor;
-    Chip chords, bass, both;
+    Chip chords, bass, both, melody;
     SaveButton save;
     std::unique_ptr<juce::FileChooser> chooser;
 

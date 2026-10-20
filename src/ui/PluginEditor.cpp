@@ -6,11 +6,15 @@
 #include "ui/ExportPanel.h"
 #include "ui/HeaderBar.h"
 #include "ui/KeyboardGuide.h"
+#include "ui/MelodyRoll.h"
 #include "ui/ProgressionLane.h"
 
 namespace
 {
+namespace Col = cb::ui::Colours;
+
 constexpr int kHeaderHeight = 56;
+constexpr const char* kViewProp = "cb.editorView";   // APVTS state tree: "melody" while the Melody view is shown
 constexpr int kMargin = 12;     // editor edge -> panels
 constexpr int kGap = 12;        // between panels
 
@@ -63,6 +67,127 @@ juce::Rectangle<int> primaryUserArea()
     return {};
 }
 
+//==============================================================================
+// "Chords | Melody" switch at the top-right of the palette card. A small dot after "Melody" says the (hidden) Melody
+// view has notes.
+class ViewSwitch final : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    ViewSwitch()
+    {
+        setWantsKeyboardFocus (false);
+        setMouseClickGrabsKeyboardFocus (false);
+        setRepaintsOnMouseActivity (true);
+        setTitle ("View");
+        setDescription ("Chords shows the chord palette, Melody the melody piano roll");
+        setTooltip ("Chords: the chord palette.\nMelody: draw a melody over the progression, with the scale and each "
+                    "chord's tones lit up.");
+    }
+
+    std::function<void (bool)> onChange;   // true = Melody
+
+    void setMelody (bool shouldShowMelody, bool hasNotes)
+    {
+        if (melody != shouldShowMelody || melodyHasNotes != hasNotes)
+        {
+            melody = shouldShowMelody;
+            melodyHasNotes = hasNotes;
+            repaint();
+
+            if (auto* handler = getAccessibilityHandler())
+                handler->notifyAccessibilityEvent (juce::AccessibilityEvent::valueChanged);
+        }
+    }
+
+    static int idealWidth() { return 122; }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto b = getLocalBounds().toFloat();
+        const float radius = juce::jmin (7.0f, b.getHeight() * 0.5f);
+        g.setColour (Col::background.brighter (0.035f));
+        g.fillRoundedRectangle (b, radius);
+        g.setColour (Col::outline.withAlpha (0.9f));
+        g.drawRoundedRectangle (b.reduced (0.5f), radius, 1.0f);
+
+        const float segW = (b.getWidth() - 4.0f) / 2.0f;
+        const auto mouse = getMouseXYRelative().toFloat();
+        const int hover = isMouseOver() ? (mouse.x < b.getCentreX() ? 0 : 1) : -1;
+        const auto f = cb::ui::font (juce::jmin (11.5f, b.getHeight() * 0.5f), 600);
+
+        for (int i = 0; i < 2; ++i)
+        {
+            const auto seg = juce::Rectangle<float> (b.getX() + 2.0f + segW * (float) i, b.getY() + 2.0f, segW, b.getHeight() - 4.0f);
+            const bool selected = (i == 1) == melody;
+
+            if (selected)
+            {
+                g.setGradientFill (juce::ColourGradient::vertical (Col::panelHover.brighter (0.06f), seg.getY(),
+                                                                   Col::panelHover.darker (0.04f), seg.getBottom()));
+                g.fillRoundedRectangle (seg, radius - 1.5f);
+                g.setColour (Col::accent.withAlpha (0.35f));
+                g.drawRoundedRectangle (seg.reduced (0.5f), radius - 1.5f, 1.0f);
+            }
+            else if (i == hover)
+            {
+                g.setColour (Col::panelRaised.withAlpha (0.8f));
+                g.fillRoundedRectangle (seg, radius - 1.5f);
+            }
+
+            const juce::String label (i == 0 ? "Chords" : "Melody");
+            const bool dot = i == 1 && melodyHasNotes && ! melody;
+            const float textW = juce::jmin (cb::ui::textWidth (f, label), seg.getWidth() - (dot ? 12.0f : 4.0f));
+            const float contentW = textW + (dot ? 7.0f : 0.0f);
+            const float x = std::round (seg.getCentreX() - contentW * 0.5f);
+
+            g.setFont (f);
+            g.setColour (selected ? Col::accent : (i == hover ? Col::text : Col::textDim));
+            g.drawFittedText (label, juce::Rectangle<float> (x, seg.getY(), textW + 1.0f, seg.getHeight()).toNearestInt(),
+                              juce::Justification::centredLeft, 1, 0.8f);
+
+            if (dot)
+            {
+                g.setColour (Col::accent.withAlpha (0.9f));
+                g.fillEllipse (x + textW + 3.0f, seg.getCentreY() - 2.0f, 4.0f, 4.0f);
+            }
+        }
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu())   // right-click never switches (Theme.h rule)
+            return;
+
+        choose (e.position.x >= (float) getWidth() * 0.5f);
+    }
+
+    std::unique_ptr<juce::AccessibilityHandler> createAccessibilityHandler() override
+    {
+        struct Value final : public juce::AccessibilityTextValueInterface
+        {
+            explicit Value (ViewSwitch& s) : owner (s) {}
+            bool isReadOnly() const override { return false; }
+            juce::String getCurrentValueAsString() const override { return owner.melody ? "Melody" : "Chords"; }
+            void setValueAsString (const juce::String& v) override { owner.choose (v.trim().equalsIgnoreCase ("Melody")); }
+            ViewSwitch& owner;
+        };
+
+        return std::make_unique<juce::AccessibilityHandler> (
+            *this, juce::AccessibilityRole::comboBox,
+            juce::AccessibilityActions().addAction (juce::AccessibilityActionType::press, [this] { choose (! melody); }),
+            juce::AccessibilityHandler::Interfaces { std::make_unique<Value> (*this) });
+    }
+
+private:
+    void choose (bool shouldShowMelody)
+    {
+        if (shouldShowMelody != melody && onChange != nullptr)
+            onChange (shouldShowMelody);
+    }
+
+    bool melody = false, melodyHasNotes = false;
+};
+
 // Open Chordbloom editors in this plug-in binary (message thread only), so the default look-and-feel can be handed
 // to a remaining editor when one closes.
 juce::Array<ChordbloomEditor*>& liveEditors()
@@ -90,10 +215,20 @@ ChordbloomEditor::ChordbloomEditor (ChordbloomProcessor& p)
     controls = std::make_unique<ControlsPanel> (p);
     keyboard = std::make_unique<KeyboardGuide> (p);
     exportPanel = std::make_unique<ExportPanel> (p);
+    melodyRoll = std::make_unique<MelodyRoll> (p);
+    auto switcher = std::make_unique<ViewSwitch>();
+    switcher->onChange = [this] (bool showMelody) { setMelodyViewVisible (showMelody); };
+    viewSwitch = std::move (switcher);
 
     for (juce::Component* c : std::initializer_list<juce::Component*> { header.get(), palette.get(), lane.get(),
                                                                         controls.get(), keyboard.get(), exportPanel.get() })
         addAndMakeVisible (c);
+
+    addChildComponent (*melodyRoll);
+    addAndMakeVisible (*viewSwitch);
+    melodyView = processor.getAPVTS().state.getProperty (kViewProp, "chords").toString() == "melody";
+    palette->setVisible (! melodyView);
+    melodyRoll->setVisible (melodyView);
 
     lane->onSelectionChanged = [this] (int) { pushChords (false); };
 
@@ -209,6 +344,8 @@ void ChordbloomEditor::resized()
     keyboardArea = right;
 
     palette->setBounds (paletteArea);
+    melodyRoll->setBounds (paletteArea);
+    layoutViewSwitch();
     lane->setBounds (laneArea);
     controls->setBounds (controlsArea);
     keyboard->setBounds (keyboardArea);
@@ -220,6 +357,46 @@ void ChordbloomEditor::resized()
 
 ProgressionLane& ChordbloomEditor::getProgressionLane() noexcept { return *lane; }
 ChordPaletteView& ChordbloomEditor::getPaletteView() noexcept { return *palette; }
+MelodyRoll& ChordbloomEditor::getMelodyRoll() noexcept { return *melodyRoll; }
+
+bool ChordbloomEditor::isMelodyViewVisible() const noexcept { return melodyView; }
+
+void ChordbloomEditor::setMelodyViewVisible (bool shouldShowMelody)
+{
+    if (melodyView == shouldShowMelody)
+        return;
+
+    melodyView = shouldShowMelody;
+    processor.getAPVTS().state.setProperty (kViewProp, melodyView ? "melody" : "chords", nullptr);
+    palette->setVisible (! melodyView);
+    melodyRoll->setVisible (melodyView);
+
+    if (melodyView)
+        melodyRoll->refresh();
+
+    updateViewSwitch();
+    cb::ui::neverTakeKeyboardFocus (*this);
+}
+
+// The switch sits in the palette's free last Triads cell (top-aligned), at the same spot in both views; the roll keeps
+// its toolbar clear of it.
+void ChordbloomEditor::layoutViewSwitch()
+{
+    const auto cell = palette->getCornerCellBounds() + paletteArea.getPosition();
+    const int right = paletteArea.getRight() - 12;
+    const int top = paletteArea.getY() + 10;
+    const int w = cell.isEmpty() ? ViewSwitch::idealWidth() : juce::jmin (ViewSwitch::idealWidth(), cell.getWidth());
+    const int h = getHeight() < 600 ? 24 : 26;
+    viewSwitch->setBounds (right - w, top, w, h);
+    melodyRoll->setToolbarRightInset (w + 12);
+    updateViewSwitch();
+}
+
+void ChordbloomEditor::updateViewSwitch()
+{
+    if (auto* s = dynamic_cast<ViewSwitch*> (viewSwitch.get()))
+        s->setMelody (melodyView, ! processor.getMelody().empty());
+}
 
 //==============================================================================
 void ChordbloomEditor::changeListenerCallback (juce::ChangeBroadcaster*)
@@ -362,6 +539,15 @@ void ChordbloomEditor::refreshChildren()
     lane->refresh();
     keyboard->refresh();
     exportPanel->refresh();
+    melodyRoll->refresh();
+
+    // The view may have changed with a loaded state (the choice is part of it).
+    const bool stateSaysMelody = processor.getAPVTS().state.getProperty (kViewProp, "chords").toString() == "melody";
+
+    if (stateSaysMelody != melodyView)
+        setMelodyViewVisible (stateSaysMelody);
+
+    updateViewSwitch();
 }
 
 void ChordbloomEditor::pushChords (bool force)

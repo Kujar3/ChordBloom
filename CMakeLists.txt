@@ -23,12 +23,14 @@ set(CB_CORE_SOURCES
     src/core/Voicing.cpp
     src/core/Pattern.cpp
     src/core/Progression.cpp
-    src/core/Generate.cpp)
+    src/core/Generate.cpp
+    src/core/Melody.cpp)
 
 set(CB_PLUGIN_SOURCES
     src/plugin/PluginProcessor.cpp
     src/plugin/PreviewSynth.cpp
-    src/plugin/MidiExport.cpp)
+    src/plugin/MidiExport.cpp
+    src/plugin/GhostRegistry.cpp)
 
 set(CB_UI_SOURCES
     src/ui/Theme.cpp
@@ -38,7 +40,8 @@ set(CB_UI_SOURCES
     src/ui/ProgressionLane.cpp
     src/ui/ControlsPanel.cpp
     src/ui/KeyboardGuide.cpp
-    src/ui/ExportPanel.cpp)
+    src/ui/ExportPanel.cpp
+    src/ui/MelodyRoll.cpp)
 
 # ---------------------------------------------------------------------------
 # Embedded resources (fonts, logo)
@@ -97,6 +100,7 @@ add_executable(CoreTests
     tests/TheoryTests.cpp
     tests/VoicingPatternTests.cpp
     tests/GenerateTests.cpp
+    tests/MelodyTests.cpp
     ${CB_CORE_SOURCES})
 target_include_directories(CoreTests PRIVATE src tests)
 if(MSVC)

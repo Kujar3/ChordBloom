@@ -1,6 +1,8 @@
 #include "plugin/PluginProcessor.h"
 #include "ui/DragPayload.h"
+#include "ui/ExportPanel.h"
 #include "ui/HeaderBar.h"
+#include "ui/MelodyRoll.h"
 #include "ui/PluginEditor.h"
 #include "ui/ProgressionLane.h"
 
@@ -70,7 +72,7 @@ cb::Progression makeProgression (std::initializer_list<std::pair<cb::Chord, int>
 // Draws look-and-feel pieces that only exist in popup windows (menus, tooltips, value bubbles) onto one sheet.
 juce::Image renderWidgetSheet (juce::LookAndFeel& lf)
 {
-    juce::Image image (juce::Image::ARGB, 900, 420, true);
+    juce::Image image (juce::Image::ARGB, 900, 470, true);
     juce::Graphics g (image);
     g.fillAll (cb::ui::Colours::background);
 
@@ -140,16 +142,20 @@ juce::Image renderWidgetSheet (juce::LookAndFeel& lf)
     drawMenu ({ 400, 20 }, { { "C" }, { "C# / Db" }, { "D" }, { "D# / Eb", Item::normal, true, true }, { "E" }, { "F" },
                              { "F# / Gb" }, { "G" }, { "G# / Ab" }, { "A" }, { "A# / Bb" }, { "B" } });
 
-    // MIDI out part menu (I13)
+    // MIDI out part menu (I13; melody parts added with the melody roll)
     {
         Item heading { "MIDI out sends", Item::heading };
-        Item both { "Chords + Bass", Item::normal, true };
+        Item all { "All parts", Item::normal, true };
+        all.shortcut = "ch 1-3";
+        Item both { "Chords + Bass" };
         both.shortcut = "ch 1 + 2";
         Item chords { "Chords only", Item::normal, false, true };
         chords.shortcut = "ch 1";
         Item bass { "Bass only" };
         bass.shortcut = "ch 2";
-        drawMenu ({ 580, 20 }, { heading, both, chords, bass });
+        Item melody { "Melody only" };
+        melody.shortcut = "ch 3";
+        drawMenu ({ 580, 20 }, { heading, all, both, chords, bass, melody });
     }
 
     auto drawTip = [&] (const juce::String& tip, juce::Point<int> origin)
@@ -160,10 +166,15 @@ juce::Image renderWidgetSheet (juce::LookAndFeel& lf)
         lf.drawTooltip (g, tip, bounds.getWidth(), bounds.getHeight());
     };
 
-    drawTip ("Voice leading: picks inversions automatically so each chord moves smoothly to the next", { 580, 180 });
+    drawTip ("Voice leading: picks inversions automatically so each chord moves smoothly to the next", { 580, 215 });
     drawTip ("Swing: delays every second step for a shuffled groove (double-click to reset)\n\nNo effect right now: Block "
              "holds each chord and the bass is held too. Try Pulse, an Arp or Broken, or the Octaves / Pulse bass.",
-             { 580, 260 });
+             { 580, 285 });
+
+    // Melody roll menu (right-click on empty space)
+    drawMenu ({ 220, 232 }, { { "Melody", Item::heading }, { "Snap", Item::normal, false, true, true },
+                              { "Grid", Item::normal, false, false, true }, { "Play melody", Item::normal, true },
+                              { {}, Item::separator }, { "Octave up" }, { "Octave down" }, { "Clear melody" } });
 
     return image;
 }
@@ -462,6 +473,131 @@ int runSnapshot (const juce::File& outputDir)
     ok &= writePng (*editor, outputDir.getChildFile ("10e_bb_minor_long_names_960x560.png"));
     editor->setSize (ChordbloomEditor::kDefaultWidth, ChordbloomEditor::kDefaultHeight);
     settle (processor, *editor);
+
+    // 13. Melody view (harmonic guide piano roll): A minor, Am F C G with a 2-beat G (the loop ends at beat 14, the
+    //     roll dims beats 14..16), a melody with chord tones, passing tones, one note outside the key and one note
+    //     past the end.
+    {
+        setParam (processor, cb::ParamIDs::keyRoot, 9.0f);
+        setParam (processor, cb::ParamIDs::scale, (float) cb::ScaleType::NaturalMinor);
+        processor.setProgression (makeProgression ({ { { 9, Q::Minor }, 4 }, { { 5, Q::Major }, 4 },
+                                                     { { 0, Q::Major }, 4 }, { { 7, Q::Major }, 2 } }));
+        auto note = [] (int n, double start, double length, float velocity = cb::kDefaultMelodyVelocity)
+        {
+            cb::MelodyNote m;
+            m.note = n;
+            m.startBeat = start;
+            m.lengthBeats = length;
+            m.velocity = velocity;
+            return m;
+        };
+
+        cb::Melody empty;
+        processor.setMelody (empty);
+        editor->setSize (ChordbloomEditor::kDefaultWidth, ChordbloomEditor::kDefaultHeight);
+        editor->setMelodyViewVisible (true);
+        settle (processor, *editor);
+        editor->getMelodyRoll().setTopNote (83);
+        settle (processor, *editor);
+        ok &= writePng (*editor, outputDir.getChildFile ("13a_melody_empty_1100x690.png"));
+
+        cb::Melody melody;
+        melody.notes = { note (76, 0.0, 1.0), note (72, 1.0, 0.5, 0.6f), note (74, 1.5, 0.5, 0.6f), note (76, 2.0, 2.0),
+                         note (77, 4.0, 1.0), note (76, 5.0, 0.5, 0.6f), note (74, 5.5, 0.5, 0.6f), note (72, 6.0, 2.0),
+                         note (79, 8.0, 1.5), note (76, 9.5, 0.5, 0.6f), note (72, 10.0, 1.0), note (75, 11.0, 0.5, 0.5f),
+                         note (74, 11.5, 0.5, 0.6f), note (71, 12.0, 1.0), note (74, 13.0, 1.0), note (69, 14.5, 1.0) };
+        processor.setMelody (melody);
+        settle (processor, *editor);
+        ok &= writePng (*editor, outputDir.getChildFile ("13b_melody_1100x690.png"));
+
+        // Hover: the row name pill and the outline of the note a click would draw (Chord snap over C)
+        {
+            auto& roll = editor->getMelodyRoll();
+            roll.setSnap (cb::MelodySnap::ChordTones);
+            auto* surface = roll.getChildComponent (0);
+            const auto pos = roll.getCellCentre (10.6, 80);
+            surface->mouseMove (syntheticMouseEvent (*surface, pos, {}));
+            settle (processor, *editor);
+            ok &= writeImage (editor->createComponentSnapshot (roll.getBounds(), true, 1.0f),
+                              outputDir.getChildFile ("13c_melody_hover_draw_preview.png"));
+            surface->mouseExit (syntheticMouseEvent (*surface, pos, {}));
+            roll.setSnap (cb::MelodySnap::Scale);
+        }
+
+        // Playing (local playback at beat ~9): playhead and the sounding note's glow
+        {
+            constexpr double sr = 48000.0;
+            constexpr int block = 480;
+            juce::AudioBuffer<float> audio (2, block);
+            juce::MidiBuffer midi;
+            setParam (processor, cb::ParamIDs::previewOn, 0.0f);
+            processor.prepareToPlay (sr, block);
+            processor.setLocalPlayback (true);
+
+            for (int i = 0; i < 900; ++i)   // 9 beats at 120 BPM
+            {
+                midi.clear();
+                processor.processBlock (audio, midi);
+            }
+
+            settle (processor, *editor);
+            ok &= writePng (*editor, outputDir.getChildFile ("13d_melody_playing_1100x690.png"));
+            processor.setLocalPlayback (false);
+            midi.clear();
+            processor.processBlock (audio, midi);
+            processor.releaseResources();
+            setParam (processor, cb::ParamIDs::previewOn, 1.0f);
+            settle (processor, *editor);
+        }
+
+        // Minimum and maximum sizes
+        editor->setSize (ChordbloomEditor::kMinWidth, ChordbloomEditor::kMinHeight);
+        settle (processor, *editor);
+        ok &= writePng (*editor, outputDir.getChildFile ("13e_melody_960x560.png"));
+        editor->setSize (ChordbloomEditor::kMaxWidth, ChordbloomEditor::kMaxHeight);
+        settle (processor, *editor);
+        ok &= writePng (*editor, outputDir.getChildFile ("13f_melody_1600x1000.png"));
+
+        // Ghost notes: a second Chordbloom instance with a bass melody
+        {
+            ChordbloomProcessor other;
+            other.setProgression (processor.getProgression());
+            cb::Melody bass;
+            bass.notes = { note (69, 0.0, 2.0), note (72, 2.0, 2.0), note (65, 4.0, 4.0), note (67, 8.0, 2.0), note (64, 10.0, 2.0),
+                           note (71, 12.0, 2.0) };
+            other.setMelody (bass);
+            editor->setSize (ChordbloomEditor::kDefaultWidth, ChordbloomEditor::kDefaultHeight);
+            settle (processor, *editor);
+            editor->getMelodyRoll().setTopNote (81);
+            settle (processor, *editor);
+            ok &= check (editor->getMelodyRoll().getNumGhostNotesShown() > 0,
+                         "melody: ghost notes of another instance are shown ("
+                             + juce::String (editor->getMelodyRoll().getNumGhostNotesShown()) + ")");
+            ok &= writePng (*editor, outputDir.getChildFile ("13g_melody_ghosts_1100x690.png"));
+        }
+
+        settle (processor, *editor);
+        ok &= check (editor->getMelodyRoll().getNumGhostNotesShown() == 0, "melody: ghosts go when the other instance closes");
+
+        // Export panel with the Melody chip, default and minimum width
+        ok &= writeImage (editor->createComponentSnapshot (editor->getLocalBounds().withTrimmedTop (editor->getHeight() - 80)
+                                                               .withTrimmedLeft (editor->getWidth() / 2), true, 2.0f),
+                          outputDir.getChildFile ("13h_export_melody_chip_2x.png"));
+        editor->setSize (ChordbloomEditor::kMinWidth, ChordbloomEditor::kMinHeight);
+        settle (processor, *editor);
+        ok &= writeImage (editor->createComponentSnapshot (editor->getLocalBounds().withTrimmedTop (editor->getHeight() - 76)
+                                                               .withTrimmedLeft (editor->getWidth() / 2), true, 2.0f),
+                          outputDir.getChildFile ("13i_export_melody_chip_960_2x.png"));
+
+        // The palette view with the switch (and its "has notes" dot), at the minimum size
+        editor->setMelodyViewVisible (false);
+        settle (processor, *editor);
+        ok &= writeImage (editor->createComponentSnapshot ({ editor->getWidth() - 260, 56, 260, 80 }, true, 2.0f),
+                          outputDir.getChildFile ("13j_view_switch_chords_960_2x.png"));
+        editor->setSize (ChordbloomEditor::kDefaultWidth, ChordbloomEditor::kDefaultHeight);
+        settle (processor, *editor);
+        ok &= writePng (*editor, outputDir.getChildFile ("13k_chords_view_with_switch_1100x690.png"));
+    }
 
     // 11. Keyboard focus (B10): no component of the editor may take keyboard focus, so FL's spacebar keeps working.
     {

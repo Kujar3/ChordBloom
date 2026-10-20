@@ -6,6 +6,7 @@
 #include <bitset>
 #include <optional>
 
+#include "core/Melody.h"
 #include "core/Palette.h"
 #include "core/Pattern.h"
 #include "core/Progression.h"
@@ -37,7 +38,11 @@ namespace cb::ParamIDs
     inline constexpr const char* scaleLock       = "scaleLock";       // bool: snap incoming MIDI notes to the scale  default false
     inline constexpr const char* chordTrigger    = "chordTrigger";    // bool: incoming white keys C..B play degree chords 1..7  default false
     inline constexpr const char* triggerSevenths = "triggerSevenths"; // bool: chord trigger uses seventh chords   default false
-    inline constexpr const char* midiOutPart     = "midiOutPart";     // choice: "Chords + Bass", "Chords only", "Bass only" (filters playback MIDI out; previews/live input count as chords)  default Chords + Bass
+    // choice, filters playback MIDI out (previews and live input count as chords, melody auditions as melody):
+    //   0 "All parts" (was "Chords + Bass" before the melody existed), 1 "Chords only", 2 "Bass only",
+    //   3 "Melody only", 4 "Chords + Bass" (no melody)       default All parts
+    inline constexpr const char* midiOutPart     = "midiOutPart";
+    inline constexpr const char* melodyOn        = "melodyOn";        // bool: the melody plays with the progression  default true
 }
 
 //==============================================================================
@@ -45,7 +50,7 @@ namespace cb::ParamIDs
     Chordbloom: chord palette / progression / MIDI generator.
 
     Audio: stereo output from the built-in preview synth (when previewOn). No audio input.
-    MIDI out (when midiOut): chords on channel 1, bass on channel 2, plus transformed live input.
+    MIDI out (when midiOut): chords on channel 1, bass on channel 2, melody on channel 3, plus transformed live input.
 
     THREADING CONTRACT
       - Every public method below is message-thread only unless marked "any thread".
@@ -64,6 +69,7 @@ public:
 
     static constexpr int kChordChannel = 1;
     static constexpr int kBassChannel = 2;
+    static constexpr int kMelodyChannel = 3;
 
     //==============================================================================
     // juce::AudioProcessor
@@ -93,7 +99,7 @@ public:
     const juce::String getProgramName (int) override { return "Default"; }
     void changeProgramName (int, const juce::String&) override {}
 
-    void getStateInformation (juce::MemoryBlock&) override;   // APVTS state + progression + editor size, versioned
+    void getStateInformation (juce::MemoryBlock&) override;   // APVTS state + progression + melody + editor size, versioned
     void setStateInformation (const void*, int) override;
 
     //==============================================================================
@@ -125,11 +131,44 @@ public:
     std::vector<cb::NoteEvent> renderProgressionEvents() const;     // one loop, current render settings
 
     //==============================================================================
+    // Melody (added with the melody roll). Drawn in the editor's Melody view; plays with the progression on MIDI
+    // channel 3 (built-in sound + MIDI out) while melodyOn is on; stored in the plugin state; exported by the Melody
+    // chip (ExportPart::Melody). Notes are in beats from the start of the progression; the loop is the progression,
+    // so nothing plays without chords. Notes at or past the loop end stay in the melody but are not played.
+    //
+    // Melody edits share the progression's undo stack: undo() / redo() step back through both in the order they
+    // happened. Structural progression edits move the melody along with its chords in the same undo step
+    // (cb::melodyFollowingSlots): addChord with an insert index, removeSlot, moveSlot, duplicateSlot, and updateSlot
+    // when the length changes. setProgression and clearProgression (Spark, presets, Clear) leave the melody where it is
+    // in time; transposeProgression transposes it with the chords (cb::transposeMelody).
+    const cb::Melody& getMelody() const;
+    void setMelody (const cb::Melody&);                      // sanitised, undoable; no undo step when nothing changes
+    void clearMelody();                                      // setMelody ({})
+    std::vector<cb::NoteEvent> renderMelodyEvents() const;   // one loop: cb::renderMelody (melody, totalBeats, 3), even
+                                                             // when melodyOn is off (export); empty without chords
+
+    // Ghost notes: every instance publishes its melody to a process-wide registry, so each melody roll can show the
+    // other Chordbloom instances' melodies faintly (e.g. a bass line or a counter-melody on another channel).
+    struct GhostMelody
+    {
+        int instanceNumber = 0;   // that instance's number (getInstanceNumber)
+        cb::Melody melody;
+        double loopBeats = 0.0;   // its progression length in beats (0 = no chords)
+    };
+    std::vector<GhostMelody> getGhostMelodies() const;   // other live instances with melody notes, by instance number
+    uint64_t getGhostSerial() const noexcept;            // any thread: changes whenever any instance publishes or goes away
+    int getInstanceNumber() const noexcept;              // any thread: 1, 2, 3 ... in creation order within the process
+
+    //==============================================================================
     // Auditioning (hand-off to the audio thread is lock-free). Preview notes sound through the built-in synth
     // (if previewOn) and are sent as MIDI out (if midiOut), chords on channel 1.
     void startPreviewChord (const cb::Chord&);   // stops any sounding preview first; voice-led from the previous preview
     void startPreviewSlot (int slotIndex);       // uses the slot's progression voicing
     void startPreviewNote (int midiNote);        // single note (keyboard clicks)
+    // (Added with the melody roll.) Single note on the melody channel (3): drawn / dragged melody notes and roll key
+    // clicks. It counts as the melody part for midiOutPart, so a "Melody only" instance passes it on. Stopped by
+    // stopPreview() like every preview; getPreviewChord() stays empty.
+    void startPreviewMelodyNote (int midiNote);
     void stopPreview();                          // note-offs for whatever preview is sounding
     std::optional<cb::Chord> getPreviewChord() const;   // chord currently being previewed (chord/slot previews), if any
     std::vector<int> getPreviewNotes() const;           // MIDI notes of the preview currently held (empty when none). Added by the integrator.
@@ -165,9 +204,12 @@ public:
 
     //==============================================================================
     // MIDI export
-    enum class ExportPart { Chords, Bass, Both };
+    // Melody (added with the melody roll): one loop of renderMelodyEvents() as a one-track file ("Chordbloom Melody",
+    // channel 3). Both stays chords + bass.
+    enum class ExportPart { Chords, Bass, Both, Melody };
     // Writes one loop of the progression at the host tempo into <temp>/Chordbloom/, file name like
-    // "Chordbloom - C Major - Chords.mid". Returns the file, or File() when the progression is empty / on failure.
+    // "Chordbloom - C Major - Chords.mid". Returns the file, or File() when the progression is empty / on failure
+    // (Melody: also when no melody note starts inside the loop).
     juce::File writeMidiToTempFile (ExportPart) const;
     bool saveMidiFile (const juce::File& destination, ExportPart) const;
 
@@ -182,8 +224,8 @@ public:
     juce::File writeSlotMidiToTempFile (int slotIndex) const;        // that slot's events (its voicing), shifted to beat 0
 
     //==============================================================================
-    // Transpose every slot's root by `semitones` (undoable, sendChangeMessage). Used by the lane's "Move chords to key"
-    // pill and its Transpose menu. bestTranspositionForKey() = the shift in -5..+6 that makes the most slots diatonic
+    // Transpose every slot's root by `semitones` (undoable, sendChangeMessage), and the melody with it
+    // (cb::transposeMelody, same undo step). Used by the lane's "Move chords to key" pill and its Transpose menu. bestTranspositionForKey() = the shift in -5..+6 that makes the most slots diatonic
     // in the current key (0 when the current placement is already best or the progression is empty).
     void transposeProgression (int semitones);
     int bestTranspositionForKey() const;

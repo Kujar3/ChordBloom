@@ -13,5 +13,9 @@ namespace cb::midiexport
 juce::MidiFile buildMidiFile (const std::vector<NoteEvent>& events, double bpm,
                               bool includeChords, bool includeBass, int ticksPerQuarterNote = 960);
 
+// (Added with the melody roll.) Melody file: track 0 as above, track 1 "Chordbloom Melody" with every event of
+// `melodyEvents` (as from cb::renderMelody) on its own channel (3), note-offs before note-ons on the same tick.
+juce::MidiFile buildMelodyMidiFile (const std::vector<NoteEvent>& melodyEvents, double bpm, int ticksPerQuarterNote = 960);
+
 bool writeMidiFile (const juce::MidiFile&, const juce::File& destination);   // overwrites; creates parent dirs
 }

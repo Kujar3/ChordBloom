@@ -18,6 +18,8 @@ src/core/                   pure C++17 music theory, no JUCE, unit-tested by Cor
   Progression.h/.cpp        progression model (done)
   Voicing.h/.cpp            voicing styles, inversions, voice leading
   Pattern.h/.cpp            rhythm patterns + bass -> NoteEvents (beats)
+  Generate.h/.cpp           Spark (mood-based progressions) and presets
+  Melody.h/.cpp             melody model, harmonic-guide tone roles, pitch/grid snapping, melody render, follow-slots
 src/plugin/                 JUCE audio side
   PluginProcessor.h/.cpp    ChordbloomProcessor (public API = contract for the UI; private Impl is free)
   PreviewSynth.h/.cpp       built-in preview instrument
@@ -25,8 +27,9 @@ src/plugin/                 JUCE audio side
 src/ui/                     JUCE editor
   Theme.h/.cpp              colours, Inter fonts, LookAndFeel
   DragPayload.h             internal drag descriptions (done)
-  PluginEditor.h/.cpp       layout + coordination
+  PluginEditor.h/.cpp       layout + coordination (Chords | Melody view switch)
   HeaderBar, ChordPaletteView, ProgressionLane, ControlsPanel, KeyboardGuide, ExportPanel
+  MelodyRoll                melody "harmonic guide" piano roll (shown in place of the palette)
 tests/                      CoreTests (tiny framework in TestFramework.h)
 tools/dev/                  ChordbloomDev: `selftest` (processor integration) and `snapshot <dir>` (editor PNGs)
 resources/fonts             Inter 400/600/700 (embedded via juce_add_binary_data -> ChordbloomBinary.h,
@@ -71,6 +74,22 @@ tools/pluginval             pluginval.exe 1.0.4 (gitignored)
 - Live MIDI input: passed through; with `scaleLock` notes snap to the nearest scale tone (remember the mapping so
   note-offs match); with `chordTrigger` white keys C..B (any octave) play the diatonic chord of degree 1..7
   (triads, or sevenths with `triggerSevenths`), voiced by the message thread in advance; black keys pass through.
+
+## Melody ("harmonic guide" piano roll)
+
+- Model: `cb::Melody` (Melody.h) = notes with MIDI pitch 36..96, start / length in beats from the start of the
+  progression (1/48-beat resolution), velocity. Always stored in canonical form (`sanitiseMelody`). Notes are tied to
+  time, not to slots, but structural progression edits move them with their chords (`melodyFollowingSlots`).
+- Processor: `getMelody / setMelody / clearMelody`; melody edits share the progression's undo stack (each undo entry is
+  progression + melody). The melody is part of the plugin state (`<Melody><Note .../></Melody>`, absent = empty).
+  Rendered on the message thread with `cb::renderMelody` into the same EngineData as the chords (channel 3, only notes
+  that start inside the loop, clipped at its end) while the `melodyOn` parameter is on. `midiOutPart` gained
+  "Melody only" (3) and "Chords + Bass" (4); 0 is now "All parts". Melody auditions (`startPreviewMelodyNote`) play on
+  channel 3 and count as the melody part. `ExportPart::Melody` writes a one-track melody file.
+- Ghost notes: every processor publishes its melody + loop length to a process-wide registry (src/plugin/GhostRegistry,
+  mutex-protected, message thread); `getGhostMelodies()` returns the other instances' melodies for the roll.
+- UI: the editor's "Chords | Melody" switch shows `MelodyRoll` in the palette's place. The roll's beat axis matches
+  the lane's track exactly (same x range and beats per pixel), so chords and notes line up vertically.
 
 ## Visual design
 

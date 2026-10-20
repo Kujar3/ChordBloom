@@ -9,6 +9,9 @@
 // so the clip can be dropped onto FL Studio's playlist / channel rack / piano roll.
 // Plus a "Save .mid..." button (async FileChooser -> processor.saveMidiFile). Chips are disabled when the
 // progression is empty. With Bass mode Off the Bass chip refuses to drag (and says why) and "Both" carries chords only.
+// A fourth chip, "Melody" (added with the melody roll), drags ExportPart::Melody; it is disabled (tooltip says why)
+// until a melody note starts inside the progression's loop, and the Save menu offers "Melody only". When the panel
+// is narrow the Save button shrinks to its icon so four chips fit.
 // After a chip was dropped outside the plugin while Play with FL (syncToHost) is on, a clickable toast
 // "Dropped into FL? Chordbloom still plays along" offers to turn syncToHost off.
 // Nothing in the panel takes keyboard focus.

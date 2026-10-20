@@ -410,6 +410,7 @@ struct ChordPaletteView::Impl : public juce::Component,
         auto area = getLocalBounds().toFloat().reduced (12.0f, 10.0f);
         const int numRows = (int) rows.size();
         legendArea = {};
+        cornerCell = {};
 
         if (numRows == 0 || area.isEmpty())
             return;
@@ -446,6 +447,13 @@ struct ChordPaletteView::Impl : public juce::Component,
                 // Decided on the unrounded row height, so every row agrees (rounding makes rows 1 px apart).
                 pad.showRoman = rowH >= 30.0f;
             }
+        }
+
+        // The last cell of the first row (the Triads row has 7 pads): the editor's Chords / Melody switch sits there.
+        {
+            const float x0 = std::round (cellsX + (float) (kColumns - 1) * pitch);
+            const auto& first = rows.front().bounds;
+            cornerCell = { x0, first.getY(), area.getRight() - x0, first.getHeight() };
         }
 
         // Legend: the free cells at the end of the lowest row that has at least two empty columns (the Secondary
@@ -1033,6 +1041,7 @@ struct ChordPaletteView::Impl : public juce::Component,
     cb::Key key;
     std::vector<Row> rows;
     juce::Rectangle<float> legendArea;
+    juce::Rectangle<float> cornerCell;
     std::vector<std::unique_ptr<AccessibleItem>> proxies;
 
     std::optional<cb::Chord> context, sounding;
@@ -1086,3 +1095,8 @@ void ChordPaletteView::refresh()
 
 void ChordPaletteView::setContextChord (std::optional<cb::Chord> chord) { impl->setContext (chord); }
 void ChordPaletteView::setSoundingChord (std::optional<cb::Chord> chord) { impl->setSounding (chord); }
+
+juce::Rectangle<int> ChordPaletteView::getCornerCellBounds() const
+{
+    return impl->cornerCell.getSmallestIntegerContainer() + impl->getPosition();
+}

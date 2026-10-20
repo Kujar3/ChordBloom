@@ -1,5 +1,6 @@
 #include "plugin/PluginProcessor.h"
 
+#include "plugin/GhostRegistry.h"
 #include "plugin/MidiExport.h"
 #include "plugin/PreviewSynth.h"
 #include "ui/PluginEditor.h"
@@ -87,8 +88,11 @@ juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
     layout.add (std::make_unique<AudioParameterBool> (pid (id::scaleLock), "Scale Lock", false));
     layout.add (std::make_unique<AudioParameterBool> (pid (id::chordTrigger), "Chord Trigger", false));
     layout.add (std::make_unique<AudioParameterBool> (pid (id::triggerSevenths), "Trigger Sevenths", false));
+    // Index 0 was "Chords + Bass" before the melody existed (old projects have no melody, so nothing changes for them);
+    // new choices are only ever appended so stored values keep their meaning.
     layout.add (std::make_unique<AudioParameterChoice> (pid (id::midiOutPart), "MIDI Out Part",
-        StringArray { "Chords + Bass", "Chords only", "Bass only" }, 0));
+        StringArray { "All parts", "Chords only", "Bass only", "Melody only", "Chords + Bass" }, 0));
+    layout.add (std::make_unique<AudioParameterBool> (pid (id::melodyOn), "Melody", true));
     return layout;
 }
 
@@ -107,14 +111,21 @@ const char* const kStateTag = "ChordbloomState";
 const char* const kProgressionTag = "Progression";
 const char* const kSlotTag = "Slot";
 const char* const kEditorTag = "Editor";
+const char* const kMelodyTag = "Melody";
+const char* const kNoteTag = "Note";
+constexpr double kStateTicksPerBeat = 48.0;   // melody note times are stored as whole 1/48 beats (exact)
 
 const char* const kAllParamIds[] = {
     cb::ParamIDs::keyRoot, cb::ParamIDs::scale, cb::ParamIDs::octave, cb::ParamIDs::voicing, cb::ParamIDs::voiceLeading,
     cb::ParamIDs::pattern, cb::ParamIDs::rate, cb::ParamIDs::bassMode, cb::ParamIDs::velocity, cb::ParamIDs::gate,
     cb::ParamIDs::swing, cb::ParamIDs::humanize, cb::ParamIDs::previewOn, cb::ParamIDs::previewTone,
     cb::ParamIDs::previewVolume, cb::ParamIDs::midiOut, cb::ParamIDs::syncToHost, cb::ParamIDs::scaleLock,
-    cb::ParamIDs::chordTrigger, cb::ParamIDs::triggerSevenths
+    cb::ParamIDs::chordTrigger, cb::ParamIDs::triggerSevenths, cb::ParamIDs::melodyOn
 };
+
+// MIDI-out parts that each midiOutPart choice lets through (bit 0 chords, bit 1 bass, bit 2 melody).
+constexpr uint8_t kOutPartMask[] = { 0b111, 0b001, 0b010, 0b100, 0b011 };
+constexpr int kNumOutPartChoices = (int) std::size (kOutPartMask);
 
 // White-key pitch class -> degree (C D E F G A B -> 0..6), -1 for black keys.
 constexpr int kWhiteKeyDegree[12] = { 0, -1, 1, -1, 2, 3, -1, 4, -1, 5, -1, 6 };
@@ -158,13 +169,14 @@ struct PreviewMsg
     uint8_t on = 0;
     uint8_t note = 0;
     uint8_t velocity = 0;
+    uint8_t channel = 1;   // chord previews and keyboard clicks: 1; melody auditions: 3
 };
 
 // Parameters that change what the message thread renders.
 struct RenderSnapshot
 {
     int keyRoot = 0, scale = 0, octave = 0, voicing = 0, pattern = 0, rate = 0, bass = 0;
-    bool voiceLeading = true;
+    bool voiceLeading = true, melodyOn = true;
     float velocity = 0.0f, gate = 0.0f, swing = 0.0f, humanize = 0.0f;
 
     bool sameVoicing (const RenderSnapshot& o) const
@@ -175,7 +187,8 @@ struct RenderSnapshot
     bool operator== (const RenderSnapshot& o) const
     {
         return keyRoot == o.keyRoot && scale == o.scale && sameVoicing (o) && pattern == o.pattern && rate == o.rate
-            && bass == o.bass && velocity == o.velocity && gate == o.gate && swing == o.swing && humanize == o.humanize;
+            && bass == o.bass && melodyOn == o.melodyOn && velocity == o.velocity && gate == o.gate && swing == o.swing
+            && humanize == o.humanize;
     }
     bool operator!= (const RenderSnapshot& o) const { return ! (*this == o); }
 };
@@ -221,6 +234,7 @@ juce::String partName (ChordbloomProcessor::ExportPart part)
     {
         case ChordbloomProcessor::ExportPart::Chords: return "Chords";
         case ChordbloomProcessor::ExportPart::Bass:   return "Bass";
+        case ChordbloomProcessor::ExportPart::Melody: return "Melody";
         case ChordbloomProcessor::ExportPart::Both:   break;
     }
     return "Chords + Bass";
@@ -432,6 +446,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         prm.chordTrigger = get (cb::ParamIDs::chordTrigger);
         prm.triggerSevenths = get (cb::ParamIDs::triggerSevenths);
         prm.midiOutPart = get (cb::ParamIDs::midiOutPart);
+        prm.melodyOn = get (cb::ParamIDs::melodyOn);
 
         applyUserDefaults();   // before the listeners: a fresh instance simply starts there (a loaded state overrides it)
 
@@ -446,6 +461,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         palette = safeBuildPalette (paletteKey);
         renderedSnap = readSnapshot();
         rebuildAndPublish();
+        publishGhost();
 
         startTimerHz (20);
     }
@@ -454,10 +470,18 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
     {
         stopTimer();
         cancelPendingUpdate();
+        cb::ghosts::unregisterInstance (instanceNumber);
         flushUserDefaults();
         for (auto* id : kAllParamIds)
             apvts.removeParameterListener (id, this);
     }
+
+    // One undo step / a loaded state: the progression and the melody together.
+    struct SongState
+    {
+        cb::Progression progression;
+        cb::Melody melody;
+    };
 
     //==============================================================================
     // Parameters
@@ -484,6 +508,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         std::atomic<float>* chordTrigger = nullptr;
         std::atomic<float>* triggerSevenths = nullptr;
         std::atomic<float>* midiOutPart = nullptr;
+        std::atomic<float>* melodyOn = nullptr;
     };
 
     static float rawValue (const std::atomic<float>* p, float fallback = 0.0f) noexcept
@@ -546,6 +571,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         s.gate = rawValue (prm.gate, 0.9f);
         s.swing = rawValue (prm.swing);
         s.humanize = rawValue (prm.humanize);
+        s.melodyOn = boolValue (prm.melodyOn);
         return s;
     }
 
@@ -585,7 +611,8 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         // notes mid-step (no chase), see resyncTimingOnly.
         const bool timingOnly = ! force && snap.keyRoot == renderedSnap.keyRoot && snap.scale == renderedSnap.scale
                              && snap.sameVoicing (renderedSnap) && snap.pattern == renderedSnap.pattern
-                             && snap.rate == renderedSnap.rate && snap.bass == renderedSnap.bass;
+                             && snap.rate == renderedSnap.rate && snap.bass == renderedSnap.bass
+                             && snap.melodyOn == renderedSnap.melodyOn;
 
         if (changed)
         {
@@ -669,6 +696,22 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         }
     }
 
+    std::vector<cb::NoteEvent> renderMelodyEvents() const
+    {
+        const double total = (double) progression.totalBeats();
+        if (total <= 0.0 || melody.empty())
+            return {};
+
+        try
+        {
+            return cb::renderMelody (melody, total, ChordbloomProcessor::kMelodyChannel);
+        }
+        catch (...)
+        {
+            return {};
+        }
+    }
+
     static std::vector<uint8_t> sanitiseNotes (const std::vector<int>& notes, size_t maxNotes)
     {
         std::vector<uint8_t> out;
@@ -702,7 +745,14 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
 
         if (total > 0.0)
         {
-            const auto events = renderEvents();
+            auto events = renderEvents();
+
+            if (boolValue (prm.melodyOn))
+            {
+                const auto melodyEvents = renderMelodyEvents();
+                events.insert (events.end(), melodyEvents.begin(), melodyEvents.end());
+            }
+
             data->events.reserve (events.size());
 
             for (const auto& e : events)
@@ -890,34 +940,61 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
     {
         const std::lock_guard<std::mutex> lock (stateMutex);
         stateProgression = progression;
+        stateMelody = melody;
     }
+
+    // Every instance's melody and loop length go to the process-wide ghost registry (the other instances' rolls).
+    void publishGhost() { cb::ghosts::publish (instanceNumber, melody, (double) progression.totalBeats()); }
 
     void progressionChanged()
     {
         syncStateCopy();
         rebuildAndPublish();
+        publishGhost();
         owner.sendChangeMessage();
     }
 
-    bool commit (const cb::Progression& proposed)
+    // One undo step for a new progression and / or melody (nothing happens when both are unchanged).
+    bool commitSong (const cb::Progression& proposed, const cb::Melody& proposedMelody)
     {
         auto next = sanitiseProgression (proposed);
-        if (next == progression)
+        auto nextMelody = cb::sanitiseMelody (proposedMelody);
+        if (next == progression && nextMelody == melody)
             return false;
 
-        undoStack.push_back (progression);
+        undoStack.push_back ({ progression, melody });
         if ((int) undoStack.size() > kMaxUndo)
             undoStack.erase (undoStack.begin());
         redoStack.clear();
 
         progression = std::move (next);
+        melody = std::move (nextMelody);
         progressionChanged();
         return true;
     }
 
+    bool commit (const cb::Progression& proposed) { return commitSong (proposed, melody); }
+
+    // A structural edit: the melody moves along with its chords. sourceSlot[i] = old index of new slot i (-1 = new).
+    bool commitFollowing (const cb::Progression& proposed, std::vector<int> sourceSlot)
+    {
+        const auto next = sanitiseProgression (proposed);
+        sourceSlot.resize (next.slots.size(), -1);
+        cb::Melody moved;
+        try
+        {
+            moved = cb::melodyFollowingSlots (melody, progression, next, sourceSlot);
+        }
+        catch (...)
+        {
+            moved = melody;
+        }
+        return commitSong (next, moved);
+    }
+
     //==============================================================================
     // Message thread: preview
-    bool pushPreview (bool on, int note, uint8_t velocity)
+    bool pushPreview (bool on, int note, uint8_t velocity, int channel)
     {
         if (fifo.getFreeSpace() < 1)
         {
@@ -925,7 +1002,8 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
             return false;
         }
 
-        const PreviewMsg msg { (uint8_t) (on ? 1 : 0), (uint8_t) juce::jlimit (0, 127, note), velocity };
+        const PreviewMsg msg { (uint8_t) (on ? 1 : 0), (uint8_t) juce::jlimit (0, 127, note), velocity,
+                               (uint8_t) juce::jlimit (1, 16, channel) };
         fifo.write (1).forEach ([&] (int index) { previewBuffer[(size_t) index] = msg; });
         return true;
     }
@@ -933,21 +1011,24 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
     void stopPreviewNotes()
     {
         for (int n : previewNotes)
-            pushPreview (false, n, 0);
+            pushPreview (false, n, 0, previewChannel);
         previewNotes.clear();
         previewChord.reset();
         ++previewSerial;   // every audition starts with a stop, so each one (and each stop) gets a fresh serial
     }
 
-    void startPreviewNotes (const std::vector<int>& notes)
+    void startPreviewNotes (const std::vector<int>& notes, int channel = ChordbloomProcessor::kChordChannel)
     {
         const auto clean = sanitiseNotes (notes, 16);
         if (clean.empty() || fifo.getFreeSpace() < (int) clean.size())
             return;
 
-        const auto vel = toMidiVelocity (juce::jlimit (0.05f, 1.0f, rawValue (prm.velocity, 0.75f)));
+        const auto vel = channel == ChordbloomProcessor::kMelodyChannel
+                             ? toMidiVelocity (cb::kDefaultMelodyVelocity)
+                             : toMidiVelocity (juce::jlimit (0.05f, 1.0f, rawValue (prm.velocity, 0.75f)));
+        previewChannel = channel;
         for (auto n : clean)
-            if (pushPreview (true, n, vel))
+            if (pushPreview (true, n, vel, channel))
                 previewNotes.push_back (n);
     }
 
@@ -972,6 +1053,20 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
                 e->setAttribute ("length", s.lengthBeats);
                 e->setAttribute ("inversion", s.inversion);
                 e->setAttribute ("octave", s.octaveShift);
+            }
+        }
+
+        auto* mel = root.createNewChildElement (kMelodyTag);
+        mel->setAttribute ("ticksPerBeat", (int) kStateTicksPerBeat);
+        {
+            const std::lock_guard<std::mutex> lock (stateMutex);
+            for (auto& n : stateMelody.notes)
+            {
+                auto* e = mel->createNewChildElement (kNoteTag);
+                e->setAttribute ("note", n.note);
+                e->setAttribute ("start", (int) std::lround (n.startBeat * kStateTicksPerBeat));
+                e->setAttribute ("length", (int) std::lround (n.lengthBeats * kStateTicksPerBeat));
+                e->setAttribute ("velocity", (double) n.velocity);
             }
         }
 
@@ -1036,6 +1131,25 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         return p;
     }
 
+    static cb::Melody parseMelody (const juce::XmlElement& xml)
+    {
+        const double ticksPerBeat = juce::jlimit (1.0, 9600.0, xml.getDoubleAttribute ("ticksPerBeat", kStateTicksPerBeat));
+        cb::Melody m;
+        for (auto* e : xml.getChildWithTagNameIterator (kNoteTag))
+        {
+            if ((int) m.notes.size() >= cb::kMaxMelodyNotes)
+                break;
+
+            cb::MelodyNote n;
+            n.note = e->getIntAttribute ("note", 72);
+            n.startBeat = e->getDoubleAttribute ("start", 0.0) / ticksPerBeat;
+            n.lengthBeats = e->getDoubleAttribute ("length", ticksPerBeat) / ticksPerBeat;
+            n.velocity = (float) e->getDoubleAttribute ("velocity", (double) cb::kDefaultMelodyVelocity);
+            m.notes.push_back (n);
+        }
+        return cb::sanitiseMelody (m);
+    }
+
     void readState (const void* data, int sizeInBytes)
     {
         if (data == nullptr || sizeInBytes <= 0)
@@ -1060,6 +1174,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         const juce::XmlElement* paramsXml = nullptr;
         const juce::XmlElement* progXml = nullptr;
         const juce::XmlElement* editorXml = nullptr;
+        const juce::XmlElement* melodyXml = nullptr;
         bool isFullState = false;
 
         if (xml->hasTagName (kStateTag))
@@ -1068,6 +1183,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
             paramsXml = xml->getChildByName (apvts.state.getType());
             progXml = xml->getChildByName (kProgressionTag);
             editorXml = xml->getChildByName (kEditorTag);
+            melodyXml = xml->getChildByName (kMelodyTag);
         }
         else if (xml->hasTagName (apvts.state.getType().toString()))
         {
@@ -1104,48 +1220,53 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
             return;
         }
 
-        const auto loaded = progXml != nullptr ? parseProgression (*progXml) : cb::Progression();
+        SongState loaded;
+        loaded.progression = progXml != nullptr ? parseProgression (*progXml) : cb::Progression();
+        loaded.melody = melodyXml != nullptr ? parseMelody (*melodyXml) : cb::Melody();   // older states: no melody
 
         if (juce::MessageManager::existsAndIsCurrentThread())
         {
             {
                 const std::lock_guard<std::mutex> lock (stateMutex);
-                pendingProgression.reset();
+                pendingSong.reset();
             }
-            applyLoadedProgression (loaded);
+            applyLoadedSong (loaded);
         }
         else
         {
             {
                 const std::lock_guard<std::mutex> lock (stateMutex);
-                pendingProgression = loaded;
-                stateProgression = loaded;
+                pendingSong = loaded;
+                stateProgression = loaded.progression;
+                stateMelody = loaded.melody;
             }
             triggerAsyncUpdate();
         }
     }
 
-    void applyLoadedProgression (const cb::Progression& loaded)
+    void applyLoadedSong (const SongState& loaded)
     {
-        progression = sanitiseProgression (loaded);
+        progression = sanitiseProgression (loaded.progression);
+        melody = cb::sanitiseMelody (loaded.melody);
         undoStack.clear();
         redoStack.clear();
         syncStateCopy();
         renderedSnap = readSnapshot();
         ensurePalette();
         rebuildAndPublish();
+        publishGhost();
         owner.sendChangeMessage();
     }
 
     void applyPendingState()
     {
-        std::optional<cb::Progression> pending;
+        std::optional<SongState> pending;
         {
             const std::lock_guard<std::mutex> lock (stateMutex);
-            pending.swap (pendingProgression);
+            pending.swap (pendingSong);
         }
         if (pending.has_value())
-            applyLoadedProgression (*pending);
+            applyLoadedSong (*pending);
     }
 
     //==============================================================================
@@ -1160,10 +1281,12 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         uint8_t channel = 1;
     };
 
-    // MIDI-out parts for the midiOutPart filter: playback bass is "bass"; playback chords, previews and live input
-    // are "chords".
+    // MIDI-out parts for the midiOutPart filter: playback bass is "bass"; playback melody and melody auditions are
+    // "melody"; playback chords, other previews and live input are "chords".
     static constexpr uint8_t kPartChords = 0;
     static constexpr uint8_t kPartBass = 1;
+    static constexpr uint8_t kPartMelody = 2;
+    static constexpr int kNumParts = 3;
 
     struct LogicalEvent
     {
@@ -1205,7 +1328,8 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         bool prevMidiOut = true;
         bool prevPreviewOn = true;
         bool wasBypassed = false;         // the previous block was processBlockBypassed (hostOn etc. = what passed through)
-        int outPart = 0;                  // midiOutPart: 0 = chords + bass, 1 = chords only, 2 = bass only
+        int outPart = 0;                  // midiOutPart choice (kOutPartMask): 0 = all parts, 1 = chords, 2 = bass,
+                                          // 3 = melody, 4 = chords + bass
 
         // timing of the current block (for beat -> sample conversion)
         int numSamples = 0;
@@ -1224,12 +1348,12 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         std::array<uint8_t, 128> notesOnPerPitch {};          // number of channels with ref > 0, per note
 
         // MIDI-out stream (only the parts midiOutPart lets through): holders per part, and how many of them were sent
-        std::array<std::array<std::array<uint16_t, 128>, 16>, 2> partHeld {};
-        std::array<std::array<std::array<uint16_t, 128>, 16>, 2> outCounted {};
+        std::array<std::array<std::array<uint16_t, 128>, 16>, kNumParts> partHeld {};
+        std::array<std::array<std::array<uint16_t, 128>, 16>, kNumParts> outCounted {};
 
         std::array<std::array<bool, 128>, 16> hostOn {};      // what the host has been sent
         std::array<bool, 16> sustainDown {}, sostenutoDown {}, bendOffCentre {};   // forwarded controller state
-        std::array<bool, 128> previewHeld {};                 // preview notes (channel 1)
+        std::array<uint8_t, 128> previewHeld {};              // preview notes: the MIDI channel holding each (0 = none)
         std::array<InputEntry, 16 * 128> input {};            // live input (channel, note) -> output notes
         int lastTriggerKey = -1;
     };
@@ -1250,10 +1374,25 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
 
     static uint8_t playbackPart (int channel) noexcept
     {
-        return channel == ChordbloomProcessor::kBassChannel ? kPartBass : kPartChords;
+        if (channel == ChordbloomProcessor::kBassChannel)
+            return kPartBass;
+        return channel == ChordbloomProcessor::kMelodyChannel ? kPartMelody : kPartChords;
     }
 
-    bool partAllowed (int part) const noexcept { return part == kPartChords ? au.outPart != 2 : au.outPart != 1; }
+    bool partAllowed (int part) const noexcept
+    {
+        return part >= 0 && part < kNumParts && ((kOutPartMask[(size_t) au.outPart] >> part) & 1) != 0;
+    }
+
+    // How many parts other than `exceptPart` have sent (channel index, note) to the MIDI out.
+    int countedByOthers (int exceptPart, int chIndex, int note) const noexcept
+    {
+        int n = 0;
+        for (int p = 0; p < kNumParts; ++p)
+            if (p != exceptPart)
+                n += au.outCounted[(size_t) p][(size_t) chIndex][(size_t) note];
+        return n;
+    }
 
     bool emitOn (int channel, int note, int velocity, int sample, uint8_t part = kPartChords) noexcept
     {
@@ -1370,9 +1509,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
             const auto onStatus = (uint8_t) (0x90 | chIndex);
             const auto offStatus = (uint8_t) (0x80 | chIndex);
 
-            auto& c0 = au.outCounted[0][(size_t) chIndex][e.note];
-            auto& c1 = au.outCounted[1][(size_t) chIndex][e.note];
-            const int outSum = (int) c0 + (int) c1;
+            const int outSum = countedByOthers (-1, chIndex, e.note);
 
             if (e.passthroughOnly != 0)
             {
@@ -1405,9 +1542,9 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
             }
 
             // MIDI-out stream
-            const int part = e.part == kPartBass ? 1 : 0;
+            const int part = juce::jlimit (0, kNumParts - 1, (int) e.part);
             auto& held = au.partHeld[(size_t) part][(size_t) chIndex][e.note];
-            auto& counted = part == 0 ? c0 : c1;
+            auto& counted = au.outCounted[(size_t) part][(size_t) chIndex][e.note];
 
             if (e.on != 0)
             {
@@ -1446,10 +1583,10 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         if (newPart == au.outPart)
             return;
 
-        const bool chordsWereSent = au.outPart != 2;
+        const bool chordsWereSent = partAllowed (kPartChords);
         au.outPart = newPart;
 
-        for (int part = 0; part < 2; ++part)
+        for (int part = 0; part < kNumParts; ++part)
         {
             if (partAllowed (part))
                 continue;
@@ -1462,7 +1599,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
                     if (counted == 0)
                         continue;
                     counted = 0;
-                    if (au.outCounted[(size_t) (1 - part)][(size_t) ch][(size_t) n] == 0)
+                    if (countedByOthers (part, ch, n) == 0)
                         addRaw (outBuffer, (uint8_t) (0x80 | ch), (uint8_t) n, 0, 0);
                 }
             }
@@ -1526,9 +1663,9 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
                     addRaw (combined, (uint8_t) (0x80 | ch), (uint8_t) n, 0, 0);
                 au.ref[(size_t) ch][(size_t) n] = 0;
 
-                if (au.outCounted[0][(size_t) ch][(size_t) n] + au.outCounted[1][(size_t) ch][(size_t) n] > 0)
+                if (countedByOthers (-1, ch, n) > 0)
                     addRaw (outBuffer, (uint8_t) (0x80 | ch), (uint8_t) n, 0, 0);
-                for (size_t part = 0; part < 2; ++part)
+                for (size_t part = 0; part < (size_t) kNumParts; ++part)
                 {
                     au.outCounted[part][(size_t) ch][(size_t) n] = 0;
                     au.partHeld[part][(size_t) ch][(size_t) n] = 0;
@@ -1538,7 +1675,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
 
         au.notesOnPerPitch.fill (0);
         au.numVoices = 0;
-        au.previewHeld.fill (false);
+        au.previewHeld.fill (0);
         for (auto& e : au.input)
             e = {};
         au.lastTriggerKey = -1;
@@ -1558,17 +1695,19 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
             {
                 const auto& m = previewBuffer[(size_t) index];
                 const int n = m.note & 0x7f;
+                const int channel = juce::jlimit (1, 16, (int) m.channel);
+                auto& held = au.previewHeld[(size_t) n];
 
                 if (m.on != 0)
                 {
-                    if (au.previewHeld[(size_t) n])
-                        emitOff (ChordbloomProcessor::kChordChannel, n, 0);
-                    au.previewHeld[(size_t) n] = emitOn (ChordbloomProcessor::kChordChannel, n, m.velocity, 0);
+                    if (held != 0)
+                        emitOff (held, n, 0, playbackPart (held));
+                    held = emitOn (channel, n, m.velocity, 0, playbackPart (channel)) ? (uint8_t) channel : (uint8_t) 0;
                 }
-                else if (au.previewHeld[(size_t) n])
+                else if (held != 0)
                 {
-                    emitOff (ChordbloomProcessor::kChordChannel, n, 0);
-                    au.previewHeld[(size_t) n] = false;
+                    emitOff (held, n, 0, playbackPart (held));
+                    held = 0;
                 }
             });
         }
@@ -1577,10 +1716,10 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         {
             for (int n = 0; n < 128; ++n)
             {
-                if (au.previewHeld[(size_t) n])
+                if (const int held = au.previewHeld[(size_t) n]; held != 0)
                 {
-                    emitOff (ChordbloomProcessor::kChordChannel, n, 0);
-                    au.previewHeld[(size_t) n] = false;
+                    emitOff (held, n, 0, playbackPart (held));
+                    au.previewHeld[(size_t) n] = 0;
                 }
             }
         }
@@ -2299,7 +2438,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
         const bool scaleLockOn = boolValue (prm.scaleLock);
         const bool chordTriggerOn = boolValue (prm.chordTrigger);
         const bool seventhsOn = boolValue (prm.triggerSevenths);
-        const int outPartNow = intValue (prm.midiOutPart, 0, 2);
+        const int outPartNow = intValue (prm.midiOutPart, 0, kNumOutPartChoices - 1);
 
         const EngineData* d = acquireEngineData();
 
@@ -2487,7 +2626,9 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
 
     // Message thread
     cb::Progression progression;
-    std::vector<cb::Progression> undoStack, redoStack;
+    cb::Melody melody;
+    std::vector<SongState> undoStack, redoStack;
+    const int instanceNumber = cb::ghosts::registerInstance();
     mutable std::vector<cb::PaletteSection> palette;
     mutable cb::Key paletteKey;
     RenderSnapshot renderedSnap;
@@ -2503,6 +2644,7 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
     std::optional<cb::Chord> lastPreviewVoicingChord;     // chord + settings lastPreviewVoicing was voiced for
     cb::VoicingSettings lastPreviewVoicingSettings;
     std::optional<cb::Chord> previewChord;
+    int previewChannel = ChordbloomProcessor::kChordChannel;   // channel of the notes in previewNotes
     uint32_t previewSerial = 0;   // message thread: changes with every preview start / stop (getPreviewSerial)
     uint64_t structuralSerial = 0;
 
@@ -2516,7 +2658,8 @@ struct ChordbloomProcessor::Impl final : private juce::Timer,
     // State shared with host threads (never touched by the audio thread)
     std::mutex stateMutex;
     cb::Progression stateProgression;
-    std::optional<cb::Progression> pendingProgression;
+    cb::Melody stateMelody;
+    std::optional<SongState> pendingSong;
     std::atomic<int> editorW { 0 }, editorH { 0 };
 
     // Publishing
@@ -2632,12 +2775,22 @@ bool ChordbloomProcessor::addChord (const cb::Chord& chord, int insertIndex)
     cb::ProgressionSlot slot;
     slot.chord = sanitiseChord (chord);
 
-    if (insertIndex < 0 || insertIndex > (int) p.slots.size())
+    // Appending leaves the melody where it is (notes drawn past the end now play over the new chord); inserting
+    // moves the notes of the later chords along with them.
+    if (insertIndex < 0 || insertIndex >= (int) p.slots.size())
+    {
         p.slots.push_back (slot);
-    else
-        p.slots.insert (p.slots.begin() + insertIndex, slot);
+        impl->commit (p);
+        return true;
+    }
 
-    impl->commit (p);
+    std::vector<int> source;
+    for (int i = 0; i < (int) p.slots.size(); ++i)
+        source.push_back (i);
+    source.insert (source.begin() + insertIndex, -1);
+
+    p.slots.insert (p.slots.begin() + insertIndex, slot);
+    impl->commitFollowing (p, source);
     return true;
 }
 
@@ -2647,8 +2800,13 @@ void ChordbloomProcessor::removeSlot (int index)
     if (index < 0 || index >= (int) p.slots.size())
         return;
 
+    std::vector<int> source;
+    for (int i = 0; i < (int) p.slots.size(); ++i)
+        if (i != index)
+            source.push_back (i);
+
     p.slots.erase (p.slots.begin() + index);
-    impl->commit (p);
+    impl->commitFollowing (p, source);
 }
 
 void ChordbloomProcessor::moveSlot (int fromIndex, int toIndex)
@@ -2662,10 +2820,16 @@ void ChordbloomProcessor::moveSlot (int fromIndex, int toIndex)
     if (toIndex == fromIndex)
         return;
 
+    std::vector<int> source;
+    for (int i = 0; i < n; ++i)
+        source.push_back (i);
+    source.erase (source.begin() + fromIndex);
+    source.insert (source.begin() + toIndex, fromIndex);
+
     const auto slot = p.slots[(size_t) fromIndex];
     p.slots.erase (p.slots.begin() + fromIndex);
     p.slots.insert (p.slots.begin() + toIndex, slot);
-    impl->commit (p);
+    impl->commitFollowing (p, source);
 }
 
 void ChordbloomProcessor::updateSlot (int index, const cb::ProgressionSlot& slot)
@@ -2674,8 +2838,20 @@ void ChordbloomProcessor::updateSlot (int index, const cb::ProgressionSlot& slot
     if (index < 0 || index >= (int) p.slots.size())
         return;
 
+    const bool lengthChanged = sanitiseSlot (slot).lengthBeats != p.slots[(size_t) index].lengthBeats;
     p.slots[(size_t) index] = sanitiseSlot (slot);
-    impl->commit (p);
+
+    if (! lengthChanged)
+    {
+        impl->commit (p);
+        return;
+    }
+
+    // A new length moves the notes of the later chords; notes that no longer fit this chord go.
+    std::vector<int> source;
+    for (int i = 0; i < (int) p.slots.size(); ++i)
+        source.push_back (i);
+    impl->commitFollowing (p, source);
 }
 
 bool ChordbloomProcessor::duplicateSlot (int index)
@@ -2684,9 +2860,14 @@ bool ChordbloomProcessor::duplicateSlot (int index)
     if (index < 0 || index >= (int) p.slots.size() || (int) p.slots.size() >= cb::kMaxSlots)
         return false;
 
+    std::vector<int> source;
+    for (int i = 0; i < (int) p.slots.size(); ++i)
+        source.push_back (i);
+    source.insert (source.begin() + index + 1, index);   // the copy gets the original's notes too
+
     const auto copy = p.slots[(size_t) index];
     p.slots.insert (p.slots.begin() + index + 1, copy);
-    impl->commit (p);
+    impl->commitFollowing (p, source);
     return true;
 }
 
@@ -2698,11 +2879,12 @@ bool ChordbloomProcessor::undo()
     if (i.undoStack.empty())
         return false;
 
-    i.redoStack.push_back (i.progression);
+    i.redoStack.push_back ({ i.progression, i.melody });
     if ((int) i.redoStack.size() > kMaxUndo)
         i.redoStack.erase (i.redoStack.begin());
 
-    i.progression = i.undoStack.back();
+    i.progression = i.undoStack.back().progression;
+    i.melody = i.undoStack.back().melody;
     i.undoStack.pop_back();
     i.progressionChanged();
     return true;
@@ -2714,11 +2896,12 @@ bool ChordbloomProcessor::redo()
     if (i.redoStack.empty())
         return false;
 
-    i.undoStack.push_back (i.progression);
+    i.undoStack.push_back ({ i.progression, i.melody });
     if ((int) i.undoStack.size() > kMaxUndo)
         i.undoStack.erase (i.undoStack.begin());
 
-    i.progression = i.redoStack.back();
+    i.progression = i.redoStack.back().progression;
+    i.melody = i.redoStack.back().melody;
     i.redoStack.pop_back();
     i.progressionChanged();
     return true;
@@ -2733,6 +2916,23 @@ std::vector<std::vector<int>> ChordbloomProcessor::getProgressionVoicings() cons
 }
 
 std::vector<cb::NoteEvent> ChordbloomProcessor::renderProgressionEvents() const { return impl->renderEvents(); }
+
+//==============================================================================
+const cb::Melody& ChordbloomProcessor::getMelody() const { return impl->melody; }
+void ChordbloomProcessor::setMelody (const cb::Melody& melody) { impl->commitSong (impl->progression, melody); }
+void ChordbloomProcessor::clearMelody() { setMelody ({}); }
+std::vector<cb::NoteEvent> ChordbloomProcessor::renderMelodyEvents() const { return impl->renderMelodyEvents(); }
+
+std::vector<ChordbloomProcessor::GhostMelody> ChordbloomProcessor::getGhostMelodies() const
+{
+    std::vector<GhostMelody> result;
+    for (auto& e : cb::ghosts::othersThan (impl->instanceNumber))
+        result.push_back ({ e.instanceNumber, std::move (e.melody), e.loopBeats });
+    return result;
+}
+
+uint64_t ChordbloomProcessor::getGhostSerial() const noexcept { return cb::ghosts::serial(); }
+int ChordbloomProcessor::getInstanceNumber() const noexcept { return impl->instanceNumber; }
 
 //==============================================================================
 void ChordbloomProcessor::startPreviewChord (const cb::Chord& chord)
@@ -2788,6 +2988,15 @@ void ChordbloomProcessor::startPreviewNote (int midiNote)
     if (midiNote < 0 || midiNote > 127)
         return;
     i.startPreviewNotes ({ midiNote });
+}
+
+void ChordbloomProcessor::startPreviewMelodyNote (int midiNote)
+{
+    auto& i = *impl;
+    i.stopPreviewNotes();
+    if (midiNote < 0 || midiNote > 127)
+        return;
+    i.startPreviewNotes ({ midiNote }, kMelodyChannel);
 }
 
 void ChordbloomProcessor::stopPreview() { impl->stopPreviewNotes(); }
@@ -2856,7 +3065,7 @@ juce::String ChordbloomProcessor::getExportFileName (ExportPart part) const
 
 juce::File ChordbloomProcessor::writeMidiToTempFile (ExportPart part) const
 {
-    if (impl->progression.empty())
+    if (impl->progression.empty() || (part == ExportPart::Melody && renderMelodyEvents().empty()))
         return {};
 
     const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("Chordbloom");
@@ -2877,6 +3086,16 @@ bool ChordbloomProcessor::saveMidiFile (const juce::File& destination, ExportPar
 {
     if (impl->progression.empty() || destination == juce::File())
         return false;
+
+    if (part == ExportPart::Melody)
+    {
+        const auto melodyEvents = renderMelodyEvents();
+        if (melodyEvents.empty())
+            return false;
+
+        const auto file = cb::midiexport::buildMelodyMidiFile (melodyEvents, getHostBpm(), 960);
+        return cb::midiexport::writeMidiFile (withLoopLength (file, (double) impl->progression.totalBeats()), destination);
+    }
 
     const auto events = renderProgressionEvents();
     const bool chords = part != ExportPart::Bass;
@@ -2992,7 +3211,7 @@ void ChordbloomProcessor::transposeProgression (int semitones)
 
     for (auto& slot : p.slots)
         slot.chord.root = cb::pc (slot.chord.root + semitones);
-    impl->commit (p);   // undoable, re-renders, sendChangeMessage
+    impl->commitSong (p, cb::transposeMelody (impl->melody, semitones));   // one undo step, re-renders, sendChangeMessage
 }
 
 int ChordbloomProcessor::bestTranspositionForKey() const
