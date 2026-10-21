@@ -272,9 +272,11 @@ public:
 class ChoiceChip final : public juce::Component, public juce::SettableTooltipClient
 {
 public:
+    // menuOrder: the order the choices are listed in the menu (empty = index order).
     ChoiceChip (juce::RangedAudioParameter& p, juce::StringArray shortLabels, juce::StringArray menuHints,
-                juce::String heading, const juce::String& accessibleTitle)
+                juce::String heading, const juce::String& accessibleTitle, std::vector<int> menuOrder = {})
         : shortNames (std::move (shortLabels)), hints (std::move (menuHints)), menuHeading (std::move (heading)),
+          order (std::move (menuOrder)),
           attachment (p, [this] (float v)
                       {
                           selected = juce::roundToInt (v);
@@ -293,6 +295,19 @@ public:
         setTitle (accessibleTitle);
         setRepaintsOnMouseActivity (true);
         attachment.sendInitialUpdate();
+    }
+
+    juce::String getSelectedLabel() const { return shortNames[selected]; }
+
+    std::vector<int> getMenuOrder() const
+    {
+        if (! order.empty())
+            return order;
+
+        std::vector<int> indices;
+        for (int i = 0; i < fullNames.size(); ++i)
+            indices.push_back (i);
+        return indices;
     }
 
     int getIdealWidth() const
@@ -373,8 +388,15 @@ private:
         if (menuHeading.isNotEmpty())
             menu.addSectionHeader (menuHeading);
 
-        for (int i = 0; i < fullNames.size(); ++i)
+        if (order.empty())
+            for (int i = 0; i < fullNames.size(); ++i)
+                order.push_back (i);
+
+        for (const int i : order)
         {
+            if (i < 0 || i >= fullNames.size())
+                continue;
+
             juce::PopupMenu::Item item (fullNames[i]);
             item.itemID = i + 1;
             item.isTicked = i == selected;
@@ -402,6 +424,7 @@ private:
 
     juce::StringArray shortNames, fullNames, hints;
     juce::String menuHeading;
+    std::vector<int> order;   // menu order of the choices
     int selected = 0;
     bool menuOpen = false;
     juce::ParameterAttachment attachment;
@@ -489,13 +512,13 @@ public:
             { "2", "Play it on your own synth (MIDI out)", Col::secondary,
               "In Chordbloom's wrapper open **settings (gear) > MIDI** and set **Output port** to a number, e.g. 1. "
               "In your synth's wrapper set **MIDI > Input port** to the same number, then click Chordbloom's "
-              "**speaker** off so you only hear your synth. **MIDI out part** sends Chords + Bass, Chords only or "
-              "Bass only (channels 1 / 2); for a separate bass synth, clone the Chordbloom channel and set the clone "
-              "to **Bass** on its own port." },
+              "**speaker** off so you only hear your synth. **MIDI out part** sends all parts (chords, bass, melody, arp "
+              "on channels 1 / 2 / 3 / 4) or one of them; for a separate synth per part (e.g. **Arp only** into a pluck), "
+              "clone the Chordbloom channel and set each clone's part, on its own port." },
             { "3", "Drag it into FL", Col::subdominant,
-              "Drag the **Chords**, **Bass** or **Both** chips (bottom right) onto the playlist, a channel or the piano "
-              "roll, or drag a single pad or progression block straight out. Drop the chords into your melody's "
-              "pattern to see them as ghost notes." }
+              "Drag the **Chords**, **Bass**, **Melody**, **Arp** or **All** chips (bottom right) onto the playlist, a "
+              "channel or the piano roll (**All** = one track per playing part), or drag a single pad or progression "
+              "block straight out. **Save** writes the same parts as .mid files." }
         };
 
         tips = {
@@ -505,7 +528,12 @@ public:
             "**Right-click** a progression block for length, inversion, octave, duplicate and delete. Scroll on it to "
             "change its length.",
             "**Chord trigger**: white keys C to B on your MIDI keyboard play the key's chords I to VII "
-            "(**7ths** for seventh chords)."
+            "(**7ths** for seventh chords).",
+            "**Roll** (switch at the top right): the **Melody**, **Arp** and **Bass** layers over the chords. A tab's dot "
+            "plays or mutes it; **Generate** writes a melody, the arrows browse arp and bass patterns. Edit a note and "
+            "the layer is edited (pencil); **Reset** follows the chords again.",
+            "**Roll gestures**: **Ctrl** (Cmd on Mac)+drag selects, **Shift**+drag duplicates, **Alt** = no grid, "
+            "right-click deletes."
         };
 
         setSize (width > 0 ? width : kDefaultWidth, 100);
@@ -806,8 +834,10 @@ struct HeaderBar::Impl
 {
     Impl (HeaderBar& o, ChordbloomProcessor& p)
         : owner (o), processor (p), apvts (p.getAPVTS()),
-          outPart (*apvts.getParameter (cb::ParamIDs::midiOutPart), { "Both", "Chords", "Bass" },
-                   { "ch 1 + 2", "ch 1", "ch 2" }, "MIDI out sends", "MIDI out part")
+          outPart (*apvts.getParameter (cb::ParamIDs::midiOutPart),
+                   { "All", "Chords", "Bass", "Melody", "Ch+Bass", "Arp" },
+                   { "ch 1-4", "ch 1", "ch 2", "ch 3", "ch 1 + 2", "ch 4" }, "MIDI out sends", "MIDI out part",
+                   { 0, 4, 1, 2, 3, 5 })
     {
         namespace id = cb::ParamIDs;
 
@@ -870,14 +900,15 @@ struct HeaderBar::Impl
                           "Chordbloom's MIDI plays another instrument in FL.");
         tone.setTooltip ("Built-in sound: the instrument's tone.");
         volume.setTooltip ("Built-in sound volume (double-click to reset).");
-        midiOut.setTooltip ("MIDI out: send the chords (channel 1) and bass (channel 2) to FL Studio, to play them on "
-                            "another instrument. Click ? for the routing steps.");
-        outPart.setTooltip ("MIDI out part: what Chordbloom sends to FL: chords and bass, chords only or bass only. "
-                            "Two Chordbloom channels (one Chords, one Bass) can feed two different synths.");
+        midiOut.setTooltip ("MIDI out: send the chords (channel 1), bass (channel 2), melody (channel 3) and the arp "
+                            "(channel 4) to FL Studio, "
+                            "to play them on another instrument. Click ? for the routing steps.");
+        outPart.setTooltip ("MIDI out part: what Chordbloom sends to FL: all parts, chords + bass, or the chords, the bass, "
+                            "the melody or the arp alone. Chordbloom channels set to different parts can feed different synths.");
         sync.setTooltip ("Play with FL: while FL Studio plays, Chordbloom loops the progression in time with it "
                          "(built-in sound and MIDI out). Turn it off once you've dragged the chords into FL, "
                          "or you will hear them twice.");
-        undo.setTooltip ("Undo the last progression edit");
+        undo.setTooltip ("Undo the last edit (chords, melody, arp or bass notes)");
         redo.setTooltip ("Redo");
         help.setTooltip ("How to use Chordbloom in FL Studio");
 
@@ -1197,6 +1228,9 @@ bool HeaderBar::isHelpVisible() const
 {
     return impl->helpPopover != nullptr && impl->helpPopover->isVisible();
 }
+
+juce::String HeaderBar::getOutPartLabel() const { return impl->outPart.getSelectedLabel(); }
+std::vector<int> HeaderBar::getOutPartMenuOrder() const { return impl->outPart.getMenuOrder(); }
 
 std::unique_ptr<juce::Component> HeaderBar::createHelpContent (int width)
 {

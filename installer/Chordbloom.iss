@@ -4,7 +4,7 @@
 ;          built with the static MSVC runtime (-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded), so no VC++ redistributable needed.
 
 #define AppName "Chordbloom"
-#define AppVersion "1.0.0"
+#define AppVersion "1.1.0"
 #define AppPublisher "Kujar3"
 
 [Setup]

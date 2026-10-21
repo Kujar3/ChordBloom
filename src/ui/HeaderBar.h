@@ -28,6 +28,11 @@ public:
     // The help card on its own at its ideal height for `width` (0 = default width). Used by the snapshot tool.
     static std::unique_ptr<juce::Component> createHelpContent (int width = 0);
 
+    // (Phase 2) Test hooks of the MIDI out part chip: the short label shown for the current midiOutPart choice ("All",
+    // "Chords", "Bass", "Melody", "Ch+Bass", "Arp") and the order its menu lists the choices in ({ 0, 4, 1, 2, 3, 5 }).
+    juce::String getOutPartLabel() const;
+    std::vector<int> getOutPartMenuOrder() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

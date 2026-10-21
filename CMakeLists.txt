@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(Chordbloom VERSION 1.0.0 LANGUAGES C CXX)
+project(Chordbloom VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,12 +23,18 @@ set(CB_CORE_SOURCES
     src/core/Voicing.cpp
     src/core/Pattern.cpp
     src/core/Progression.cpp
-    src/core/Generate.cpp)
+    src/core/Generate.cpp
+    src/core/Melody.cpp
+    src/core/Arp.cpp
+    src/core/Layers.cpp
+    src/core/NoteEdit.cpp
+    src/core/MelodyGen.cpp)
 
 set(CB_PLUGIN_SOURCES
     src/plugin/PluginProcessor.cpp
     src/plugin/PreviewSynth.cpp
-    src/plugin/MidiExport.cpp)
+    src/plugin/MidiExport.cpp
+    src/plugin/GhostRegistry.cpp)
 
 set(CB_UI_SOURCES
     src/ui/Theme.cpp
@@ -38,7 +44,9 @@ set(CB_UI_SOURCES
     src/ui/ProgressionLane.cpp
     src/ui/ControlsPanel.cpp
     src/ui/KeyboardGuide.cpp
-    src/ui/ExportPanel.cpp)
+    src/ui/ExportPanel.cpp
+    src/ui/MelodyRoll.cpp
+    src/ui/RollToolbar.cpp)
 
 # ---------------------------------------------------------------------------
 # Embedded resources (fonts, logo)
@@ -97,22 +105,37 @@ add_executable(CoreTests
     tests/TheoryTests.cpp
     tests/VoicingPatternTests.cpp
     tests/GenerateTests.cpp
+    tests/MelodyTests.cpp
+    tests/BassGoldenTests.cpp
+    tests/BassPatternTests.cpp
+    tests/ArpTests.cpp
+    tests/LayersTests.cpp
+    tests/NoteEditTests.cpp
+    tests/MelodyGenTests.cpp
+    tests/DocsTests.cpp
     ${CB_CORE_SOURCES})
 target_include_directories(CoreTests PRIVATE src tests)
+# DocsTests reads README.md, ARCHITECTURE.md, installer/QuickStart.txt and docs/screenshot.png from the checkout.
+target_compile_definitions(CoreTests PRIVATE CB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 if(MSVC)
     target_compile_options(CoreTests PRIVATE /W4 /permissive-)
 endif()
 
 # ---------------------------------------------------------------------------
-# Dev tool: processor self-test + editor snapshot renderer
+# Dev tool: processor self-test + editor snapshot renderer + listening demos
 #   ChordbloomDev selftest
 #   ChordbloomDev snapshot <outDir>
+#   ChordbloomDev demos <outDir>
 # ---------------------------------------------------------------------------
 juce_add_console_app(ChordbloomDev PRODUCT_NAME "ChordbloomDev")
 target_sources(ChordbloomDev PRIVATE
     tools/dev/DevMain.cpp
     tools/dev/SelfTest.cpp
+    tools/dev/SelfTestEngine.cpp
+    tools/dev/SelfTestRoll.cpp
+    tools/dev/SelfTestShell.cpp
     tools/dev/Snapshot.cpp
+    tools/dev/Demos.cpp
     ${CB_CORE_SOURCES} ${CB_PLUGIN_SOURCES} ${CB_UI_SOURCES})
 target_include_directories(ChordbloomDev PRIVATE src)
 target_compile_definitions(ChordbloomDev PRIVATE

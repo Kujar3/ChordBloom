@@ -432,6 +432,89 @@ private:
 };
 
 juce::String percent (double v) { return juce::String (juce::roundToInt (v * 100.0)) + "%"; }
+
+void addBassModeItems (juce::PopupMenu& menu, const juce::StringArray& names, int tickedId)
+{
+    // Headings "Classic" (Off..Pulse) and "Patterns (fixed grooves)"; item ids are index + 1 (final-spec 7.11).
+    for (int i = 0; i < names.size(); ++i)
+    {
+        if (i == 0)
+            menu.addSectionHeader ("Classic");
+        else if (i == (int) cb::BassMode::Offbeat8)
+            menu.addSectionHeader ("Patterns (fixed grooves)");
+
+        menu.addItem (i + 1, names[i], true, i + 1 == tickedId);
+    }
+}
+
+//==============================================================================
+// The Bass combo (final-spec 7.11): showPopup builds the menu itself, so a real user pick is known without any flag
+// (JUCE runs the attachment's listener before onChange, and a dismissed popup fires no onChange). The callback hands a
+// pick to onUserPick; result 0 (dismissed) does nothing. Plain onChange (automation, state loads) never resets.
+class BassCombo final : public juce::ComboBox
+{
+public:
+    std::function<void (cb::BassMode)> onUserPick;
+    juce::StringArray modeNames;
+
+    void showPopup() override
+    {
+        if (! isEnabled())
+            return;
+
+        juce::PopupMenu menu;
+        addBassModeItems (menu, modeNames, getSelectedId());
+        menu.setLookAndFeel (&getLookAndFeel());
+
+        juce::Component::SafePointer<BassCombo> safe (this);
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this).withMinimumWidth (getWidth()),
+                            [safe] (int result)
+                            {
+                                if (safe == nullptr)
+                                    return;
+
+                                safe->hidePopup();
+
+                                if (result > 0 && result <= cb::numBassModes && safe->onUserPick != nullptr)
+                                    safe->onUserPick ((cb::BassMode) (result - 1));
+                            });
+    }
+};
+
+// Small "edited" pencil and "muted" crossed speaker after the Bass caption.
+void drawPencilGlyph (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour colour)
+{
+    const float s = juce::jmin (r.getWidth(), r.getHeight());
+    const auto c = r.getCentre();
+    juce::Path body;
+    body.addRoundedRectangle (-s * 0.24f, -s * 0.17f, s * 0.80f, s * 0.34f, s * 0.07f);
+    body.addTriangle (-s * 0.30f, -s * 0.17f, -s * 0.30f, s * 0.17f, -s * 0.62f, 0.0f);
+    body.applyTransform (juce::AffineTransform::rotation (-juce::MathConstants<float>::pi * 0.25f).translated (c.x, c.y));
+    g.setColour (colour);
+    g.fillPath (body);
+}
+
+// An outline speaker with one slash through the whole glyph: legible at 8 px and 1x, like the header's sound-off icon.
+void drawMutedGlyph (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour colour)
+{
+    const float s = juce::jmin (r.getWidth(), r.getHeight());
+    const auto c = r.getCentre();
+    juce::Path speaker;
+    speaker.startNewSubPath (c.x - s * 0.36f, c.y - s * 0.16f);
+    speaker.lineTo (c.x - s * 0.12f, c.y - s * 0.16f);
+    speaker.lineTo (c.x + s * 0.20f, c.y - s * 0.42f);
+    speaker.lineTo (c.x + s * 0.20f, c.y + s * 0.42f);
+    speaker.lineTo (c.x - s * 0.12f, c.y + s * 0.16f);
+    speaker.lineTo (c.x - s * 0.36f, c.y + s * 0.16f);
+    speaker.closeSubPath();
+    g.setColour (colour);
+    g.strokePath (speaker, juce::PathStrokeType (1.0f, juce::PathStrokeType::mitered, juce::PathStrokeType::butt));
+
+    juce::Path slash;
+    slash.startNewSubPath (c.x - s * 0.46f, c.y - s * 0.46f);
+    slash.lineTo (c.x + s * 0.46f, c.y + s * 0.46f);
+    g.strokePath (slash, juce::PathStrokeType (1.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+}
 } // namespace
 
 //==============================================================================
@@ -439,6 +522,7 @@ struct ControlsPanel::Impl
 {
     Impl (ControlsPanel& o, ChordbloomProcessor& p)
         : owner (o),
+          processor (p),
           apvts (p.getAPVTS()),
           rate (param (apvts, cb::ParamIDs::rate), choiceNames (apvts, cb::ParamIDs::rate), "Rate"),
           style (param (apvts, cb::ParamIDs::voicing), choiceNames (apvts, cb::ParamIDs::voicing), "Voicing style"),
@@ -450,12 +534,25 @@ struct ControlsPanel::Impl
                     [] (double v) { return juce::String (juce::jlimit (1, 127, juce::roundToInt (v * 127.0))); },
                     "Velocity of the generated notes (shown as MIDI velocity 1-127)"),
           humanize (param (apvts, cb::ParamIDs::humanize), "Humanize", percent,
-                    "Humanize: subtle, repeatable timing and velocity variation so the part feels played")
+                    "Humanize: subtle, repeatable timing and velocity variation so the part feels played "
+                    "(an edited arp or bass in the Roll plays as drawn)")
     {
         namespace id = cb::ParamIDs;
 
         pattern.addItemList (choiceNames (apvts, id::pattern), 1);
-        bass.addItemList (choiceNames (apvts, id::bassMode), 1);
+        bass.modeNames = choiceNames (apvts, id::bassMode);
+
+        for (int i = 0; i < bass.modeNames.size(); ++i)
+        {
+            if (i == 0)
+                bass.addSectionHeading ("Classic");
+            else if (i == (int) cb::BassMode::Offbeat8)
+                bass.addSectionHeading ("Patterns (fixed grooves)");
+
+            bass.addItem (bass.modeNames[i], i + 1);
+        }
+
+        bass.onUserPick = [this] (cb::BassMode mode) { owner.pickBassModeAsUser (mode); };
         patternAtt = std::make_unique<APVTS::ComboBoxAttachment> (apvts, id::pattern, pattern);
         bassAtt = std::make_unique<APVTS::ComboBoxAttachment> (apvts, id::bassMode, bass);
 
@@ -472,7 +569,7 @@ struct ControlsPanel::Impl
 
         pattern.setTooltip ("Rhythm pattern for playback and MIDI export: held chords, strums, pulses, arpeggios or broken chords");
         style.setTooltip ("Voicing: Close keeps the notes compact, Open spreads them (drop-2), Spread gives wide pad-like chords");
-        bass.setTooltip ("Bass line, sent on MIDI channel 2");
+        updateBassLook();
         octave.setTooltip ("Octave of the chords (the bass stays in its own low range, below the chords). "
                            "Scroll or click - / +, double-click to reset");
         voiceLeading.setTooltip ("Voice leading: picks inversions automatically so each chord moves smoothly to the next");
@@ -521,13 +618,42 @@ struct ControlsPanel::Impl
         const auto bassMode = (B) juce::jlimit (0, cb::numBassModes - 1, bass.getSelectedItemIndex());
         const auto rateDiv = (cb::RateDivision) juce::jlimit (0, cb::numRateDivisions - 1, rate.getSelectedIndex());
 
+        // Only an audible auto layer follows Rate / Swing: an edited (custom) arp or bass plays its own notes at their
+        // baked times, and a muted bass (bassOn off) plays nothing, like an arp that is off.
+        const auto* bassOnParam = apvts.getRawParameterValue (cb::ParamIDs::bassOn);
+        const bool bassOff = bassOnParam != nullptr && bassOnParam->load() < 0.5f;
+        const bool bassCustom = processor.isLayerCustom (cb::Layer::Bass);
+        const bool bassFollows = ! bassOff && ! bassCustom;
+        const bool bassGridMode = bassMode == B::Octaves || bassMode == B::Pulse || cb::isBassPattern (bassMode);
+
         const bool patternOnGrid = ! (pat == P::Block || pat == P::Strum || pat == P::Offbeat);
-        const bool bassOnGrid = bassMode == B::Octaves || bassMode == B::Pulse;
+        const bool bassOnGrid = (bassMode == B::Octaves || bassMode == B::Pulse) && bassFollows;
         const bool triplet = rateDiv == cb::RateDivision::EighthTriplet;
 
-        const bool rateActive = patternOnGrid || bassOnGrid;
+        // Phase 2 (final-spec 7.11): the chord Rate is the groove grid the auto arp and the auto pattern basses swing on.
+        const auto* arpParam = apvts.getRawParameterValue (cb::ParamIDs::arpOn);
+        const bool arpOn = arpParam != nullptr && arpParam->load() >= 0.5f;
+        const bool arpCustom = arpOn && processor.isLayerCustom (cb::Layer::Arp);
+        const bool groove = (arpOn && ! arpCustom) || (cb::isBassPattern (bassMode) && bassFollows);
+
+        // Why nothing runs on the grid right now (the chords hold, and the bass is held, muted or edited).
+        juce::String quiet (cb::rhythmPatternName (pat));
+        quiet << " holds each chord";
+
+        if (bassGridMode && bassOff)
+            quiet << ", the bass is muted";
+        else if (bassGridMode && bassCustom)
+            quiet << ", the edited bass plays its own notes";
+        else
+            quiet << (arpCustom ? ", the bass is held" : " and the bass is held too");
+
+        if (arpCustom)
+            quiet << " and the edited arp plays its own notes";
+
+        const bool rateActive = patternOnGrid || bassOnGrid || groove;
         const bool swingActive = ((patternOnGrid || bassOnGrid) && ! triplet)
-                              || (pat == P::Offbeat && rateDiv == cb::RateDivision::Eighth);
+                              || (pat == P::Offbeat && rateDiv == cb::RateDivision::Eighth)
+                              || (groove && ! triplet);
 
         juce::String rateNote, swingNote;
 
@@ -535,33 +661,89 @@ struct ControlsPanel::Impl
         {
             rateNote = pat == P::Offbeat
                          ? "No effect with Offbeat (it always plays on the \"&\"), except that swing needs 1/8."
-                         : "No effect right now: " + juce::String (cb::rhythmPatternName (pat))
-                               + " holds each chord and the bass is held too. Try Pulse, an Arp or Broken, "
-                                 "or the Octaves / Pulse bass.";
+                         : "No effect right now: " + quiet + ". Try Pulse, an Arp or Broken, or the Octaves / Pulse bass.";
         }
 
         if (! swingActive)
         {
-            if (triplet && (patternOnGrid || bassOnGrid))
+            if (triplet && (patternOnGrid || bassOnGrid || groove))
                 swingNote = "No effect at 1/8T: triplets are already a shuffle.";
             else if (pat == P::Offbeat && ! bassOnGrid)
                 swingNote = "With Offbeat, swing only works at rate 1/8.";
             else
-                swingNote = "No effect right now: " + juce::String (cb::rhythmPatternName (pat))
-                              + " holds each chord and the bass is held too. Try Pulse, an Arp or Broken, "
-                                "or the Octaves / Pulse bass.";
+                swingNote = "No effect right now: " + quiet + ". Try Pulse, an Arp or Broken, or the Octaves / Pulse bass.";
         }
 
-        rate.setTooltip (juce::String (rateTip) + (rateNote.isNotEmpty() ? "\n\n" + rateNote : juce::String()));
+        // Called on every layer-serial move (a Velocity or Gate knob drag too): only what changed is touched.
+        // setAlpha repaints a control only when its alpha changes; the panel itself only draws the dimmed caption.
+        const auto rateTipText = juce::String (rateTip) + "\n" + grooveTip + (rateNote.isNotEmpty() ? "\n\n" + rateNote : juce::String());
+
+        if (rate.getTooltip() != rateTipText)
+            rate.setTooltip (rateTipText);
+
         swing.setTooltipText (swingTip, swingNote);
 
         rate.setAlpha (rateActive ? 1.0f : kInactiveAlpha);
         swing.setAlpha (swingActive ? 1.0f : kInactiveAlpha);
-        rateInactive = ! rateActive;
-        owner.repaint();   // the "Rate" caption dims with the control
+
+        if (rateInactive != ! rateActive)
+        {
+            rateInactive = ! rateActive;
+            ++numCaptionRepaints;
+            owner.repaint (rateCaption);   // the "Rate" caption dims with the control
+        }
     }
 
+    // Caption glyphs and the combo's tooltip words (final-spec 7.11).
+    void updateBassLook()
+    {
+        const auto stateText = bassStateText();
+        bassEdited = stateText.contains ("edited");
+        bassMuted = stateText.contains ("muted");
+
+        juce::String tip ("Bass line, sent on MIDI channel 2. The patterns are fixed grooves (they ignore Rate).");
+
+        if (bassEdited || bassMuted)
+        {
+            tip << "\n\nBass: " << stateText << ".";
+
+            if (bassEdited)
+                tip << " Your notes in the Roll play instead of the pattern, so Velocity, Gate and Humanize no longer "
+                       "change it; picking a mode here resets them (Undo brings them back).";
+            if (bassMuted)
+                tip << " Muted: turn it on with the dot on the Roll's Bass tab.";
+        }
+
+        if (bass.getTooltip() != tip)
+            bass.setTooltip (tip);
+
+        if (bassEdited != shownEdited || bassMuted != shownMuted)
+        {
+            shownEdited = bassEdited;
+            shownMuted = bassMuted;
+            owner.repaint (bassCaption);
+        }
+    }
+
+    juce::String bassStateText() const
+    {
+        const bool edited = processor.isLayerCustom (cb::Layer::Bass);
+        const auto* bassOn = apvts.getRawParameterValue (cb::ParamIDs::bassOn);
+        const bool muted = bassOn != nullptr && bassOn->load() < 0.5f;
+
+        if (edited && muted)
+            return "edited, muted";
+        if (edited)
+            return "edited";
+        return muted ? "muted" : "";
+    }
+
+    bool bassEdited = false, bassMuted = false, shownEdited = false, shownMuted = false;
+    juce::Rectangle<int> bassCaption, rateCaption;
+    int numCaptionRepaints = 0;   // Rate caption repaints (test hook: getNumRateCaptionRepaints)
+
     static constexpr float kInactiveAlpha = 0.45f;
+    static constexpr const char* grooveTip = "Rate also sets the swing grid of the arp and the bass patterns.";
     static constexpr const char* rateTip = "Step length for pulses, arpeggios and moving bass lines (1/8T = eighth-note triplets)";
     static constexpr const char* swingTip = "Swing: delays every second step for a shuffled groove";
     bool rateInactive = false;
@@ -573,9 +755,11 @@ struct ControlsPanel::Impl
     };
 
     ControlsPanel& owner;
+    ChordbloomProcessor& processor;
     APVTS& apvts;
 
-    juce::ComboBox pattern, bass;
+    juce::ComboBox pattern;
+    BassCombo bass;
     Segmented rate, style;
     Stepper octave;
     Knob swing, gate, velocity, humanize;
@@ -611,6 +795,26 @@ void ControlsPanel::paint (juce::Graphics& g)
         const bool dim = d.rateInactive && c.text == "Rate";
         g.setColour (dim ? Col::textDim.withMultipliedAlpha (Impl::kInactiveAlpha + 0.1f) : Col::textDim);
         g.drawText (c.text, c.area, juce::Justification::centredLeft, true);
+
+        // Bass: a pencil while the bass layer is custom, a crossed speaker while bassOn is off.
+        if (c.text == "Bass" && (d.bassEdited || d.bassMuted))
+        {
+            // A 7 px pencil on an 8.5 px pitch and an 8 px speaker: "Bass" (about 25 px) + 2.5 + 8.5 + 8 fits the caption
+            // column (45 px at 960x560; clamped to its right edge below that).
+            const float glyphsW = (d.bassEdited ? 8.5f : 0.0f) + (d.bassMuted ? 8.0f : 0.0f);
+            float x = juce::jmin ((float) c.area.getX() + cb::ui::textWidth (cb::ui::font (12.0f), c.text) + 2.5f,
+                                  (float) c.area.getRight() - glyphsW - 1.0f);
+            const float cy = (float) c.area.getCentreY();
+
+            if (d.bassEdited)
+            {
+                drawPencilGlyph (g, { x, cy - 3.5f, 7.0f, 7.0f }, Col::textDim);
+                x += 8.5f;
+            }
+
+            if (d.bassMuted)
+                drawMutedGlyph (g, { x, cy - 4.0f, 8.0f, 8.0f }, Col::textDim);
+        }
     }
 
     for (int x : d.dividerX)
@@ -693,6 +897,7 @@ void ControlsPanel::resized()
         auto rows = rowsFor (groups[0]);
         d.pattern.setBounds (withCaption (rows.a, "Pattern"));
         d.rate.setBounds (withCaption (rows.b, "Rate"));
+        d.rateCaption = d.captions.back().area;
         auto c = rows.c;
         d.swing.setBounds (c.removeFromLeft (c.getWidth() / 2));
         d.gate.setBounds (c);
@@ -703,6 +908,7 @@ void ControlsPanel::resized()
         auto rows = rowsFor (groups[1]);
         d.style.setBounds (withCaption (rows.a, "Style"));
         d.bass.setBounds (withCaption (rows.b, "Bass"));
+        d.bassCaption = d.captions.back().area;
 
         auto c = rows.c;
         const int subH = juce::jmin (rowH, (c.getHeight() - 4) / 2);
@@ -738,3 +944,31 @@ void ControlsPanel::resized()
         d.humanize.setBounds (c);
     }
 }
+
+//==============================================================================
+// Phase 2 (final-spec 7.11): the caption glyphs and the Rate / Swing rule follow parameter-only changes too (the editor
+// calls this on change messages and whenever the layer serial moves).
+void ControlsPanel::refresh()
+{
+    impl->updateBassLook();
+    impl->updateRateSwingLook();
+}
+
+// final-spec 7.11 order: the parameter first (host gesture), then beginUserLayerPick for a mode other than Off.
+void ControlsPanel::pickBassModeAsUser (cb::BassMode mode)
+{
+    const int index = juce::jlimit (0, cb::numBassModes - 1, (int) mode);
+
+    if (auto* p = impl->apvts.getParameter (cb::ParamIDs::bassMode))
+    {
+        p->beginChangeGesture();
+        p->setValueNotifyingHost (p->convertTo0to1 ((float) index));
+        p->endChangeGesture();
+    }
+
+    if (index != (int) cb::BassMode::Off)
+        impl->processor.beginUserLayerPick (cb::Layer::Bass);
+}
+
+juce::String ControlsPanel::getBassStateText() const { return impl->bassStateText(); }
+int ControlsPanel::getNumRateCaptionRepaints() const { return impl->numCaptionRepaints; }

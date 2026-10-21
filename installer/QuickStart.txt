@@ -12,6 +12,10 @@ BUILD A PROGRESSION
 - No idea where to start? Click "Spark" for a fresh progression, or "Presets".
 - Glowing pads = chords that sound good next. Right-click a chord in the lane
   for more options (change chord, length, inversion, delete...).
+- Click "Roll" (switch at the top right) for the Melody, Arp and Bass layers
+  over the chords: "Generate" writes a melody, the arrows browse arp and bass
+  patterns. Edit a note and the layer is edited; "Reset" follows the chords
+  again.
 
 PLAY IT ON YOUR OWN SYNTH (e.g. Omnisphere)
 - Chordbloom wrapper: gear icon > MIDI > Output port = 1
@@ -20,8 +24,11 @@ PLAY IT ON YOUR OWN SYNTH (e.g. Omnisphere)
   otherwise you hear both.
 
 GET THE MIDI INTO YOUR PROJECT
-- Drag the "Chords", "Bass" or "Both" chips (bottom right) onto the playlist
-  or piano roll - or drag a single pad / chord straight out of the plugin.
+- Drag the "Chords", "Bass", "Melody", "Arp" or "All" chips (bottom right)
+  onto the playlist, a channel or the piano roll ("All" = one track per
+  playing part) - or drag a single pad / chord straight out of the plugin.
+- "Save" (above the chips) writes the same parts as .mid files, plus
+  "Chords + bass".
 - Then switch off "Play with FL" so the chords don't play twice.
 
 The "?" button in the top-right corner of the plugin shows all of this again.

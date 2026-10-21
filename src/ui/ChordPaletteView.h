@@ -42,6 +42,10 @@ public:
     void setContextChord (std::optional<cb::Chord>);        // suggestion source
     void setSoundingChord (std::optional<cb::Chord>);       // highlight
 
+    // (Added with the melody roll.) The always-free 8th cell of the Triads row (7 diatonic triads), in local
+    // coordinates; the editor puts the Chords / Melody view switch there. Empty before the first layout.
+    juce::Rectangle<int> getCornerCellBounds() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
