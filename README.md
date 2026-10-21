@@ -12,8 +12,14 @@ VST3 + CLAP + Standalone, Windows, built with JUCE 8.
 
 ## Install
 
-1. Build it, or use the build that's already in `build\` (see *Building* below).
-2. Copy it into the system plugin folders. Run this from the `Klimper-Like` folder in PowerShell; it asks for admin once:
+**Installer:** run `Chordbloom-Setup-<version>.exe` (built with *Building > Installer* below). It installs the VST3 into
+`C:\Program Files\Common Files\VST3\`, the CLAP into `C:\Program Files\Common Files\CLAP\` and the Standalone app, and
+offers to close FL Studio first if it has Chordbloom loaded.
+
+**From a build:**
+
+1. Build it (see *Building* below).
+2. Copy it into the system plugin folders. Run this from the repository folder in PowerShell; it asks for admin once:
 
    ```
    powershell -ExecutionPolicy Bypass -File scripts\install-plugin.ps1
@@ -39,12 +45,12 @@ The **?** button in the top-right corner shows the same instructions inside the 
    4), *Chords + Bass*, or the chords, the bass, the melody or the arp alone (*Arp only*). To put a part on a separate
    synth, clone the Chordbloom channel and set the clone's part (for example *Arp only* into a pluck, *Bass only* into
    your bass synth).
-   I couldn't test whether FL forwards VST3 MIDI output on your machine. If nothing arrives, load the **CLAP** version,
-   or use option 3.
+   If your synth receives nothing from the VST3, load the **CLAP** version, or drag the MIDI in (option 3).
 3. **Drag it into FL.** Drag the **Chords / Bass / Melody / Arp / All** chips (bottom right) onto the playlist, a
    channel or the piano roll. Each single-part chip is one loop on its own channel (Chords 1, Bass 2, Melody 3, Arp 4);
    the Arp chip exports the arp even while it is muted in Chordbloom. **All** is one file with a named track per part
-   that plays (Chords, then Bass, Melody, Arp), so it is best dropped on the playlist. **Save** (the pill above the
+   that plays (Chords, then Bass, Melody, Arp); FL Studio drops it into one channel with colour-coded parts, so for
+   separate instruments drag the single-part chips instead. **Save** (the pill above the
    chips) writes the same parts as .mid files, plus *Chords + bass* (the old two-track *Both* file). Right-click a chip
    to save just that part. You can also drag a single pad or a single progression block straight out of the plugin.
 4. **Melody, arp and bass.** Click **Roll** in the switch at the top right of the chord palette. See *Roll* below.
@@ -127,7 +133,7 @@ project, otherwise you'll hear the chords twice. Chordbloom shows a reminder aft
   - **Ghost notes**: with several Chordbloom instances in one project, each roll shows the others' melodies as faint
     outlines, so a lead and a counter-melody don't collide.
 
-### Good to know (phase 2)
+### Good to know
 
 - **Timing of edited layers.** An edited arp or bass keeps the timing it had when you first edited it, rounded to 1/48
   of a beat and played straight: it keeps the swing it had then and no longer follows the Swing knob (Reset brings the
@@ -165,6 +171,20 @@ scripts\build.bat build Chordbloom_VST3 Chordbloom_CLAP Chordbloom_Standalone Co
 - `build\ChordbloomDev_artefacts\Release\ChordbloomDev.exe snapshot out\snaps`: renders the UI to PNGs
 - `build\ChordbloomDev_artefacts\Release\ChordbloomDev.exe demos out\demos`: the melody generator's listening demos
 - `tools\pluginval\pluginval.exe --strictness-level 10 --validate build\Chordbloom_artefacts\Release\VST3\Chordbloom.vst3`
+
+### Installer
+
+The installer is built with [Inno Setup 6](https://jrsoftware.org/isinfo.php) from a static-runtime build (no Visual C++
+redistributable needed on the target machine):
+
+```
+cmake -S . -B build-rel -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+cmake --build build-rel --target Chordbloom_VST3 Chordbloom_CLAP Chordbloom_Standalone
+```
+
+Copy `Chordbloom.vst3`, `Chordbloom.clap` and `Chordbloom.exe` from `build-rel\Chordbloom_artefacts\Release\` into
+`installer\payload\VST3\`, `CLAP\` and `Standalone\`, then run `ISCC.exe installer\Chordbloom.iss`; the setup lands in
+`dist\`. Bump `VERSION` in `CMakeLists.txt` and `AppVersion` in `installer\Chordbloom.iss` together.
 
 See `ARCHITECTURE.md` for how the code is organised.
 
